@@ -10,7 +10,7 @@ use std::sync::Arc;
 use agent_core::{
     AgentError, CancellationToken, EngineOutput, HistoryEntry, NextTurnService, Result,
     SessionState, StopReason, Tool, ToolCallId, ToolCallStatus, ToolContext, ToolEvent,
-    ToolRegistry, TurnContext, TurnEngine, TurnEvent, UpdateSink,
+    ToolRegistry, TurnContext, TurnEngine, TurnEvent, TurnInbox, UpdateSink,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -123,6 +123,46 @@ impl Tool for CancellingTool {
         Ok(Box::pin(stream::iter(vec![ToolEvent::Completed(
             serde_json::json!("should never be observed"),
         )])))
+    }
+}
+
+/// A decision service that, on its first round, injects a steering message
+/// into the shared [`TurnInbox`] and then finishes the turn. The engine should
+/// notice the pending inbox and loop for a second round rather than ending.
+struct SteeringOnFirstRoundService {
+    inbox: TurnInbox,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait]
+impl NextTurnService for SteeringOnFirstRoundService {
+    async fn get_next_turn_streaming(
+        &self,
+        _ctx: &TurnContext,
+    ) -> Result<BoxStream<'static, TurnEvent>> {
+        let n = self
+            .calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if n == 0 {
+            // Simulate a `_session/inject` arriving mid-turn.
+            self.inbox
+                .lock()
+                .unwrap()
+                .push("steer me".to_string());
+            Ok(Box::pin(stream::iter(vec![
+                TurnEvent::TextDelta("first".into()),
+                TurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])))
+        } else {
+            Ok(Box::pin(stream::iter(vec![
+                TurnEvent::TextDelta("second".into()),
+                TurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])))
+        }
     }
 }
 
@@ -559,4 +599,52 @@ async fn permission_denied_skips_execution_and_marks_failed() {
         HistoryEntry::ToolResult(rec) => assert!(!rec.success),
         other => panic!("unexpected entry: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn steering_message_injected_mid_turn_extends_the_turn() {
+    use std::sync::atomic::AtomicUsize;
+
+    let inbox: TurnInbox = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let svc = SteeringOnFirstRoundService {
+        inbox: inbox.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+    };
+    let mut session = SessionState::new("s1");
+    session.push_user_text("hi");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), ToolRegistry::new()).with_inbox(inbox.clone());
+
+    let stop = engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(stop, StopReason::EndTurn);
+
+    // Both rounds streamed their text: the turn continued instead of ending
+    // after the first round because a steering message was pending.
+    let chunks: Vec<String> = sink
+        .outputs
+        .iter()
+        .filter_map(|o| match o {
+            EngineOutput::MessageChunk(text) => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(chunks, vec!["first".to_string(), "second".to_string()]);
+
+    // The injected message was folded into the conversation as a user message.
+    let injected_user_msg = session.history.entries.iter().any(|entry| match entry {
+        HistoryEntry::User(msg) => msg
+            .content
+            .iter()
+            .any(|block| matches!(block, agent_core::ContentBlock::Text { text } if text == "steer me")),
+        _ => false,
+    });
+    assert!(injected_user_msg, "injected steering message should be in history");
+
+    // The inbox was fully drained.
+    assert!(inbox.lock().unwrap().is_empty());
 }

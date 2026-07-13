@@ -11,7 +11,7 @@
 //! [`ToolContext`]). When cancellation is observed the loop stops promptly,
 //! returns [`StopReason::Cancelled`], and emits no further updates.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::StreamExt;
 use tracing::{debug, warn};
@@ -31,6 +31,14 @@ use crate::tool::ToolRegistry;
 /// guard against a misbehaving backend looping forever.
 pub const DEFAULT_MAX_ITERATIONS: usize = 128;
 
+/// A shared queue of user messages injected into a running turn ("steering").
+///
+/// Messages pushed here by the ACP layer (via `_session/inject`) are drained by
+/// the [`TurnEngine`] between decision rounds and appended to the conversation
+/// as user messages, so they take effect on the next decision call within the
+/// same turn.
+pub type TurnInbox = Arc<StdMutex<Vec<String>>>;
+
 /// Drives the agent turn loop.
 ///
 /// A `TurnEngine` couples a [`NextTurnService`] (the decision layer) with a
@@ -43,6 +51,7 @@ pub struct TurnEngine {
     max_iterations: usize,
     client: Option<Arc<dyn ClientAccess>>,
     depth: usize,
+    inbox: Option<TurnInbox>,
 }
 
 impl TurnEngine {
@@ -54,6 +63,7 @@ impl TurnEngine {
             max_iterations: DEFAULT_MAX_ITERATIONS,
             client: None,
             depth: 0,
+            inbox: None,
         }
     }
 
@@ -68,6 +78,38 @@ impl TurnEngine {
     pub fn with_client(mut self, client: Arc<dyn ClientAccess>) -> Self {
         self.client = Some(client);
         self
+    }
+
+    /// Attach a steering [`TurnInbox`] whose queued user messages are drained
+    /// between decision rounds and appended to the conversation.
+    pub fn with_inbox(mut self, inbox: TurnInbox) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// Drain any queued steering messages into the session as user messages.
+    /// Returns `true` if at least one message was drained.
+    fn drain_inbox(&self, session: &mut SessionState) -> bool {
+        let Some(inbox) = &self.inbox else {
+            return false;
+        };
+        let drained: Vec<String> = {
+            let mut queue = inbox.lock().expect("inbox mutex poisoned");
+            std::mem::take(&mut *queue)
+        };
+        let had_any = !drained.is_empty();
+        for text in drained {
+            debug!("draining injected steering message into turn");
+            session.push_user_text(text);
+        }
+        had_any
+    }
+
+    /// Whether the steering inbox currently has pending messages.
+    fn has_pending_inbox(&self) -> bool {
+        self.inbox
+            .as_ref()
+            .is_some_and(|inbox| !inbox.lock().expect("inbox mutex poisoned").is_empty())
     }
 
     /// Set the subagent nesting depth this engine runs at.
@@ -99,6 +141,10 @@ impl TurnEngine {
                 debug!("cancellation observed before iteration {iteration}");
                 return Ok(StopReason::Cancelled);
             }
+
+            // Fold in any steering messages injected since the previous round so
+            // they become part of the context for this decision call.
+            self.drain_inbox(session);
 
             let ctx = session.turn_context();
             let mut stream = self.next_turn.get_next_turn_streaming(&ctx).await?;
@@ -160,6 +206,11 @@ impl TurnEngine {
                             // The turn paused for tool execution; loop for another
                             // decision round only if a tool was actually run.
                             StopReason::ToolUse if had_tool_call => break,
+                            // The backend would end the turn, but a steering
+                            // message arrived while it was running: keep the turn
+                            // alive and loop so the injected input is answered
+                            // within the same prompt turn.
+                            _ if self.has_pending_inbox() => break,
                             other => return Ok(other),
                         }
                     }

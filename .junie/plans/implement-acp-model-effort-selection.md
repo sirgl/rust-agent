@@ -92,3 +92,14 @@ Expose the elicitation capability to the LLM via a new built-in tool.
 
 ### ✓ Step 5: Add integration tests
 Verify the elicitation flow with end-to-end integration tests using a mock ACP client.
+
+# Plan — Steering (`_session/inject`)
+
+### ✓ Step 6: Add a steering inbox to the turn engine
+Add `TurnInbox` and `TurnEngine::with_inbox`; drain queued user messages between decision rounds and keep the turn alive when a message arrives mid-turn.
+
+### ✓ Step 7: Advertise the `inject` capability and handle `_session/inject`
+Advertise an `inject` meta capability from `initialize`; handle the custom `_session/inject` request: steer a running turn via the inbox, or start a fresh turn when idle.
+
+### ✓ Step 8: Add steering tests
+Engine unit test (mid-turn injection extends the turn) and ACP integration tests (capability advertised, idle injection starts a new turn).

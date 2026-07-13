@@ -27,6 +27,7 @@
 //! the whole session.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
@@ -36,11 +37,15 @@ use agent_client_protocol::schema::v1::{
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, Client, ConnectTo, on_receive_notification, on_receive_request};
+use agent_client_protocol::{
+    Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, MetaCapability, MetaCapabilityExt,
+    on_receive_notification, on_receive_request,
+};
 use agent_core::{
     CancellationToken, NextTurnService, SessionState, StopReason, ToolDescriptor, ToolRegistry,
-    TurnEngine,
+    TurnEngine, TurnInbox,
 };
+use serde::{Deserialize, Serialize};
 use mcp_client::stdio::StdioMcpConnection;
 use mcp_client::{register_mcp_tools, McpConnection};
 use tokio::sync::Mutex as AsyncMutex;
@@ -69,6 +74,44 @@ pub struct AgentDeps {
     pub config: AgentConfig,
 }
 
+/// Wire method name for the steering extension request.
+///
+/// ACP extension methods must start with `_`.
+const INJECT_METHOD: &str = "_session/inject";
+
+/// The `inject` meta capability advertised in `initialize`, signalling that
+/// this agent supports the custom [`INJECT_METHOD`] steering request.
+struct InjectCapability;
+
+impl MetaCapability for InjectCapability {
+    fn key(&self) -> &'static str {
+        "inject"
+    }
+}
+
+/// Parameters for the `_session/inject` steering request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
+#[request(method = "_session/inject", response = InjectResponse)]
+struct InjectRequest {
+    /// The session to steer.
+    #[serde(rename = "sessionId")]
+    session_id: SessionId,
+    /// The message to inject, as prompt content blocks.
+    #[serde(default)]
+    prompt: Vec<ContentBlock>,
+}
+
+/// Response acknowledging a `_session/inject` steering request.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
+struct InjectResponse {
+    /// Whether the injected message was accepted into the session.
+    received: bool,
+    /// Whether the injection started a fresh prompt turn (because no turn was
+    /// running at the time), as opposed to steering an in-flight turn.
+    #[serde(rename = "startedNewTurn")]
+    started_new_turn: bool,
+}
+
 /// Per-session runtime state shared between handlers.
 struct SessionEntry {
     /// The typed session state, guarded for exclusive access during a turn.
@@ -80,6 +123,11 @@ struct SessionEntry {
     tools: ToolRegistry,
     /// Current model and effort selection for this session.
     selection: StdMutex<ModelSelection>,
+    /// Steering inbox: user messages injected via [`INJECT_METHOD`] and drained
+    /// by the running turn between decision rounds.
+    inbox: TurnInbox,
+    /// Whether a prompt turn is currently running for this session.
+    running: Arc<AtomicBool>,
 }
 
 /// Shared registry of active sessions, keyed by session id string.
@@ -101,6 +149,8 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
     let prompt_factory = deps.next_turn_factory.clone();
     let cancel_sessions = sessions.clone();
     let config_sessions = sessions.clone();
+    let inject_sessions = sessions.clone();
+    let inject_factory = deps.next_turn_factory.clone();
 
     Agent
         .builder()
@@ -119,7 +169,10 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     .agent_info(Implementation::new(
                         init_config.name.clone(),
                         init_config.version.clone(),
-                    ));
+                    ))
+                    // Advertise steering support so clients know they may call
+                    // the custom `_session/inject` method.
+                    .add_meta_capability(InjectCapability);
                 responder.respond(response)
             },
             on_receive_request!(),
@@ -158,6 +211,8 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     cancel: StdMutex::new(CancellationToken::new()),
                     tools,
                     selection: StdMutex::new(selection),
+                    inbox: Arc::new(StdMutex::new(Vec::new())),
+                    running: Arc::new(AtomicBool::new(false)),
                 });
                 new_sessions
                     .lock()
@@ -198,6 +253,17 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let tools = entry.tools.clone();
                 let acp_session_id = req.session_id.clone();
 
+                // Seed the turn's inbox with the user's prompt; the engine drains
+                // it (together with any later steering injections) each round.
+                entry
+                    .inbox
+                    .lock()
+                    .expect("inbox mutex poisoned")
+                    .push(user_text);
+                entry.running.store(true, Ordering::SeqCst);
+                let inbox = entry.inbox.clone();
+                let running = entry.running.clone();
+
                 // The turn must run off the event loop so the sink's blocking
                 // permission requests do not deadlock the connection.
                 cx.spawn({
@@ -209,13 +275,15 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                             cx.clone(),
                             acp_session_id.clone(),
                         ));
-                        let engine = TurnEngine::new(next_turn, tools).with_client(client);
+                        let engine = TurnEngine::new(next_turn, tools)
+                            .with_client(client)
+                            .with_inbox(inbox);
                         let mut sink = AcpUpdateSink::new(cx, acp_session_id);
 
                         let mut guard = entry.state.lock().await;
-                        guard.push_user_text(user_text);
                         let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
                         drop(guard);
+                        running.store(false, Ordering::SeqCst);
 
                         match result {
                             Ok(stop) => {
@@ -267,6 +335,89 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 info!(session_id, config_id = %req.config_id.0, "session/set_config_option");
                 responder.respond(SetSessionConfigOptionResponse::new(config_options))
+            },
+            on_receive_request!(),
+        )
+        // _session/inject: steering — inject a user message into the running
+        // turn, or start a fresh turn if none is running.
+        .on_receive_request(
+            async move |req: InjectRequest, responder, cx| {
+                let session_id = req.session_id.0.to_string();
+                let Some(entry) = inject_sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .get(&session_id)
+                    .cloned()
+                else {
+                    warn!(session_id, method = INJECT_METHOD, "inject for unknown session");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("unknown session: {session_id}")),
+                    );
+                };
+
+                let text = prompt_text(&req.prompt);
+                entry
+                    .inbox
+                    .lock()
+                    .expect("inbox mutex poisoned")
+                    .push(text);
+
+                // If a turn is already running, the engine will drain the inbox
+                // on its next round: the message is steered into the current
+                // prompt turn.
+                if entry.running.load(Ordering::SeqCst) {
+                    info!(session_id, method = INJECT_METHOD, "steering: injected into running turn");
+                    return responder.respond(InjectResponse {
+                        received: true,
+                        started_new_turn: false,
+                    });
+                }
+
+                // Otherwise the previous turn already stopped; start a fresh turn
+                // so the user perceives a new prompt turn beginning.
+                info!(session_id, method = INJECT_METHOD, "steering: starting new turn");
+                let cancel = CancellationToken::new();
+                *entry.cancel.lock().expect("cancel mutex poisoned") = cancel.clone();
+                entry.running.store(true, Ordering::SeqCst);
+
+                let factory = inject_factory.clone();
+                let tools = entry.tools.clone();
+                let inbox = entry.inbox.clone();
+                let running = entry.running.clone();
+                let acp_session_id = req.session_id.clone();
+                let turn_entry = entry.clone();
+
+                cx.spawn({
+                    let cx = cx.clone();
+                    let selection =
+                        entry.selection.lock().expect("selection mutex poisoned").clone();
+                    async move {
+                        let next_turn = factory(&selection);
+                        let client =
+                            Arc::new(AcpClientAccess::new(cx.clone(), acp_session_id.clone()));
+                        let engine = TurnEngine::new(next_turn, tools)
+                            .with_client(client)
+                            .with_inbox(inbox);
+                        let mut sink = AcpUpdateSink::new(cx, acp_session_id);
+
+                        let mut guard = turn_entry.state.lock().await;
+                        let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
+                        drop(guard);
+                        running.store(false, Ordering::SeqCst);
+                        if let Err(err) = result {
+                            warn!(session_id, %err, "steering turn failed");
+                        } else {
+                            debug!(session_id, "steering turn finished");
+                        }
+                        Ok(())
+                    }
+                })?;
+
+                responder.respond(InjectResponse {
+                    received: true,
+                    started_new_turn: true,
+                })
             },
             on_receive_request!(),
         )

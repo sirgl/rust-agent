@@ -31,7 +31,7 @@ pub use client::{ClientAccess, ElicitationOutcome, TerminalOutcome};
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };
-pub use engine::TurnEngine;
+pub use engine::{TurnEngine, TurnInbox};
 pub use error::{AgentError, Result, TurnError};
 pub use event::{PlanStep, PlanStepStatus, PlanUpdate, StopReason, ToolCallId, TurnEvent};
 pub use history::{
