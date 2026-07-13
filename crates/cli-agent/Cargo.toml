@@ -1,0 +1,24 @@
+[package]
+name = "cli-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "cli_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cli-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+acp-agent.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+futures.workspace = true

@@ -1,0 +1,30 @@
+[package]
+name = "acp-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "acp_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "acp-agent"
+path = "src/main.rs"
+
+[dependencies]
+agent-core.workspace = true
+turn-anthropic.workspace = true
+turn-replay.workspace = true
+tools-builtin.workspace = true
+mcp-client.workspace = true
+subagents.workspace = true
+agent-client-protocol.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

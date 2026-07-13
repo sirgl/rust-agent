@@ -1,0 +1,224 @@
+//! End-to-end test proving MCP tools become available through *real* runtime
+//! wiring: `session/new`'s `mcp_servers` connects an actual child-process MCP
+//! server (over stdio), registers its tools into that session's registry, and
+//! a subsequent `session/prompt` can dispatch a tool call against it -- not
+//! just the seam-level unit tests in `mcp-client` that exercise an in-memory
+//! stub or a directly-constructed [`StdioMcpConnection`].
+
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::sync::{Arc, Mutex};
+
+use agent_client_protocol::schema::v1::{
+    ContentBlock, InitializeRequest, McpServer, McpServerStdio, NewSessionRequest, PromptRequest,
+    SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
+};
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::{Client, on_receive_notification};
+use agent_core::{NextTurnService, StopReason as CoreStopReason, ToolCallId, ToolRegistry, TurnEvent};
+use serde_json::json;
+
+use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
+
+/// A tiny, self-contained MCP server implemented as a POSIX shell script; see
+/// `mcp-client/src/stdio.rs`'s own tests for the same fixture used to exercise
+/// [`StdioMcpConnection`] directly. It answers `initialize`, `tools/list`
+/// (advertising a single `ping` tool), and `tools/call`.
+const MOCK_SERVER: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}}\n' "$id"
+      ;;
+    *'"method":"notifications/initialized"'*)
+      : ;;
+    *'"method":"tools/list"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"ping","description":"pong back","inputSchema":{"type":"object"}}]}}\n' "$id"
+      ;;
+    *'"method":"tools/call"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}\n' "$id"
+      ;;
+  esac
+done
+"#;
+
+/// Write the mock server script to a fresh temp file and mark it executable.
+fn write_mock_server() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!(
+        "acp-agent-mock-mcp-{}-{nanos}.sh",
+        std::process::id()
+    ));
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(MOCK_SERVER.as_bytes()).unwrap();
+    file.flush().unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// Build [`AgentDeps`] whose decision layer replays the given scripted rounds,
+/// with an otherwise-empty base tool registry (any tools available during the
+/// turn must come from the session's own `mcp_servers`, proving the runtime
+/// wiring path rather than a pre-populated base registry).
+fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
+    let factory: NextTurnFactory = Arc::new(move || {
+        let service: Arc<dyn NextTurnService> =
+            Arc::new(turn_replay::ReplayTurnService::new(script.clone()));
+        service
+    });
+    AgentDeps {
+        next_turn_factory: factory,
+        tools: ToolRegistry::new(),
+        config: AgentConfig {
+            enable_subagents: false,
+            ..AgentConfig::default()
+        },
+    }
+}
+
+/// A two-round script: request the MCP-provided `ping` tool, then finish.
+fn mcp_tool_call_script() -> Vec<Vec<TurnEvent>> {
+    vec![
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-1"),
+                name: "mcp__mockserver__ping".to_string(),
+                arguments: json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: CoreStopReason::ToolUse,
+            },
+        ],
+        vec![
+            TurnEvent::TextDelta("done".to_string()),
+            TurnEvent::TurnFinished {
+                stop_reason: CoreStopReason::EndTurn,
+            },
+        ],
+    ]
+}
+
+#[tokio::test]
+async fn mcp_stdio_server_from_session_new_is_callable_in_prompt_turn() {
+    let server_path = write_mock_server();
+
+    let deps = deps_with_script(mcp_tool_call_script());
+    let agent = build_agent(deps);
+
+    let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
+    let collected = updates.clone();
+
+    let server_path_for_request = server_path.clone();
+    let stop = Client
+        .builder()
+        .name("test-client")
+        .on_receive_notification(
+            async move |notif: SessionNotification, _cx| {
+                collected.lock().unwrap().push(notif.update);
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(agent, async move |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+
+            // This is the ACP-native path: the client declares the MCP server
+            // it wants for this session directly in `session/new`, exactly as
+            // a real editor would.
+            let new_session = cx
+                .send_request(
+                    NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Stdio(
+                        McpServerStdio::new("mockserver", server_path_for_request),
+                    )]),
+                )
+                .block_task()
+                .await?;
+
+            let response = cx
+                .send_request(PromptRequest::new(
+                    new_session.session_id,
+                    vec![ContentBlock::from("ping the mcp server")],
+                ))
+                .block_task()
+                .await?;
+            Ok(response.stop_reason)
+        })
+        .await
+        .expect("connection completed");
+
+    let _ = std::fs::remove_file(&server_path);
+
+    assert_eq!(stop, StopReason::EndTurn);
+
+    let statuses: Vec<ToolCallStatus> = updates
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|update| match update {
+            SessionUpdate::ToolCall(call) => Some(call.status),
+            SessionUpdate::ToolCallUpdate(update) => update.fields.status,
+            _ => None,
+        })
+        .collect();
+    // The MCP tool was genuinely connected and dispatched at runtime: pending
+    // (creation) -> in_progress -> completed, never failed.
+    assert!(statuses.contains(&ToolCallStatus::InProgress));
+    assert!(statuses.contains(&ToolCallStatus::Completed));
+    assert!(!statuses.contains(&ToolCallStatus::Failed));
+}
+
+#[tokio::test]
+async fn unknown_mcp_transport_is_skipped_without_failing_session_new() {
+    // A server with no matching tool still lets session/new succeed and the
+    // turn proceed (unresolved tool calls fail gracefully rather than
+    // panicking or blocking session creation).
+    let deps = deps_with_script(vec![vec![
+        TurnEvent::TextDelta("hi".to_string()),
+        TurnEvent::TurnFinished {
+            stop_reason: CoreStopReason::EndTurn,
+        },
+    ]]);
+    let agent = build_agent(deps);
+
+    let stop = Client
+        .builder()
+        .name("test-client")
+        .connect_with(agent, async move |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let new_session = cx
+                .send_request(
+                    NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Http(
+                        agent_client_protocol::schema::v1::McpServerHttp::new(
+                            "unsupported-http",
+                            "https://example.invalid/mcp",
+                        ),
+                    )]),
+                )
+                .block_task()
+                .await?;
+            let response = cx
+                .send_request(PromptRequest::new(
+                    new_session.session_id,
+                    vec![ContentBlock::from("hi")],
+                ))
+                .block_task()
+                .await?;
+            Ok(response.stop_reason)
+        })
+        .await
+        .expect("connection completed");
+
+    assert_eq!(stop, StopReason::EndTurn);
+}

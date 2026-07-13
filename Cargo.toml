@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-core",
+    "crates/turn-anthropic",
+    "crates/turn-replay",
+    "crates/tools-builtin",
+    "crates/mcp-client",
+    "crates/subagents",
+    "crates/orchestrated",
+    "crates/acp-agent",
+    "crates/cli-agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+agent-client-protocol = "1.2"
+async-trait = "0.1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Internal crates
+agent-core = { path = "crates/agent-core" }
+turn-anthropic = { path = "crates/turn-anthropic" }
+turn-replay = { path = "crates/turn-replay" }
+tools-builtin = { path = "crates/tools-builtin" }
+mcp-client = { path = "crates/mcp-client" }
+subagents = { path = "crates/subagents" }
+orchestrated = { path = "crates/orchestrated" }
+acp-agent = { path = "crates/acp-agent" }

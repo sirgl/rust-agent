@@ -1,0 +1,159 @@
+//! The [`AcpUpdateSink`]: maps [`agent_core`] engine output to ACP
+//! `session/update` notifications and `session/request_permission` requests.
+//!
+//! The sink is deliberately thin: it owns a clone of the [`ConnectionTo<Client>`]
+//! handle plus the session id, and translates each [`EngineOutput`] emitted by
+//! the [`agent_core::TurnEngine`] into the corresponding [`SessionUpdate`],
+//! forwarding it as it arrives (no buffering of the full turn). Permission
+//! requests are issued as a blocking `session/request_permission` round-trip.
+//!
+//! NOTE: because permission requests block on a client response, the sink MUST
+//! be driven from a spawned task (via [`ConnectionTo::spawn`]), never directly
+//! on the JSON-RPC event loop, otherwise `block_task` would deadlock.
+
+use agent_client_protocol::schema::v1::{
+    Content, ContentBlock, ContentChunk, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
+    PlanEntryPriority, PlanEntryStatus, RequestPermissionOutcome, RequestPermissionRequest,
+    SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus as AcpToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+};
+use agent_client_protocol::{Client, ConnectionTo};
+use agent_core::{
+    AgentError, EngineOutput, PlanStepStatus, PlanUpdate, Result, ToolCallId, ToolCallStatus,
+    UpdateSink,
+};
+use async_trait::async_trait;
+use tracing::debug;
+
+/// Permission option id used to signal the user granted the tool call.
+const ALLOW_OPTION_ID: &str = "allow-once";
+/// Permission option id used to signal the user denied the tool call.
+const REJECT_OPTION_ID: &str = "reject-once";
+
+/// An [`UpdateSink`] that emits ACP notifications over a live connection.
+pub struct AcpUpdateSink {
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+}
+
+impl AcpUpdateSink {
+    /// Create a sink bound to a connection and session.
+    #[must_use]
+    pub fn new(cx: ConnectionTo<Client>, session_id: SessionId) -> Self {
+        Self { cx, session_id }
+    }
+
+    /// Send a single `session/update` notification, mapping transport errors.
+    fn notify(&self, update: SessionUpdate) -> Result<()> {
+        self.cx
+            .send_notification(SessionNotification::new(self.session_id.clone(), update))
+            .map_err(|err| AgentError::Other(format!("failed to send session/update: {err}")))
+    }
+}
+
+#[async_trait]
+impl UpdateSink for AcpUpdateSink {
+    async fn send(&mut self, output: EngineOutput) -> Result<()> {
+        match output {
+            EngineOutput::MessageChunk(text) => {
+                self.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                    text_block(text),
+                )))
+            }
+            EngineOutput::ThinkingChunk(text) => {
+                self.notify(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
+                    text_block(text),
+                )))
+            }
+            EngineOutput::Plan(plan) => self.notify(SessionUpdate::Plan(map_plan(&plan))),
+            EngineOutput::ToolCall { id, name, status } => {
+                let tool_call = ToolCall::new(id.0, name).status(map_status(status));
+                self.notify(SessionUpdate::ToolCall(tool_call))
+            }
+            EngineOutput::ToolCallUpdate { id, status, output } => {
+                let mut fields = ToolCallUpdateFields::new().status(map_status(status));
+                if let Some(text) = output {
+                    if !text.is_empty() {
+                        fields = fields.content(vec![ToolCallContent::Content(Content::new(
+                            text_block(text),
+                        ))]);
+                    }
+                }
+                self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.0, fields)))
+            }
+        }
+    }
+
+    async fn request_permission(&mut self, id: &ToolCallId, tool_name: &str) -> Result<bool> {
+        let tool_call = ToolCallUpdate::new(
+            id.0.clone(),
+            ToolCallUpdateFields::new()
+                .title(Some(tool_name.to_string()))
+                .status(AcpToolCallStatus::Pending),
+        );
+        let options = vec![
+            PermissionOption::new(ALLOW_OPTION_ID, "Allow", PermissionOptionKind::AllowOnce),
+            PermissionOption::new(REJECT_OPTION_ID, "Reject", PermissionOptionKind::RejectOnce),
+        ];
+        let request = RequestPermissionRequest::new(self.session_id.clone(), tool_call, options);
+
+        let response = self
+            .cx
+            .send_request(request)
+            .block_task()
+            .await
+            .map_err(|err| {
+                AgentError::Other(format!("session/request_permission failed: {err}"))
+            })?;
+
+        let granted = match response.outcome {
+            RequestPermissionOutcome::Selected(selected) => {
+                &*selected.option_id.0 == ALLOW_OPTION_ID
+            }
+            // Cancelled (or any future variant) is treated as "not granted".
+            _ => false,
+        };
+        debug!(tool = tool_name, granted, "permission decision received");
+        Ok(granted)
+    }
+}
+
+/// Wrap a plain string as a text [`ContentBlock`].
+fn text_block(text: String) -> ContentBlock {
+    ContentBlock::Text(TextContent::new(text))
+}
+
+/// Map an [`agent_core`] tool-call status to the ACP schema equivalent.
+fn map_status(status: ToolCallStatus) -> AcpToolCallStatus {
+    match status {
+        ToolCallStatus::Pending => AcpToolCallStatus::Pending,
+        ToolCallStatus::InProgress => AcpToolCallStatus::InProgress,
+        ToolCallStatus::Completed => AcpToolCallStatus::Completed,
+        ToolCallStatus::Failed => AcpToolCallStatus::Failed,
+    }
+}
+
+/// Map a provider-agnostic [`PlanUpdate`] to an ACP [`Plan`].
+fn map_plan(plan: &PlanUpdate) -> Plan {
+    let entries = plan
+        .steps
+        .iter()
+        .map(|step| {
+            PlanEntry::new(
+                step.content.clone(),
+                PlanEntryPriority::Medium,
+                map_plan_status(step.status),
+            )
+        })
+        .collect();
+    Plan::new(entries)
+}
+
+/// Map a plan-step status to the ACP plan-entry status.
+fn map_plan_status(status: PlanStepStatus) -> PlanEntryStatus {
+    match status {
+        PlanStepStatus::Pending => PlanEntryStatus::Pending,
+        PlanStepStatus::InProgress => PlanEntryStatus::InProgress,
+        PlanStepStatus::Completed => PlanEntryStatus::Completed,
+    }
+}

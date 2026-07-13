@@ -1,0 +1,146 @@
+//! The services layer: callable [`Tool`]s and the [`ToolRegistry`].
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use futures::stream::BoxStream;
+
+use crate::cancel::CancellationToken;
+use crate::client::ClientAccess;
+use crate::error::{AgentError, Result};
+use crate::event::ToolCallId;
+
+/// A streaming event emitted while a tool executes.
+#[derive(Debug, Clone)]
+pub enum ToolEvent {
+    /// The tool has started executing.
+    Started,
+    /// An incremental chunk of human-readable output.
+    OutputDelta(String),
+    /// The tool finished successfully with a final result payload.
+    Completed(serde_json::Value),
+    /// The tool failed with a descriptive message.
+    Failed(String),
+}
+
+/// Context passed to a [`Tool`] when it is invoked.
+///
+/// Holds access needed to perform work: the session id, a cancellation token
+/// shared with the turn engine, and the current subagent nesting depth (used to
+/// bound recursion).
+#[derive(Clone)]
+pub struct ToolContext {
+    /// The id of the session this tool call belongs to.
+    pub session_id: String,
+    /// Cancellation token observed by the tool.
+    pub cancel: CancellationToken,
+    /// Current subagent nesting depth (0 for a top-level turn).
+    pub depth: usize,
+    /// Provider-independent access to the ACP client (fs/terminal).
+    ///
+    /// Optional so tests and non-ACP contexts (e.g. the replay integration
+    /// tests) can build a context without a live client. Tools that need it
+    /// should obtain it via [`ToolContext::client`], which yields a structured
+    /// error when absent rather than panicking.
+    pub client: Option<Arc<dyn ClientAccess>>,
+}
+
+impl ToolContext {
+    /// Create a new tool context for the given session, without a client.
+    pub fn new(session_id: impl Into<String>, cancel: CancellationToken) -> Self {
+        Self {
+            session_id: session_id.into(),
+            cancel,
+            depth: 0,
+            client: None,
+        }
+    }
+
+    /// Attach a [`ClientAccess`] implementation to this context.
+    pub fn with_client(mut self, client: Arc<dyn ClientAccess>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Access the [`ClientAccess`] handle, or a structured error if none is set.
+    pub fn client(&self) -> Result<&Arc<dyn ClientAccess>> {
+        self.client.as_ref().ok_or_else(|| {
+            AgentError::Other("no client access available for this tool context".to_string())
+        })
+    }
+}
+
+/// A callable capability invoked by the turn engine.
+#[async_trait]
+pub trait Tool: Send + Sync {
+    /// The unique name used to reference this tool.
+    fn name(&self) -> &str;
+
+    /// JSON schema describing the tool's arguments.
+    fn schema(&self) -> serde_json::Value;
+
+    /// Whether this tool requires explicit user permission before execution.
+    fn requires_permission(&self) -> bool;
+
+    /// Execute the tool, streaming [`ToolEvent`]s back to the caller.
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>>;
+}
+
+/// A registry mapping tool names to their implementations.
+#[derive(Default, Clone)]
+pub struct ToolRegistry {
+    tools: HashMap<String, Arc<dyn Tool>>,
+}
+
+impl ToolRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register a tool, keyed by its [`Tool::name`].
+    pub fn register(&mut self, tool: Arc<dyn Tool>) {
+        self.tools.insert(tool.name().to_string(), tool);
+    }
+
+    /// Look up a tool by name.
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
+    }
+
+    /// Whether a tool with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
+    /// The number of registered tools.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty()
+    }
+
+    /// Iterate over the names of all registered tools.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tools.keys().map(|s| s.as_str())
+    }
+}
+
+/// The outcome of dispatching a tool call, fed back into the conversation.
+#[derive(Debug, Clone)]
+pub struct ToolResult {
+    /// The tool call this result corresponds to.
+    pub id: ToolCallId,
+    /// Whether the call succeeded.
+    pub success: bool,
+    /// A textual summary suitable for feeding back to the decision layer.
+    pub content: String,
+}

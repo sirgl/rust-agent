@@ -1,0 +1,18 @@
+[package]
+name = "orchestrated"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Orchestrated execution: an orchestrator LLM drives sub-agents in modes via a single run_subagent tool."
+
+[dependencies]
+agent-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+turn-replay.workspace = true
+tokio.workspace = true
