@@ -11,7 +11,24 @@
 
 use async_trait::async_trait;
 
-use crate::error::Result;
+use crate::error::{AgentError, Result};
+
+/// The outcome of an elicitation request (structured user input) sent to the
+/// client.
+///
+/// Provider-independent mirror of the ACP `elicitation/create` response: the
+/// user either accepts and provides content matching the requested schema,
+/// declines, or the request is cancelled.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationOutcome {
+    /// The user accepted and provided content, as a JSON object matching the
+    /// requested schema (may be empty).
+    Accepted(serde_json::Value),
+    /// The user declined to provide the requested input.
+    Declined,
+    /// The elicitation was cancelled (e.g. the turn was interrupted).
+    Cancelled,
+}
 
 /// The outcome of running a terminal command via the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,4 +66,24 @@ pub trait ClientAccess: Send + Sync {
 
     /// Run a terminal command, waiting for it to exit, and return its outcome.
     async fn run_terminal(&self, command: &str, args: &[String]) -> Result<TerminalOutcome>;
+
+    /// Request structured input from the user via a form.
+    ///
+    /// `message` is a human-readable description of what input is needed, and
+    /// `requested_schema` is a JSON Schema (an `"object"` schema) describing the
+    /// form fields. Blocks until the user responds, returning an
+    /// [`ElicitationOutcome`].
+    ///
+    /// The default implementation reports the capability as unsupported; the
+    /// ACP binary overrides it with a live `elicitation/create` request.
+    async fn request_elicitation(
+        &self,
+        message: &str,
+        requested_schema: serde_json::Value,
+    ) -> Result<ElicitationOutcome> {
+        let _ = (message, requested_schema);
+        Err(AgentError::Other(
+            "elicitation is not supported by this client".to_string(),
+        ))
+    }
 }

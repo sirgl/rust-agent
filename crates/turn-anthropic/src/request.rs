@@ -18,6 +18,31 @@
 use agent_core::{LlmMessage, LlmRequest, LlmRole};
 use serde_json::{json, Map, Value};
 
+/// Selection of "effort" (reasoning/thought level) for the response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Low effort (faster, less reasoning).
+    Low,
+    /// Medium effort (balanced).
+    Medium,
+    /// High effort (slower, more reasoning).
+    High,
+}
+
+impl std::str::FromStr for Effort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "low" => Ok(Effort::Low),
+            "medium" => Ok(Effort::Medium),
+            "high" => Ok(Effort::High),
+            _ => Err(format!("invalid effort: {}", s)),
+        }
+    }
+}
+
 /// Static configuration for talking to the Anthropic Messages API.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -25,6 +50,8 @@ pub struct AnthropicConfig {
     pub api_key: String,
     /// Model identifier (e.g. `claude-sonnet-5`).
     pub model: String,
+    /// Selection of effort level.
+    pub effort: Option<Effort>,
     /// Maximum number of tokens to sample for the response.
     pub max_tokens: u32,
     /// Base URL of the messages endpoint (override for tests/proxies).
@@ -46,6 +73,7 @@ impl AnthropicConfig {
         Self {
             api_key: api_key.into(),
             model: model.into(),
+            effort: None,
             max_tokens: 4096,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
@@ -56,8 +84,8 @@ impl AnthropicConfig {
     /// `ANTHROPIC_API_KEY` (optional; falls back to the default
     /// `token.properties` key file described in
     /// [`load_default_api_key`] when unset), `ANTHROPIC_MODEL` (optional),
-    /// `ANTHROPIC_BASE_URL` (optional). Returns `None` if no API key can be
-    /// resolved from either source.
+    /// `ANTHROPIC_EFFORT` (optional), `ANTHROPIC_BASE_URL` (optional).
+    /// Returns `None` if no API key can be resolved from either source.
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .ok()
@@ -66,6 +94,11 @@ impl AnthropicConfig {
         let model =
             std::env::var("ANTHROPIC_MODEL").unwrap_or_else(|_| Self::DEFAULT_MODEL.to_string());
         let mut cfg = Self::new(api_key, model);
+        if let Ok(effort_str) = std::env::var("ANTHROPIC_EFFORT") {
+            if let Ok(effort) = effort_str.parse() {
+                cfg.effort = Some(effort);
+            }
+        }
         if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
             cfg.base_url = base;
         }
@@ -195,6 +228,10 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
     body.insert("max_tokens".into(), json!(config.max_tokens));
     body.insert("stream".into(), json!(true));
     body.insert("messages".into(), Value::Array(messages));
+
+    if let Some(effort) = config.effort {
+        body.insert("output_config".into(), json!({ "effort": effort }));
+    }
 
     if !system_parts.is_empty() {
         body.insert("system".into(), json!(system_parts.join("\n\n")));
@@ -371,6 +408,49 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn effort_parsing() {
+        assert_eq!("low".parse::<Effort>().unwrap(), Effort::Low);
+        assert_eq!("MEDIUM".parse::<Effort>().unwrap(), Effort::Medium);
+        assert_eq!("High".parse::<Effort>().unwrap(), Effort::High);
+        assert!("invalid".parse::<Effort>().is_err());
+    }
+
+    #[test]
+    fn builds_body_with_effort() {
+        let mut cfg = cfg();
+        cfg.effort = Some(Effort::High);
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn builds_body_without_effort_omits_field() {
+        let cfg = cfg(); // effort is None by default
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn from_env_reads_effort() {
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-test");
+        std::env::set_var("ANTHROPIC_EFFORT", "medium");
+        let cfg = AnthropicConfig::from_env().unwrap();
+        assert_eq!(cfg.effort, Some(Effort::Medium));
+        std::env::remove_var("ANTHROPIC_EFFORT");
+
+        std::env::set_var("ANTHROPIC_EFFORT", "invalid");
+        let cfg = AnthropicConfig::from_env().unwrap();
+        assert_eq!(cfg.effort, None); // Should ignore invalid effort
+        std::env::remove_var("ANTHROPIC_EFFORT");
     }
 
     #[test]

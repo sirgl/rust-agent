@@ -28,7 +28,7 @@ use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
 
 /// Build [`AgentDeps`] whose decision layer replays the given scripted rounds.
 fn deps_with_script(script: Vec<Vec<TurnEvent>>, tools: ToolRegistry) -> AgentDeps {
-    let factory: NextTurnFactory = Arc::new(move || {
+    let factory: NextTurnFactory = Arc::new(move |_selection| {
         let service: Arc<dyn NextTurnService> =
             Arc::new(turn_replay::ReplayTurnService::new(script.clone()));
         service

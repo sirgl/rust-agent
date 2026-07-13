@@ -27,7 +27,7 @@ pub mod sink;
 pub mod tool;
 
 pub use cancel::CancellationToken;
-pub use client::{ClientAccess, TerminalOutcome};
+pub use client::{ClientAccess, ElicitationOutcome, TerminalOutcome};
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };

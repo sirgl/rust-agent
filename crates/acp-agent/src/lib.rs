@@ -17,6 +17,7 @@
 pub mod agent;
 pub mod client;
 pub mod config;
+pub mod selection;
 pub mod sink;
 
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use turn_replay::ReplayTurnService;
 pub use agent::{build_agent, AgentDeps, NextTurnFactory};
 pub use client::AcpClientAccess;
 pub use config::AgentConfig;
+pub use selection::ModelSelection;
 pub use sink::AcpUpdateSink;
 
 // Re-export the capability seams so downstream wiring/tests can construct MCP
@@ -43,7 +45,7 @@ pub use mcp_client::{McpConnection as McpConnectionTrait, McpServerConfig, McpTo
 /// full streaming prompt turn deterministically, without any network access.
 #[must_use]
 pub fn canned_replay_factory() -> NextTurnFactory {
-    Arc::new(|| {
+    Arc::new(|_selection| {
         let service: Arc<dyn NextTurnService> = Arc::new(ReplayTurnService::single(vec![
             TurnEvent::TextDelta("Hello from the replay backend! ".to_string()),
             TurnEvent::TextDelta("This turn was produced without any network.".to_string()),
@@ -67,9 +69,12 @@ pub fn canned_replay_factory() -> NextTurnFactory {
 #[must_use]
 pub fn anthropic_factory() -> Option<NextTurnFactory> {
     let config = turn_anthropic::AnthropicConfig::from_env()?;
-    Some(Arc::new(move || {
+    Some(Arc::new(move |selection| {
+        let mut turn_config = config.clone();
+        turn_config.model = selection.model.clone();
+        turn_config.effort = Some(selection.effort);
         let service: Arc<dyn NextTurnService> =
-            Arc::new(turn_anthropic::AnthropicTurnService::new(config.clone()));
+            Arc::new(turn_anthropic::AnthropicTurnService::new(turn_config));
         service
     }))
 }
@@ -87,7 +92,12 @@ pub fn build_registry(config: &AgentConfig, next_turn_factory: &NextTurnFactory)
     if config.enable_subagents {
         // The subagent drives its own nested engine using the same decision
         // backend as the parent turn, over a copy of the built-in tools.
-        let nested_backend = next_turn_factory();
+        //
+        // Subagents remain out of scope for client-driven selection changes
+        // in v1, so we build them once with the intentional default selection
+        // derived from the agent configuration.
+        let selection = ModelSelection::for_config(config);
+        let nested_backend = next_turn_factory(&selection);
         let nested_tools = tools_builtin::builtin_registry();
         let subagent = SubagentTool::new(nested_backend, nested_tools)
             .with_max_depth(config.subagent_max_depth);

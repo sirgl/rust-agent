@@ -31,6 +31,8 @@ pub struct AgentConfig {
     /// scope for v1. When enabled, callers assemble an orchestrator from the
     /// `orchestrated` crate using the same backend factories.
     pub enable_orchestrated: bool,
+    /// Default model used for new sessions.
+    pub default_model: String,
 }
 
 impl Default for AgentConfig {
@@ -43,6 +45,7 @@ impl Default for AgentConfig {
             subagent_max_depth: DEFAULT_MAX_DEPTH,
             mcp_servers: Vec::new(),
             enable_orchestrated: false,
+            default_model: "claude-3-5-sonnet-latest".to_string(),
         }
     }
 }
@@ -54,6 +57,7 @@ impl AgentConfig {
     /// - `ACP_AGENT_NAME` overrides the advertised implementation name.
     /// - `ACP_AGENT_SYSTEM_PROMPT` seeds a system prompt into new sessions.
     /// - `ACP_ORCHESTRATED` (`1`/`true`/`yes`/`on`) enables orchestrated mode.
+    /// - `ANTHROPIC_MODEL` overrides the default model.
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -70,6 +74,30 @@ impl AgentConfig {
         if let Ok(v) = std::env::var("ACP_ORCHESTRATED") {
             config.enable_orchestrated = matches!(v.trim(), "1" | "true" | "yes" | "on");
         }
+        if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            if !model.is_empty() {
+                config.default_model = model;
+            }
+        }
         config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_env_reads_model() {
+        std::env::set_var("ANTHROPIC_MODEL", "claude-test");
+        let config = AgentConfig::from_env();
+        assert_eq!(config.default_model, "claude-test");
+        std::env::remove_var("ANTHROPIC_MODEL");
+    }
+
+    #[test]
+    fn default_model_is_sonnet() {
+        let config = AgentConfig::default();
+        assert_eq!(config.default_model, "claude-3-5-sonnet-latest");
     }
 }

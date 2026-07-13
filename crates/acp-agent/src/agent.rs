@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, ContentBlock,
     Implementation, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, StopReason as AcpStopReason,
+    NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason as AcpStopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectTo, on_receive_notification, on_receive_request};
@@ -47,6 +48,7 @@ use tracing::{debug, info, warn};
 
 use crate::client::AcpClientAccess;
 use crate::config::AgentConfig;
+use crate::selection::ModelSelection;
 use crate::sink::AcpUpdateSink;
 
 /// Factory that produces a fresh [`NextTurnService`] for each prompt turn.
@@ -54,7 +56,7 @@ use crate::sink::AcpUpdateSink;
 /// A fresh instance per turn keeps stateful backends (e.g. the deterministic
 /// replay backend, which consumes scripted rounds) well-behaved across multiple
 /// prompts in the same session.
-pub type NextTurnFactory = Arc<dyn Fn() -> Arc<dyn NextTurnService> + Send + Sync>;
+pub type NextTurnFactory = Arc<dyn Fn(&ModelSelection) -> Arc<dyn NextTurnService> + Send + Sync>;
 
 /// Dependencies required to build the agent connection.
 #[derive(Clone)]
@@ -76,6 +78,8 @@ struct SessionEntry {
     /// This session's tool registry: the base tools plus any tools
     /// discovered from the session's `mcp_servers` at `session/new` time.
     tools: ToolRegistry,
+    /// Current model and effort selection for this session.
+    selection: StdMutex<ModelSelection>,
 }
 
 /// Shared registry of active sessions, keyed by session id string.
@@ -96,6 +100,7 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
     let prompt_sessions = sessions.clone();
     let prompt_factory = deps.next_turn_factory.clone();
     let cancel_sessions = sessions.clone();
+    let config_sessions = sessions.clone();
 
     Agent
         .builder()
@@ -145,10 +150,14 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 state.system_prompt = new_session_config.system_prompt.clone();
                 state.available_tools = tool_descriptors(&tools);
 
+                let selection = ModelSelection::for_config(&new_session_config);
+                let config_options = selection.config_options();
+
                 let entry = Arc::new(SessionEntry {
                     state: Arc::new(AsyncMutex::new(state)),
                     cancel: StdMutex::new(CancellationToken::new()),
                     tools,
+                    selection: StdMutex::new(selection),
                 });
                 new_sessions
                     .lock()
@@ -156,7 +165,9 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     .insert(session_id.clone(), entry);
 
                 info!(session_id, "session/new");
-                responder.respond(NewSessionResponse::new(SessionId::new(session_id)))
+                responder.respond(
+                    NewSessionResponse::new(SessionId::new(session_id)).config_options(config_options),
+                )
             },
             on_receive_request!(),
         )
@@ -191,8 +202,9 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 // permission requests do not deadlock the connection.
                 cx.spawn({
                     let cx = cx.clone();
+                    let selection = entry.selection.lock().expect("selection mutex poisoned").clone();
                     async move {
-                        let next_turn = factory();
+                        let next_turn = factory(&selection);
                         let client = Arc::new(AcpClientAccess::new(
                             cx.clone(),
                             acp_session_id.clone(),
@@ -221,6 +233,40 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 })?;
 
                 Ok(())
+            },
+            on_receive_request!(),
+        )
+        // session/set_session_config_option: update session-level configuration (e.g.
+        // model/effort) and return the full set of current options.
+        .on_receive_request(
+            async move |req: SetSessionConfigOptionRequest, responder, _cx| {
+                let session_id = req.session_id.0.to_string();
+                let Some(entry) = config_sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .get(&session_id)
+                    .cloned()
+                else {
+                    warn!(session_id, "session/set_config_option for unknown session");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("unknown session: {session_id}")),
+                    );
+                };
+
+                let mut selection = entry.selection.lock().expect("selection mutex poisoned");
+                let json_value = if let Some(id) = req.value.as_value_id() {
+                    serde_json::Value::String(id.0.to_string())
+                } else if let Some(b) = req.value.as_bool() {
+                    serde_json::Value::Bool(b)
+                } else {
+                    serde_json::to_value(req.value).unwrap_or_default()
+                };
+                selection.apply_update(&req.config_id.0, json_value);
+                let config_options = selection.config_options();
+
+                info!(session_id, config_id = %req.config_id.0, "session/set_config_option");
+                responder.respond(SetSessionConfigOptionResponse::new(config_options))
             },
             on_receive_request!(),
         )

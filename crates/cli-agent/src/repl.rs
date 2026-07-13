@@ -15,7 +15,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
-use acp_agent::AgentDeps;
+use acp_agent::{AgentDeps, ModelSelection};
 use agent_core::{
     CancellationToken, ClientAccess, SessionState, StopReason, ToolDescriptor, ToolRegistry,
     TurnEngine,
@@ -103,7 +103,8 @@ where
         session.push_user_text(message);
 
         let cancel = CancellationToken::new();
-        let next_turn = (deps.next_turn_factory)();
+        let selection = ModelSelection::for_config(&deps.config);
+        let next_turn = (deps.next_turn_factory)(&selection);
         let engine = TurnEngine::new(next_turn, deps.tools.clone()).with_client(client.clone());
 
         // Scope the sink so its mutable borrow of `output` is released before we
