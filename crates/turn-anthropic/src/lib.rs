@@ -23,6 +23,7 @@
 #![warn(missing_docs)]
 
 pub mod mapper;
+pub mod models;
 pub mod request;
 pub mod sse;
 
@@ -38,6 +39,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 pub use mapper::StreamMapper;
+pub use models::{default_max_output_tokens, model_spec, ModelSpec, MODELS};
 pub use request::{build_body, load_default_api_key, AnthropicConfig, Effort, ThinkingConfig};
 pub use sse::SseDecoder;
 

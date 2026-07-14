@@ -33,7 +33,11 @@ async fn test_config_options_e2e() {
     let deps = AgentDeps {
         next_turn_factory: factory,
         tools: ToolRegistry::new(),
-        config: AgentConfig::default(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
     };
     let agent = build_agent(deps);
 

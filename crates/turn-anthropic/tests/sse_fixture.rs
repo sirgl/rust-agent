@@ -66,7 +66,8 @@ fn run(bytes: &[u8], chunk_size: usize) -> Vec<TurnEvent> {
 }
 
 fn assert_expected_sequence(events: &[TurnEvent]) {
-    assert_eq!(events.len(), 4, "unexpected events: {events:?}");
+    // Text x2, tool call, then a Usage event followed by TurnFinished.
+    assert_eq!(events.len(), 5, "unexpected events: {events:?}");
     assert!(matches!(&events[0], TurnEvent::TextDelta(t) if t == "Let me "));
     assert!(matches!(&events[1], TurnEvent::TextDelta(t) if t == "read it."));
     match &events[2] {
@@ -81,8 +82,12 @@ fn assert_expected_sequence(events: &[TurnEvent]) {
         }
         other => panic!("expected ToolCallRequested, got {other:?}"),
     }
+    match &events[3] {
+        TurnEvent::Usage(usage) => assert_eq!(usage.output_tokens, 15),
+        other => panic!("expected Usage, got {other:?}"),
+    }
     assert!(matches!(
-        &events[3],
+        &events[4],
         TurnEvent::TurnFinished {
             stop_reason: StopReason::ToolUse
         }

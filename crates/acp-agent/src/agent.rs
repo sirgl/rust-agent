@@ -31,11 +31,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, ContentBlock,
-    Implementation, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
-    SessionModeState, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    SetSessionModeRequest, SetSessionModeResponse, StopReason as AcpStopReason,
+    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, AvailableCommand,
+    AvailableCommandsUpdate, CancelNotification, Content, ContentBlock, ContentChunk,
+    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    McpServer, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
+    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
+    SetSessionModeResponse, StopReason as AcpStopReason, TextContent, ToolCall, ToolCallContent,
+    ToolCallStatus as AcpToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -43,8 +46,8 @@ use agent_client_protocol::{
     on_receive_notification, on_receive_request,
 };
 use agent_core::{
-    CancellationToken, NextTurnService, SessionState, StopReason, ToolDescriptor, ToolRegistry,
-    TurnEngine, TurnInbox,
+    CancellationToken, HistoryEntry, InMemorySessionStore, NextTurnService, SessionRecord,
+    SessionState, SessionStore, StopReason, ToolDescriptor, ToolRegistry, TurnEngine, TurnInbox,
 };
 use serde::{Deserialize, Serialize};
 use mcp_client::stdio::StdioMcpConnection;
@@ -56,6 +59,8 @@ use crate::config::AgentConfig;
 use crate::local_client::LocalClientAccess;
 use crate::selection::ModelSelection;
 use crate::sink::AcpUpdateSink;
+use crate::commands::{parse_command, run_command};
+use crate::usage::USAGE_COMMAND;
 
 /// The mode id for the default plain-chat session mode.
 pub const CHAT_MODE_ID: &str = "chat";
@@ -98,6 +103,33 @@ pub struct AgentDeps {
     pub tools: ToolRegistry,
     /// Static configuration (identity, system prompt).
     pub config: AgentConfig,
+    /// Backing store used to persist session *core* state (history + usage)
+    /// after each turn, so sessions can survive process restarts.
+    ///
+    /// Defaults to [`default_store`] (an [`InMemorySessionStore`]) via
+    /// construction helpers; the binary swaps in a disk-backed store when a
+    /// persistence directory is configured.
+    pub store: Arc<dyn SessionStore>,
+}
+
+/// Build the default [`SessionStore`]: a non-durable [`InMemorySessionStore`].
+///
+/// Used as the ergonomic default for [`AgentDeps::store`] in tests and when no
+/// persistence directory is configured.
+#[must_use]
+pub fn default_store() -> Arc<dyn SessionStore> {
+    Arc::new(InMemorySessionStore::new())
+}
+
+/// Persist the given session's core state via `store`, logging (but not
+/// failing) on error.
+///
+/// Durability is best-effort: a store error must never crash the turn or the
+/// session, so failures are logged and swallowed here.
+async fn persist_record(store: &Arc<dyn SessionStore>, session_id: &str, record: &SessionRecord) {
+    if let Err(err) = store.save(record).await {
+        warn!(session_id, %err, "failed to persist session state");
+    }
 }
 
 /// Wire method name for the steering extension request.
@@ -176,11 +208,22 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
     let new_sessions = sessions.clone();
     let prompt_sessions = sessions.clone();
     let prompt_factory = deps.next_turn_factory.clone();
+    let prompt_require_submit_result = deps.config.require_submit_result;
+    let inject_require_submit_result = deps.config.require_submit_result;
+    let prompt_thought_interval = deps.config.thought_interval;
+    let inject_thought_interval = deps.config.thought_interval;
     let cancel_sessions = sessions.clone();
     let set_mode_sessions = sessions.clone();
     let config_sessions = sessions.clone();
     let inject_sessions = sessions.clone();
     let inject_factory = deps.next_turn_factory.clone();
+    let new_store = deps.store.clone();
+    let prompt_store = deps.store.clone();
+    let inject_store = deps.store.clone();
+    let load_sessions = sessions.clone();
+    let load_session_tools = deps.tools.clone();
+    let load_session_config = deps.config.clone();
+    let load_store = deps.store.clone();
 
     // The initial mode a new session starts in: `orchestrate` when the
     // orchestrated toggle is set (backward-compatible with `ACP_ORCHESTRATED`),
@@ -204,7 +247,7 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     "initialize"
                 );
                 let response = InitializeResponse::new(negotiated)
-                    .agent_capabilities(AgentCapabilities::default())
+                    .agent_capabilities(AgentCapabilities::default().load_session(true))
                     .agent_info(Implementation::new(
                         init_config.name.clone(),
                         init_config.version.clone(),
@@ -228,7 +271,7 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
         // client asked for and registering their tools into this session's own
         // registry.
         .on_receive_request(
-            async move |req: NewSessionRequest, responder, _cx| {
+            async move |req: NewSessionRequest, responder, cx| {
                 let session_id = format!("session-{}", uuid_like());
 
                 let mut tools = new_session_tools.clone();
@@ -245,6 +288,11 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let selection = ModelSelection::for_config(&new_session_config);
                 let config_options = selection.config_options();
 
+                // Persist the freshly-created core state so the session exists
+                // in the store from the outset (best-effort).
+                let record = state.to_record();
+                persist_record(&new_store, &session_id, &record).await;
+
                 let entry = Arc::new(SessionEntry {
                     state: Arc::new(AsyncMutex::new(state)),
                     cancel: StdMutex::new(CancellationToken::new()),
@@ -260,11 +308,98 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     .insert(session_id.clone(), entry);
 
                 info!(session_id, initial_mode = initial_mode_id, "session/new");
+
+                // Advertise the built-in slash commands this agent supports, so
+                // clients can surface them (e.g. `/usage`) and route them back as
+                // prompts.
+                if let Err(err) = cx.send_notification(available_commands_notification(&session_id)) {
+                    warn!(session_id, %err, "failed to advertise available commands");
+                }
                 responder.respond(
                     NewSessionResponse::new(SessionId::new(session_id))
                         .modes(session_mode_state(initial_mode_id))
                         .config_options(config_options),
                 )
+            },
+            on_receive_request!(),
+        )
+        // session/load: restore a persisted session from the store, reconnect
+        // its MCP servers, rehydrate state, replay history to the client, and
+        // re-advertise available commands.
+        .on_receive_request(
+            async move |req: LoadSessionRequest, responder, cx| {
+                let session_id = req.session_id.0.to_string();
+
+                // Read the persisted core state. A missing session is a client
+                // error; a store/deserialization failure is surfaced cleanly
+                // rather than panicking.
+                let record = match load_store.load(&session_id).await {
+                    Ok(Some(record)) => record,
+                    Ok(None) => {
+                        warn!(session_id, "session/load for unknown session");
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data(format!("unknown session: {session_id}")),
+                        );
+                    }
+                    Err(err) => {
+                        warn!(session_id, %err, "session/load failed to read store");
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data(format!("failed to load session {session_id}: {err}")),
+                        );
+                    }
+                };
+
+                // Reconnect any MCP servers the client asked for and re-derive
+                // the live tool set (tool schemas are not persisted).
+                let mut tools = load_session_tools.clone();
+                connect_session_mcp_servers(&session_id, &req.mcp_servers, &mut tools).await;
+
+                let available_tools = tool_descriptors(&tools);
+                let history = record.history.clone();
+                let state = SessionState::from_record(record, available_tools);
+
+                let selection = ModelSelection::for_config(&load_session_config);
+                let config_options = selection.config_options();
+
+                let entry = Arc::new(SessionEntry {
+                    state: Arc::new(AsyncMutex::new(state)),
+                    cancel: StdMutex::new(CancellationToken::new()),
+                    tools,
+                    mode: StdMutex::new(SessionModeId::new(CHAT_MODE_ID)),
+                    selection: StdMutex::new(selection),
+                    inbox: Arc::new(StdMutex::new(Vec::new())),
+                    running: Arc::new(AtomicBool::new(false)),
+                });
+                load_sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .insert(session_id.clone(), entry);
+
+                info!(session_id, entries = history.len(), "session/load");
+
+                // Replay the stored conversation to the client in order, as
+                // `session/update` notifications. Unknown/ingested entries are
+                // skipped (best-effort) rather than failing the load.
+                let acp_session_id = SessionId::new(session_id.clone());
+                for entry in &history.entries {
+                    if let Some(update) = history_entry_to_update(entry) {
+                        let notification =
+                            SessionNotification::new(acp_session_id.clone(), update);
+                        if let Err(err) = cx.send_notification(notification) {
+                            warn!(session_id, %err, "failed to replay history entry");
+                        }
+                    }
+                }
+
+                // Re-advertise the built-in slash commands so the reloaded
+                // session exposes the same commands as a fresh one.
+                if let Err(err) = cx.send_notification(available_commands_notification(&session_id)) {
+                    warn!(session_id, %err, "failed to advertise available commands");
+                }
+
+                responder.respond(LoadSessionResponse::new().config_options(config_options))
             },
             on_receive_request!(),
         )
@@ -285,13 +420,41 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     );
                 };
 
+                let user_text = prompt_text(&req.prompt);
+
+                // Intercept built-in slash commands (e.g. `/usage`): produce the
+                // command's display text as a plain agent message, without
+                // running a model turn.
+                if let Some(command) = parse_command(&user_text) {
+                    let model = entry
+                        .selection
+                        .lock()
+                        .expect("selection mutex poisoned")
+                        .model
+                        .clone();
+                    let summary = {
+                        let guard = entry.state.lock().await;
+                        run_command(command, &guard, &model)
+                    };
+                    let notification = SessionNotification::new(
+                        req.session_id.clone(),
+                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                            TextContent::new(summary),
+                        ))),
+                    );
+                    if let Err(err) = cx.send_notification(notification) {
+                        warn!(session_id, %err, "failed to send /usage summary");
+                    }
+                    return responder.respond(PromptResponse::new(AcpStopReason::EndTurn));
+                }
+
                 // Fresh cancellation token for this turn; stored so session/cancel
                 // can reach both the decision stream and running tools.
                 let cancel = CancellationToken::new();
                 *entry.cancel.lock().expect("cancel mutex poisoned") = cancel.clone();
-
-                let user_text = prompt_text(&req.prompt);
                 let factory = prompt_factory.clone();
+                let require_submit_result = prompt_require_submit_result;
+                let thought_interval = prompt_thought_interval;
                 let tools = entry.tools.clone();
                 let acp_session_id = req.session_id.clone();
 
@@ -307,6 +470,7 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 entry.running.store(true, Ordering::SeqCst);
                 let inbox = entry.inbox.clone();
                 let running = entry.running.clone();
+                let store = prompt_store.clone();
 
                 // The turn must run off the event loop so the sink's blocking
                 // permission requests do not deadlock the connection.
@@ -352,17 +516,33 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                                 .expect("inbox mutex poisoned")
                                 .push(user_text);
                             let next_turn = factory(&selection);
-                            let engine = TurnEngine::new(next_turn, tools)
+                            let mut engine = TurnEngine::new(next_turn, tools)
                                 .with_client(client)
-                                .with_inbox(inbox)
-                                .with_progress_nudge();
+                                .with_inbox(inbox);
+                            if require_submit_result {
+                                engine = engine.require_terminal_tool();
+                            }
+                            if thought_interval > 0 {
+                                engine = engine.with_thought_interval(thought_interval);
+                            }
                             let mut guard = entry.state.lock().await;
                             let result =
                                 engine.run_prompt(&mut guard, &mut sink, &cancel).await;
                             drop(guard);
                             result
                         };
+
+                        // Snapshot the core state for best-effort persistence
+                        // after the turn (no lock held across the store `.await`).
+                        let record = {
+                            let guard = entry.state.lock().await;
+                            guard.to_record()
+                        };
                         running.store(false, Ordering::SeqCst);
+
+                        // Persist the updated history + usage after the turn
+                        // (best-effort; failures are logged, not fatal).
+                        persist_record(&store, &session_id, &record).await;
 
                         match result {
                             Ok(stop) => {
@@ -461,11 +641,14 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 entry.running.store(true, Ordering::SeqCst);
 
                 let factory = inject_factory.clone();
+                let require_submit_result = inject_require_submit_result;
+                let thought_interval = inject_thought_interval;
                 let tools = entry.tools.clone();
                 let inbox = entry.inbox.clone();
                 let running = entry.running.clone();
                 let acp_session_id = req.session_id.clone();
                 let turn_entry = entry.clone();
+                let store = inject_store.clone();
 
                 cx.spawn({
                     let cx = cx.clone();
@@ -477,17 +660,30 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                             cx.clone(),
                             acp_session_id.clone(),
                         ));
-                        let engine = TurnEngine::new(next_turn, tools)
+                        let mut engine = TurnEngine::new(next_turn, tools)
                             .with_client(client)
-                            .with_inbox(inbox)
-                            .with_progress_nudge();
+                            .with_inbox(inbox);
+                        if require_submit_result {
+                            engine = engine.require_terminal_tool();
+                        }
+                        if thought_interval > 0 {
+                            engine = engine.with_thought_interval(thought_interval);
+                        }
                         let mut sink = AcpUpdateSink::new(cx, acp_session_id)
                             .with_yolo(selection.permission.is_yolo());
 
                         let mut guard = turn_entry.state.lock().await;
                         let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
+                        // Snapshot core state under the guard, then drop before
+                        // the awaiting persist so no lock is held across `.await`.
+                        let record = guard.to_record();
                         drop(guard);
                         running.store(false, Ordering::SeqCst);
+
+                        // Persist the updated history + usage after the steering
+                        // turn (best-effort).
+                        persist_record(&store, &session_id, &record).await;
+
                         if let Err(err) = result {
                             warn!(session_id, %err, "steering turn failed");
                         } else {
@@ -560,6 +756,85 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
             },
             on_receive_request!(),
         )
+}
+
+/// Build the `AvailableCommandsUpdate` notification advertising this agent's
+/// built-in slash commands (currently just `/usage`).
+///
+/// Shared by `session/new` and `session/load` so a reloaded session exposes the
+/// same commands as a freshly created one.
+fn available_commands_notification(session_id: &str) -> SessionNotification {
+    SessionNotification::new(
+        SessionId::new(session_id.to_string()),
+        SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
+            AvailableCommand::new(
+                USAGE_COMMAND.trim_start_matches('/'),
+                "Show cumulative token usage and estimated cost for this session.",
+            ),
+        ])),
+    )
+}
+
+/// Concatenate the text of a slice of `agent-core` content blocks.
+fn blocks_text(blocks: &[agent_core::ContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            agent_core::ContentBlock::Text { text } => text.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Map a persisted [`HistoryEntry`] to the ACP [`SessionUpdate`] used to replay
+/// it to a client during `session/load`.
+///
+/// Returns `None` for entries that have no faithful `session/update` analog
+/// (e.g. previously-ingested provider fragments), which are skipped during
+/// replay on a best-effort basis.
+fn history_entry_to_update(entry: &HistoryEntry) -> Option<SessionUpdate> {
+    match entry {
+        HistoryEntry::User(message) => Some(SessionUpdate::UserMessageChunk(ContentChunk::new(
+            ContentBlock::Text(TextContent::new(blocks_text(&message.content))),
+        ))),
+        HistoryEntry::Assistant(message) => Some(SessionUpdate::AgentMessageChunk(
+            ContentChunk::new(ContentBlock::Text(TextContent::new(blocks_text(
+                &message.content,
+            )))),
+        )),
+        HistoryEntry::ToolCall(record) => {
+            let tool_call = ToolCall::new(record.id.0.clone(), record.tool.name().to_string())
+                .status(AcpToolCallStatus::Completed);
+            Some(SessionUpdate::ToolCall(tool_call))
+        }
+        HistoryEntry::ToolResult(record) => {
+            let status = if record.success {
+                AcpToolCallStatus::Completed
+            } else {
+                AcpToolCallStatus::Failed
+            };
+            let mut fields = ToolCallUpdateFields::new().status(status);
+            let text = blocks_text(&record.content);
+            if !text.is_empty() {
+                fields = fields.content(vec![ToolCallContent::Content(Content::new(
+                    ContentBlock::Text(TextContent::new(text)),
+                ))]);
+            }
+            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                record.id.0.clone(),
+                fields,
+            )))
+        }
+        HistoryEntry::Thinking(_) => {
+            // Thinking blocks are preserved for faithful provider replay but have
+            // no user-visible `session/update` analog on load; skip them.
+            None
+        }
+        HistoryEntry::Ingested(record) => {
+            debug!(source = %record.source, "session/load: skipping ingested history entry");
+            None
+        }
+    }
 }
 
 /// Build [`ToolDescriptor`]s advertised to the decision layer.

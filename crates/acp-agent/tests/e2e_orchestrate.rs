@@ -19,7 +19,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Client, on_receive_notification};
 use agent_core::{NextTurnService, StopReason as CoreStopReason, ToolRegistry, TurnEvent};
 
-use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
+use acp_agent::{build_agent, default_store, AgentConfig, AgentDeps, NextTurnFactory};
 
 /// A factory whose first invocation yields the orchestrator script and every
 /// later invocation yields the sub-agent script. `run_pipeline` calls the
@@ -80,6 +80,7 @@ fn orchestrate_deps() -> AgentDeps {
         next_turn_factory: staged_factory(),
         tools: ToolRegistry::new(),
         config,
+        store: default_store(),
     }
 }
 

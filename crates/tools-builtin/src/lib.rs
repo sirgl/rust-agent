@@ -8,13 +8,16 @@
 //! trait, which the ACP binary implements against the live connection and tests
 //! implement in memory.
 //!
-//! Three tools are provided:
+//! The built-in tools provided are:
 //! - [`FsReadTool`] (`fs_read`) — read a text file. Non-destructive, so it does
 //!   **not** require permission.
 //! - [`FsWriteTool`] (`fs_write`) — write a text file. Destructive, so it
 //!   **requires permission** (enforced by the engine before `Tool::call`).
 //! - [`TerminalRunTool`] (`terminal_run`) — run a shell command. Destructive, so
 //!   it **requires permission**.
+//! - [`SubmitResultTool`] (`submit_result`) — end the current turn and hand
+//!   control back to the user. Non-destructive; recognized by the engine as the
+//!   terminal tool (see [`agent_core::TurnEngine::with_terminal_tool`]).
 //!
 //! Each tool validates its JSON arguments up front (returning
 //! [`agent_core::AgentError::InvalidArguments`] on malformed input, which the
@@ -43,7 +46,11 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FsWriteTool));
     registry.register(Arc::new(TerminalRunTool));
     registry.register(Arc::new(ElicitationTool));
+    registry.register(Arc::new(SubmitResultTool));
 }
+
+/// The registry name of the built-in turn-terminating tool.
+pub const SUBMIT_RESULT_TOOL_NAME: &str = "submit_result";
 
 /// Build a fresh registry pre-populated with the built-in tools.
 pub fn builtin_registry() -> ToolRegistry {
@@ -92,6 +99,13 @@ struct ElicitationArgs {
     requested_schema: serde_json::Value,
 }
 
+/// Arguments for [`SubmitResultTool`].
+#[derive(Debug, Deserialize)]
+struct SubmitResultArgs {
+    /// A concise, user-facing summary of the work performed this turn.
+    summary: String,
+}
+
 /// Arguments for [`TerminalRunTool`].
 #[derive(Debug, Deserialize)]
 struct TerminalRunArgs {
@@ -100,6 +114,62 @@ struct TerminalRunArgs {
     /// Optional command-line arguments.
     #[serde(default)]
     args: Vec<String>,
+}
+
+/// The built-in `submit_result` tool: ends the current turn and hands control
+/// back to the user.
+///
+/// This tool performs no side effects; it exists purely as the explicit,
+/// typed signal that the turn is complete. The turn engine, when configured
+/// with [`agent_core::TurnEngine::with_terminal_tool`], recognizes a call to
+/// this tool as the sole way to end a turn, so the agent keeps working until
+/// it deliberately submits its result rather than stopping on plain text.
+pub struct SubmitResultTool;
+
+#[async_trait]
+impl Tool for SubmitResultTool {
+    fn name(&self) -> &str {
+        SUBMIT_RESULT_TOOL_NAME
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "A concise, user-facing summary of what was done this turn."
+                }
+            },
+            "required": ["summary"]
+        })
+    }
+
+    fn requires_permission(&self) -> bool {
+        // Ending the turn is not a destructive action.
+        false
+    }
+
+    fn ends_turn(&self) -> bool {
+        // This is the terminal tool: dispatching it ends the turn.
+        true
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        let args: SubmitResultArgs = parse_args(self.name(), args)?;
+        debug!("submit_result: ending turn");
+        Ok(events(vec![
+            ToolEvent::Started,
+            ToolEvent::Completed(serde_json::json!({
+                "submitted": true,
+                "summary": args.summary,
+            })),
+        ]))
+    }
 }
 
 /// The built-in `fs_read` tool: read a text file via the client.
@@ -625,6 +695,38 @@ mod tests {
         assert!(matches!(evts.last(), Some(ToolEvent::Failed(_))));
     }
 
+    #[tokio::test]
+    async fn submit_result_completes_and_needs_no_client() {
+        // No client attached: submit_result must not require one.
+        let ctx = ToolContext::new("sess-test", CancellationToken::new());
+        let tool = SubmitResultTool;
+        assert!(!tool.requires_permission());
+        assert!(tool.ends_turn());
+        let stream = tool
+            .call(serde_json::json!({ "summary": "all done" }), &ctx)
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+        match evts.last() {
+            Some(ToolEvent::Completed(payload)) => {
+                assert_eq!(payload["submitted"], serde_json::json!(true));
+                assert_eq!(payload["summary"], serde_json::json!("all done"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_result_requires_summary() {
+        let ctx = ToolContext::new("sess-test", CancellationToken::new());
+        let tool = SubmitResultTool;
+        let result = tool.call(serde_json::json!({}), &ctx).await;
+        assert!(matches!(
+            result.err(),
+            Some(AgentError::InvalidArguments(_))
+        ));
+    }
+
     #[test]
     fn registry_registers_all_builtins() {
         let registry = builtin_registry();
@@ -632,6 +734,7 @@ mod tests {
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("terminal_run"));
         assert!(registry.contains("elicitation"));
+        assert!(registry.contains("submit_result"));
     }
 
     #[test]

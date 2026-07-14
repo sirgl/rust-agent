@@ -39,7 +39,7 @@
 use std::collections::BTreeMap;
 
 use agent_core::history::ThinkingRecord;
-use agent_core::{StopReason, ToolCallId, TurnError, TurnEvent};
+use agent_core::{StopReason, TokenUsage, ToolCallId, TurnError, TurnEvent};
 use serde_json::Value;
 
 /// Per-content-block state tracked while streaming.
@@ -72,6 +72,7 @@ enum BlockState {
 pub struct StreamMapper {
     blocks: BTreeMap<u64, BlockState>,
     stop_reason: StopReason,
+    usage: TokenUsage,
 }
 
 impl Default for StreamMapper {
@@ -87,12 +88,17 @@ impl StreamMapper {
             blocks: BTreeMap::new(),
             // Default until a `message_delta` provides the real reason.
             stop_reason: StopReason::EndTurn,
+            usage: TokenUsage::default(),
         }
     }
 
     /// Feed one decoded event and return any resulting turn events.
     pub fn push(&mut self, event: &Value) -> Vec<TurnEvent> {
         match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.on_message_start(event);
+                Vec::new()
+            }
             Some("content_block_start") => self.on_block_start(event),
             Some("content_block_delta") => self.on_block_delta(event),
             Some("content_block_stop") => self.on_block_stop(event),
@@ -100,11 +106,16 @@ impl StreamMapper {
                 self.on_message_delta(event);
                 Vec::new()
             }
-            Some("message_stop") => vec![TurnEvent::TurnFinished {
-                stop_reason: self.stop_reason,
-            }],
+            // Emit the accumulated usage right before the terminal event so the
+            // engine can fold it into the session totals.
+            Some("message_stop") => vec![
+                TurnEvent::Usage(self.usage),
+                TurnEvent::TurnFinished {
+                    stop_reason: self.stop_reason,
+                },
+            ],
             Some("error") => vec![TurnEvent::Error(TurnError::new(error_message(event)))],
-            // message_start, ping, and any unknown types carry nothing to emit.
+            // ping and any unknown types carry nothing to emit.
             _ => Vec::new(),
         }
     }
@@ -251,6 +262,28 @@ impl StreamMapper {
         {
             self.stop_reason = map_stop_reason(reason);
         }
+        // `message_delta.usage.output_tokens` is the cumulative final output
+        // count for the message, so overwrite rather than add.
+        if let Some(usage) = event.get("usage") {
+            if let Some(out) = usage.get("output_tokens").and_then(Value::as_u64) {
+                self.usage.output_tokens = out;
+            }
+        }
+    }
+
+    /// Capture the prompt-side token counts reported at `message_start`.
+    ///
+    /// Anthropic reports `input_tokens` (fresh) plus the cache read/creation
+    /// counts here; the output count starts at ~1 and is finalized in
+    /// `message_delta`.
+    fn on_message_start(&mut self, event: &Value) {
+        let Some(usage) = event.get("message").and_then(|m| m.get("usage")) else {
+            return;
+        };
+        let get = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        self.usage.input_tokens = get("input_tokens");
+        self.usage.cache_read_input_tokens = get("cache_read_input_tokens");
+        self.usage.cache_creation_input_tokens = get("cache_creation_input_tokens");
     }
 }
 
@@ -486,9 +519,11 @@ mod tests {
                 json!({"type":"message_stop"}),
             ],
         );
-        assert_eq!(out.len(), 1);
+        // message_stop emits a Usage event followed by TurnFinished.
+        assert_eq!(out.len(), 2);
+        assert!(matches!(out[0], TurnEvent::Usage(_)));
         assert!(matches!(
-            out[0],
+            out[1],
             TurnEvent::TurnFinished {
                 stop_reason: StopReason::ToolUse
             }
@@ -499,12 +534,42 @@ mod tests {
     fn message_stop_without_delta_defaults_end_turn() {
         let mut m = StreamMapper::new();
         let out = m.push(&json!({"type":"message_stop"}));
+        assert!(matches!(out[0], TurnEvent::Usage(_)));
         assert!(matches!(
-            out[0],
+            out[1],
             TurnEvent::TurnFinished {
                 stop_reason: StopReason::EndTurn
             }
         ));
+    }
+
+    #[test]
+    fn accumulates_usage_across_start_delta_and_stop() {
+        let mut m = StreamMapper::new();
+        let out = push_all(
+            &mut m,
+            &[
+                json!({"type":"message_start","message":{"usage":{
+                    "input_tokens":120,
+                    "cache_read_input_tokens":800,
+                    "cache_creation_input_tokens":40,
+                    "output_tokens":1
+                }}}),
+                json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":57}}),
+                json!({"type":"message_stop"}),
+            ],
+        );
+        let usage = out
+            .iter()
+            .find_map(|e| match e {
+                TurnEvent::Usage(u) => Some(*u),
+                _ => None,
+            })
+            .expect("usage event emitted");
+        assert_eq!(usage.input_tokens, 120);
+        assert_eq!(usage.cache_read_input_tokens, 800);
+        assert_eq!(usage.cache_creation_input_tokens, 40);
+        assert_eq!(usage.output_tokens, 57);
     }
 
     #[test]

@@ -6,41 +6,52 @@
 //! can be configured without a config file, while tests construct
 //! [`AgentConfig`] directly.
 
+use std::path::PathBuf;
+
 use mcp_client::McpServerConfig;
 use subagents::DEFAULT_MAX_DEPTH;
 
-/// Default system prompt seeded into every new session unless overridden.
+/// Default system prompt seeded into every new session.
 ///
-/// It defines the agent's persona and working style (consistent, thorough,
-/// proactive, best-practices-driven) and, crucially, makes it *communicate its
-/// intent*: it should keep the user posted with very short (1-2 line) plan and
-/// progress notes instead of going silent for many steps of thinking and tool
-/// calls. The engine reinforces this by periodically injecting a short nudge
-/// (see `agent_core::DEFAULT_PROGRESS_NUDGE`).
+/// It defines the agent's character: proactive, rigorous about building a
+/// coherent picture of the problem, unwilling to accept vague or ill-posed
+/// requests, and disciplined about persisting decisions in documents. The tone
+/// is deliberately terse: say everything that matters, and nothing that does
+/// not.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
-You are an AI coding agent working inside a user's editor. Act like a careful, \
-senior engineer.\n\
-\n\
-How you work:\n\
-- Be consistent and predictable; follow the existing conventions and patterns \
-of the project and keep your approach coherent across the whole task.\n\
-- Clarify the task in detail: figure out the precise intent and requirements. \
-If something is genuinely ambiguous or a decision is risky, ask a short, \
-focused clarifying question before doing heavy or irreversible work.\n\
-- Be proactive: anticipate what the user really needs, investigate edge cases, \
-error paths, concurrency and data races, and other corner cases rather than \
-only the happy path.\n\
-- Use best practices for correctness, safety and maintainability; prefer \
-simple, robust solutions over clever but fragile ones.\n\
-- Answer in a structured way (short sections/bullets when useful) but stay \
-succinct — no filler, minimal text, high signal.\n\
-\n\
-Communication rule (important): keep the user informed of your intent. Before \
-starting work on a request — and again as you make progress across multiple \
-tool calls — send a very short, plain-language message (1-2 lines maximum, \
-minimal text) saying what you plan to do next and why. Do not go silent for \
-many steps while only thinking or calling tools. These are quick plan/progress \
-notes, not the full answer.";
+You are a proactive engineering agent. You do not passively wait for perfect \
+instructions: you take initiative, drive the task toward a working outcome, and \
+anticipate the next step instead of stopping at the literal request.\n\n\
+Build a coherent picture of the world before acting. Reconcile the request with \
+the actual state of the code, docs, and prior decisions; surface contradictions \
+instead of silently picking one side. When something is ambiguous, \
+underspecified, or self-contradictory, ask focused clarifying questions rather \
+than guessing. Do not agree to nonsense: if a request is wrong, infeasible, or \
+based on a false premise, say so plainly and propose a better path.\n\n\
+Actively interrogate the user. Do not soldier on over an unresolved ambiguity, \
+a missing input, or a risky assumption \u{2014} draw the answer out. Prefer the \
+`elicitation` tool for anything structured (a value, a choice, a config, a \
+credential): it gives the user a proper form and returns typed data. When a \
+tool is not suitable, just ask in plain text (the user sees it live and can \
+reply mid-turn) or pose the question in your `submit_result` summary and hand \
+control back. Ask early and specifically rather than late and vaguely.\n\n\
+Fix knowledge in documents. Record decisions, designs, assumptions, and \
+trade-offs in the appropriate files so the picture stays consistent and \
+nothing important lives only in the conversation.\n\n\
+Be succinct, but full: communicate as briefly as possible while staying \
+complete. State every fact that matters and omit everything that does not. No \
+filler, no hedging, no restating the question back \u{2014} just the substance.\n\n\
+Ending a turn is an explicit act. Your plain text never ends the turn: control \
+returns to the user only when you call the `submit_result` tool with a concise \
+summary of what you did. So keep working \u{2014} think, call tools, make progress \
+\u{2014} until the task is actually done, then call `submit_result`. If you truly \
+need the user before you can continue (a real question or a blocking decision), \
+ask it and then call `submit_result` to hand control back. Do not call \
+`submit_result` while work you can still do remains.\n\n\
+Your plain text is still streamed to the user in real time, even though it does \
+not end the turn. So you can think out loud and narrate what you are doing, and \
+the user may send a comment mid-turn to steer you \u{2014} treat any such incoming \
+message as immediate guidance and adjust course before continuing.";
 
 /// Static configuration for the agent process.
 #[derive(Debug, Clone)]
@@ -69,6 +80,27 @@ pub struct AgentConfig {
     pub enable_orchestrate_tool: bool,
     /// Default model used for new sessions.
     pub default_model: String,
+    /// Whether a turn only ends when the model calls the `submit_result` tool.
+    ///
+    /// When `true` (the default), the turn engine is configured with
+    /// `submit_result` as its terminal tool: a decision round that produces only
+    /// text does not end the turn; the model is nudged to keep working and hand
+    /// control back explicitly. When `false`, plain text ends the turn as
+    /// before (used by tests that script fixed replay turns).
+    pub require_submit_result: bool,
+    /// Cadence (in decision rounds) at which the agent is nudged to briefly
+    /// share what it is planning: once right after the user prompt, then every
+    /// N rounds. `0` disables the behavior.
+    pub thought_interval: usize,
+    /// Directory under which session core state is persisted as JSON, one
+    /// file per session.
+    ///
+    /// When `Some`, the binary selects a disk-backed
+    /// [`JsonFileSessionStore`](agent_core::JsonFileSessionStore) so sessions
+    /// survive process restarts and can be reopened via `session/load`. When
+    /// `None` (the default), a non-durable
+    /// [`InMemorySessionStore`](agent_core::InMemorySessionStore) is used.
+    pub session_persistence_dir: Option<PathBuf>,
 }
 
 impl Default for AgentConfig {
@@ -83,6 +115,9 @@ impl Default for AgentConfig {
             enable_orchestrated: false,
             enable_orchestrate_tool: false,
             default_model: "claude-sonnet-5".to_string(),
+            require_submit_result: true,
+            thought_interval: 5,
+            session_persistence_dir: None,
         }
     }
 }
@@ -95,6 +130,11 @@ impl AgentConfig {
     /// - `ACP_AGENT_SYSTEM_PROMPT` seeds a system prompt into new sessions.
     /// - `ACP_ORCHESTRATED` (`1`/`true`/`yes`/`on`) enables orchestrated mode.
     /// - `ANTHROPIC_MODEL` overrides the default model.
+    /// - `ACP_REQUIRE_SUBMIT_RESULT` (`1`/`true`/`yes`/`on`) toggles whether a
+    ///   turn only ends when the model calls the `submit_result` tool.
+    /// - `ACP_SESSION_DIR` selects a directory for disk-backed session
+    ///   persistence (enables the JSON file store); unset keeps sessions
+    ///   in memory only.
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -119,6 +159,19 @@ impl AgentConfig {
                 config.default_model = model;
             }
         }
+        if let Ok(v) = std::env::var("ACP_REQUIRE_SUBMIT_RESULT") {
+            config.require_submit_result = matches!(v.trim(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("ACP_THOUGHT_INTERVAL") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                config.thought_interval = n;
+            }
+        }
+        if let Ok(dir) = std::env::var("ACP_SESSION_DIR") {
+            if !dir.trim().is_empty() {
+                config.session_persistence_dir = Some(PathBuf::from(dir));
+            }
+        }
         config
     }
 }
@@ -136,17 +189,51 @@ mod tests {
     }
 
     #[test]
+    fn default_seeds_system_prompt() {
+        let config = AgentConfig::default();
+        assert_eq!(config.system_prompt.as_deref(), Some(DEFAULT_SYSTEM_PROMPT));
+    }
+
+    #[test]
     fn default_model_is_sonnet() {
         let config = AgentConfig::default();
         assert_eq!(config.default_model, "claude-sonnet-5");
     }
 
     #[test]
-    fn default_seeds_communication_system_prompt() {
+    fn default_requires_submit_result() {
         let config = AgentConfig::default();
-        let prompt = config
-            .system_prompt
-            .expect("a default system prompt should be seeded");
-        assert!(prompt.contains("1-2 lines"));
+        assert!(config.require_submit_result);
+    }
+
+    #[test]
+    fn default_thought_interval_is_five() {
+        let config = AgentConfig::default();
+        assert_eq!(config.thought_interval, 5);
+    }
+
+    #[test]
+    fn from_env_reads_thought_interval() {
+        std::env::set_var("ACP_THOUGHT_INTERVAL", "3");
+        let config = AgentConfig::from_env();
+        assert_eq!(config.thought_interval, 3);
+        std::env::remove_var("ACP_THOUGHT_INTERVAL");
+    }
+
+    #[test]
+    fn default_has_no_session_persistence_dir() {
+        let config = AgentConfig::default();
+        assert!(config.session_persistence_dir.is_none());
+    }
+
+    #[test]
+    fn from_env_reads_session_dir() {
+        std::env::set_var("ACP_SESSION_DIR", "/tmp/acp-sessions");
+        let config = AgentConfig::from_env();
+        assert_eq!(
+            config.session_persistence_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/acp-sessions"))
+        );
+        std::env::remove_var("ACP_SESSION_DIR");
     }
 }

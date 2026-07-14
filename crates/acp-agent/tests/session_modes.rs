@@ -12,7 +12,7 @@ use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::Client;
 use agent_core::{NextTurnService, ToolRegistry, TurnEvent};
 
-use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
+use acp_agent::{build_agent, default_store, AgentConfig, AgentDeps, NextTurnFactory};
 
 /// Build [`AgentDeps`] with an empty replay script and the given config.
 fn deps_with_config(config: AgentConfig) -> AgentDeps {
@@ -25,6 +25,7 @@ fn deps_with_config(config: AgentConfig) -> AgentDeps {
         next_turn_factory: factory,
         tools: ToolRegistry::new(),
         config,
+        store: default_store(),
     }
 }
 

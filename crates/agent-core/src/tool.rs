@@ -107,6 +107,20 @@ pub trait Tool: Send + Sync {
         Vec::new()
     }
 
+    /// Whether dispatching this tool ends the current turn and hands control
+    /// back to the user.
+    ///
+    /// Defaults to `false`. A tool that returns `true` is a *terminal tool*:
+    /// when the engine is configured to require one (see
+    /// [`TurnEngine::require_terminal_tool`](crate::TurnEngine::require_terminal_tool)),
+    /// a decision round that produces only text does not end the turn, and the
+    /// turn ends only once some terminal tool is dispatched. Multiple terminal
+    /// tools may coexist; the engine treats any of them as a valid way to end
+    /// the turn.
+    fn ends_turn(&self) -> bool {
+        false
+    }
+
     /// Execute the tool, streaming [`ToolEvent`]s back to the caller.
     async fn call(
         &self,

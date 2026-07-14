@@ -1,6 +1,6 @@
 //! Model and effort selection for ACP sessions.
 
-use turn_anthropic::Effort;
+use turn_anthropic::{Effort, MODELS};
 use agent_client_protocol::schema::v1::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
@@ -55,12 +55,6 @@ pub struct ModelSelection {
     pub permission: PermissionMode,
 }
 
-/// The set of supported models.
-pub const MODEL_CATALOG: &[(&str, &str, &str)] = &[
-    ("claude-sonnet-5", "Claude Sonnet", "Most balanced model"),
-    ("claude-haiku-4-5", "Claude Haiku 4.5", "Fastest model"),
-    ("claude-opus-4-8", "Claude Opus", "Most powerful model"),
-];
 
 impl ModelSelection {
     /// Create a new selection based on the agent configuration.
@@ -81,14 +75,14 @@ impl ModelSelection {
                 SessionConfigKind::Select(SessionConfigSelect::new(
                     SessionConfigValueId::new(self.model.clone()),
                     SessionConfigSelectOptions::Ungrouped(
-                        MODEL_CATALOG
+                        MODELS
                             .iter()
-                            .map(|(id, name, desc)| {
+                            .map(|m| {
                                 SessionConfigSelectOption::new(
-                                    SessionConfigValueId::new(id.to_string()),
-                                    name.to_string(),
+                                    SessionConfigValueId::new(m.id.to_string()),
+                                    m.display_name.to_string(),
                                 )
-                                .description(desc.to_string())
+                                .description(m.description.to_string())
                             })
                             .collect(),
                     ),
@@ -154,7 +148,7 @@ impl ModelSelection {
         match config_id {
             "model" => {
                 if let Some(s) = value.as_str() {
-                    if MODEL_CATALOG.iter().any(|(id, _, _)| *id == s) {
+                    if MODELS.iter().any(|m| m.id == s) {
                         self.model = s.to_string();
                         return true;
                     }
@@ -212,7 +206,7 @@ mod tests {
         if let SessionConfigKind::Select(select) = &model_opt.kind {
             assert_eq!(select.current_value.0.as_ref(), "claude-haiku-4-5");
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
-                assert_eq!(opts.len(), 3);
+                assert_eq!(opts.len(), MODELS.len());
                 assert!(opts
                     .iter()
                     .any(|o| o.value.0.as_ref() == "claude-sonnet-5"));

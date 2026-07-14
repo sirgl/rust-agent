@@ -85,7 +85,12 @@ pub struct AnthropicConfig {
     /// Selection of effort level.
     pub effort: Option<Effort>,
     /// Maximum number of tokens to sample for the response.
-    pub max_tokens: u32,
+    ///
+    /// The Anthropic Messages API *requires* `max_tokens`, so it is always sent.
+    /// When `None`, a per-model default is derived via
+    /// [`default_max_output_tokens`] so that the value matches the selected
+    /// model's real output budget instead of an arbitrary fixed cap.
+    pub max_tokens: Option<u32>,
     /// Base URL of the messages endpoint (override for tests/proxies).
     pub base_url: String,
     /// Value of the required `anthropic-version` header.
@@ -132,7 +137,7 @@ impl AnthropicConfig {
             api_key: api_key.into(),
             model: model.into(),
             effort: None,
-            max_tokens: Self::DEFAULT_MAX_TOKENS,
+            max_tokens: None,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
             thinking: ThinkingConfig::Adaptive {
@@ -172,7 +177,7 @@ impl AnthropicConfig {
         if let Ok(raw) = std::env::var("ANTHROPIC_MAX_TOKENS") {
             if let Ok(n) = raw.trim().parse::<u32>() {
                 if n > 0 {
-                    cfg.max_tokens = n;
+                    cfg.max_tokens = Some(n);
                 }
             }
         }
@@ -460,13 +465,18 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
 /// is guaranteed to stay strictly greater than the thinking `budget_tokens` (an
 /// Anthropic API requirement); other modes send `max_tokens` unchanged.
 fn effective_max_tokens(config: &AnthropicConfig) -> u32 {
+    // Resolve the base budget: an explicit override, otherwise the per-model
+    // default derived from the model catalog.
+    let base = config
+        .max_tokens
+        .unwrap_or_else(|| crate::models::default_max_output_tokens(&config.model));
     match &config.thinking {
         ThinkingConfig::Budget { budget_tokens } => {
             let budget = (*budget_tokens).max(AnthropicConfig::MIN_THINKING_BUDGET);
             // Leave room for the visible answer on top of the thinking budget.
-            config.max_tokens.max(budget.saturating_add(4096))
+            base.max(budget.saturating_add(4096))
         }
-        ThinkingConfig::Disabled | ThinkingConfig::Adaptive { .. } => config.max_tokens,
+        ThinkingConfig::Disabled | ThinkingConfig::Adaptive { .. } => base,
     }
 }
 
@@ -559,7 +569,11 @@ mod tests {
 
         let body = build_body(&req, &cfg());
         assert_eq!(body["model"], "claude-test");
-        assert_eq!(body["max_tokens"], AnthropicConfig::DEFAULT_MAX_TOKENS);
+        // Unknown model -> conservative per-model default.
+        assert_eq!(
+            body["max_tokens"],
+            crate::models::default_max_output_tokens("claude-test")
+        );
         assert_eq!(body["stream"], true);
         // With prompt caching on (the default), `system` is a structured block
         // array carrying a cache breakpoint rather than a bare string.

@@ -100,6 +100,11 @@ where
             writeln!(output, "bye")?;
             break;
         }
+        if let Some(command) = acp_agent::parse_command(message) {
+            let text = acp_agent::run_command(command, &session, &deps.config.default_model);
+            writeln!(output, "\n{text}")?;
+            continue;
+        }
 
         // `/orchestrate <goal>`: launch the orchestration pipeline instead of a
         // plain chat turn. The rest of the line is the goal.
@@ -227,6 +232,7 @@ mod tests {
             next_turn_factory: acp_agent::canned_replay_factory(),
             tools: ToolRegistry::new(),
             config: acp_agent::AgentConfig::default(),
+            store: acp_agent::default_store(),
         }
     }
 
@@ -254,6 +260,36 @@ mod tests {
         assert!(text.contains("Hello from the replay backend!"));
         assert!(text.contains("without any network"));
         assert!(text.contains("bye"));
+    }
+
+    #[tokio::test]
+    async fn usage_command_prints_totals_and_cost() {
+        let deps = replay_deps();
+        let client: Arc<dyn ClientAccess> = Arc::new(crate::LocalClientAccess::new());
+        // Ask for usage before any turn, then exit.
+        let input = Cursor::new(b"/usage\nexit\n".to_vec());
+        let mut output: Vec<u8> = Vec::new();
+
+        run_repl(
+            deps,
+            client,
+            input,
+            &mut output,
+            ReplOptions {
+                interactive_permissions: false,
+                handle_ctrl_c: false,
+            },
+        )
+        .await
+        .expect("repl should complete");
+
+        let text = String::from_utf8(output).expect("utf8");
+        assert!(text.contains("Token usage this session"));
+        assert!(text.contains("cached (reused):"));
+        // Default model (claude-sonnet-5) has known pricing -> a dollar figure.
+        assert!(text.contains("estimated cost:   $"));
+        // No turn ran, so the replay answer must not appear.
+        assert!(!text.contains("replay backend"));
     }
 
     #[tokio::test]
