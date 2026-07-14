@@ -404,6 +404,151 @@ Drive both the orchestrator and every sub-agent with `turn-replay`, so an entire
 - Unit tests colocated per module (`mode`, `registry`, `submit`, `worker`, `action`).
 - Integration test in `orchestrated/tests/` driving the orchestrator + sub-agents via replay through a full multi-pass flow.
 
+# Orchestration Mode Integration
+
+### Overview & Goals
+Make the already-implemented `orchestrated` capability **actually reachable at runtime** in the ACP agent. Today the `Orchestrator` is only built inside tests; the `ACP_ORCHESTRATED` flag is read but never used to construct an orchestrator, so the editor cannot use it.
+
+This adds **two complementary integration points**:
+1. A **dedicated ACP session mode** (`orchestrate`) advertised via the native ACP session-mode mechanism, so an editor user can explicitly switch the session into orchestrated execution.
+2. An **`orchestrate` tool** the ordinary chat agent can call itself, so the agent can *autonomously decide* to launch the orchestration pipeline for a goal — the same way it can already delegate via `subagents`.
+
+Both are thin front-ends over a **single shared `run_pipeline` helper** in the `orchestrated` crate, so behavior stays identical however orchestration is triggered.
+
+### Scope
+**In Scope**
+- Advertise ACP session modes on `session/new`: `chat` (default) and `orchestrate`, via `NewSessionResponse.modes` (`SessionModeState`).
+- Handle the `session/set_mode` request (`SetSessionModeRequest`) to switch a session's current mode; persist it on the `SessionEntry`.
+- Branch `session/prompt` on the current mode: `chat` -> existing `TurnEngine`; `orchestrate` -> run the orchestration pipeline, streaming through the same `AcpUpdateSink`.
+- A reusable `run_pipeline(goal, backend, resolver, base_tools, sink, cancel)` entry point in the `orchestrated` crate that builds an `Orchestrator` and drives it to a `StopReason`.
+- An `OrchestrateTool` (`orchestrate { goal }`) registered in the chat tool registry that invokes `run_pipeline` and streams sub-agent progress back as tool updates.
+- A `ModelResolver` that maps **all tiers** (`Low`/`Medium`/`High`) to the single configured backend factory (Anthropic-or-replay), matching the chat backend.
+- Seed the orchestrator context with a **single implicit plan step derived from the goal** so `code`/`review` modes work immediately; the orchestrator may still call the `plan` mode to refine.
+- Wire the same integration into `cli-agent` (a `/orchestrate <goal>` command or mode toggle) reusing `run_pipeline`.
+
+**Out of Scope**
+- Auto-populating a rich multi-step `PlanProposal` from free-form planner text (known gap; the single implicit step is the v1 seed).
+- Per-tier distinct Anthropic model ids (all tiers map to one backend for now; the resolver seam stays open for later).
+- New MCP/HTTP transports.
+
+### User Stories
+- As an **editor user**, I switch the session to the `orchestrate` mode from the client's mode menu and my next prompt is handled by the orchestrator pipeline, with each sub-agent's progress streaming back.
+- As an **editor user**, I stay in `chat` mode and the agent itself decides a task is big enough to call the `orchestrate` tool, then reports the orchestrated result.
+- As an **operator**, orchestration triggered either way runs the exact same pipeline (shared `run_pipeline`), so behavior and logs are consistent.
+
+### Functional Requirements
+- `initialize` continues to negotiate version/capabilities; `session/new` returns `modes` with `current_mode_id = "chat"` and both modes listed.
+- `session/set_mode` updates the stored current mode for the session and responds with `SetSessionModeResponse`; an unknown mode id is rejected with an error.
+- In `orchestrate` mode, `session/prompt` treats the prompt text as the **goal**, runs `run_pipeline`, and returns a mapped `stopReason`; `session/cancel` cancels the orchestrator and its in-flight sub-agents via the shared `CancellationToken`.
+- The `orchestrate` tool (chat mode) accepts `{ goal }`, runs the same pipeline nested within the current turn, streams `ToolEvent` progress, and returns a concise summary to the decision layer.
+- The old `ACP_ORCHESTRATED` env flag becomes the **default initial mode** selector (when set, `session/new` advertises `orchestrate` as `current_mode_id`), preserving backward compatibility.
+
+# Orchestration Mode Design
+
+### Current Implementation
+`crates/acp-agent/src/agent.rs` builds the `Agent` connection with handlers for `initialize`, `authenticate`, `session/new`, `session/prompt`, `session/cancel`. `SessionEntry` holds `state`, a `cancel` token, and a per-session `tools` registry. `session/prompt` spawns a task that builds a `TurnEngine::new(next_turn, tools).with_client(AcpClientAccess)` and drives `run_prompt` into an `AcpUpdateSink`. The `orchestrated` crate already provides `OrchestratorBuilder`/`Orchestrator` (a `TurnEngine` whose only tool is `run_subagent`), `ModeRegistry::with_defaults()`, a `ModelResolver` trait + `FnModelResolver`, and `OrchestratedStepContext`/`PlanProposal`. `acp-agent` exposes `default_deps()`, `anthropic_factory()`, `canned_replay_factory()`, and `build_registry()`. The ACP schema (v1.4) provides `SessionModeState`, `SessionMode`, `SessionModeId`, `SetSessionModeRequest`/`Response`, and `NewSessionResponse::modes(...)`.
+
+### Key Decisions
+- **Native ACP session modes** (chosen over an env-only toggle) — advertise `chat`/`orchestrate` in `NewSessionResponse.modes` and handle `session/set_mode`, so the editor exposes the switch in its UI. Rationale: this is the protocol-standard way to offer distinct agent behaviors per session.
+- **Orchestration also exposed as an `orchestrate` tool** (per user request) — the chat agent can autonomously launch the pipeline mid-turn, mirroring the existing `SubagentTool` pattern. Rationale: lets the model itself reach the decision to orchestrate without a manual mode switch.
+- **One shared `run_pipeline` helper** — both the mode branch and the tool call the same function, so there is a single source of truth for building/driving the orchestrator. Rationale: avoids divergence between the two entry points.
+- **All model tiers map to the configured backend** — a resolver returns the same `next_turn_factory()` for every `ModelTier`, matching the chat backend (Anthropic when a key resolves, else replay). Rationale: keeps v1 wiring simple; the tier seam remains for future per-tier models.
+- **Single implicit plan step seeded from the goal** — the orchestrator context starts with a one-step `PlanProposal` built from the prompt so `code`/`review` work without a planning pass; the `plan` mode can still refine it. Rationale: avoids the known plan-population gap blocking any useful run.
+
+### Proposed Changes
+**`orchestrated` crate — shared entry point:**
+```rust
+/// Build a ModelResolver that maps every tier to one backend factory.
+pub fn uniform_resolver(
+    factory: Arc<dyn Fn() -> Arc<dyn NextTurnService> + Send + Sync>,
+) -> Arc<dyn ModelResolver>;
+
+/// Build and drive an orchestrator for `goal`, streaming into `sink`.
+pub async fn run_pipeline(
+    goal: &str,
+    orchestrator_backend: Arc<dyn NextTurnService>,
+    resolver: Arc<dyn ModelResolver>,
+    base_tools: ToolRegistry,
+    sink: &mut dyn UpdateSink,
+    cancel: &CancellationToken,
+) -> Result<StopReason>;
+```
+`run_pipeline` seeds `OrchestratedStepContext` with a single `PlanStepSpec` derived from `goal`, calls `OrchestratorBuilder::new(backend, resolver).with_base_tools(base_tools).with_context(ctx).build()`, then `orch.engine().run_prompt(&mut orch.new_session(goal), sink, cancel)`.
+
+**`orchestrated` crate — the tool:**
+```rust
+pub struct OrchestrateTool { /* backend factory, resolver, base tools */ }
+impl Tool for OrchestrateTool {
+    fn name(&self) -> &str { "orchestrate" }          // { goal: string }
+    fn requires_permission(&self) -> bool { false }
+    // call: build a CapturingSink, run_pipeline(goal, ...), stream progress
+}
+```
+Modeled on `subagents::SubagentTool`: it runs the pipeline nested in the current turn and forwards progress as `ToolEvent`s.
+
+**`acp-agent` changes:**
+- `SessionEntry` gains `mode: StdMutex<SessionModeId>` (default `chat`).
+- `session/new`: attach `NewSessionResponse::modes(SessionModeState::new("chat", vec![chat_mode, orchestrate_mode]))`; honor `ACP_ORCHESTRATED` as the initial `current_mode_id`.
+- New handler for `SetSessionModeRequest`: validate + store the mode on the entry, respond `SetSessionModeResponse`.
+- `session/prompt`: read the entry's mode; for `chat` keep today's `TurnEngine` path; for `orchestrate` call `orchestrated::run_pipeline(goal=user_text, backend=factory(), resolver=uniform_resolver(factory), base_tools=entry.tools, sink, cancel)`.
+- `AgentDeps` gains the `next_turn_factory` (already present) reused to build the resolver; optionally register `OrchestrateTool` into the base registry in `build_registry` behind a config flag.
+
+**`cli-agent` changes:** add a `/orchestrate <goal>` REPL command (and/or a mode toggle) that calls `run_pipeline` with `LocalClientAccess`-backed tools and the `TerminalUpdateSink`.
+
+### Data Models / Contracts
+- ACP: `SessionModeState { current_mode_id, available_modes: [SessionMode{ id, name, description }] }`; `SetSessionModeRequest { session_id, mode_id }` -> `SetSessionModeResponse`.
+- `SessionEntry.mode: SessionModeId` — the per-session selected mode.
+- `run_pipeline(...) -> Result<StopReason>` — the single shared driver.
+- `OrchestrateTool` args: `{ "goal": string }`.
+- Reuses `Orchestrator`, `ModeRegistry`, `ModelResolver`, `OrchestratedStepContext`, `PlanProposal`, `PlanStepSpec`.
+
+### Components
+- **`orchestrated` (lib)** — new `run_pipeline`, `uniform_resolver`, and `OrchestrateTool`.
+- **`acp-agent::agent`** — session-mode advertisement, `set_mode` handler, mode-branched `session/prompt`.
+- **`acp-agent::config`** — `ACP_ORCHESTRATED` reinterpreted as the default initial mode; optional `orchestrate`-tool toggle.
+- **`cli-agent`** — `/orchestrate` command reusing `run_pipeline`.
+
+### Architecture Diagram
+```mermaid
+graph TD
+    Client[ACP Client editor] -->|session/set_mode| Agent[acp-agent]
+    Client -->|session/prompt| Agent
+    Agent -->|mode?| Branch{current mode}
+    Branch -->|chat| Engine[TurnEngine]
+    Engine -->|orchestrate tool| Pipe[run_pipeline]
+    Branch -->|orchestrate| Pipe
+    Pipe --> Orch[Orchestrator run_subagent]
+    Orch --> Sub[sub-agent modes]
+    Pipe -->|session/update| Client
+```
+
+### Risks
+- **Schema handler wiring**: registering the `SetSessionModeRequest` handler must use the same `on_receive_request!` pattern; verify the method name maps to `session/set_mode`.
+- **Backend reuse**: `run_pipeline` and the resolver must each get a *fresh* backend instance from the factory per turn (replay backends are stateful) — call `factory()` where needed.
+- **Cancellation**: the orchestrator turn and its nested sub-agents must share the prompt's `CancellationToken`; thread it through `run_pipeline`.
+- **Plan seed limitation**: a single implicit step limits multi-step orchestration until plan auto-population lands; documented as a known gap.
+
+# Orchestration Mode Testing
+
+### Validation Approach
+Drive the whole path with `turn-replay` for both the orchestrator and sub-agents plus an in-memory fake ACP client / `UpdateSink`, so mode switching and pipeline execution are deterministic and network-free.
+
+### Key Scenarios
+- **Mode advertised**: `session/new` response includes `modes` with `current_mode_id=chat` and both modes.
+- **Switch mode**: `session/set_mode(orchestrate)` succeeds; a subsequent `session/prompt` runs `run_pipeline` (assert orchestrator sub-agent updates stream through the sink).
+- **Chat unaffected**: default `chat` mode still runs the plain `TurnEngine` path.
+- **`orchestrate` tool**: in chat mode, a replayed `ToolCallRequested{orchestrate, goal}` runs the pipeline and returns a summary.
+- **Backward-compat flag**: with `ACP_ORCHESTRATED=1`, `session/new` advertises `orchestrate` as the initial mode.
+
+### Edge Cases
+- **Unknown mode id** in `set_mode` -> error response, mode unchanged.
+- **Cancellation** during an orchestrated prompt -> `cancelled` stop reason, no further updates.
+- **Shared `run_pipeline`** used by both the mode branch and the tool produces identical stored results (parity test).
+
+### Test Changes
+- `orchestrated` unit/integration tests for `run_pipeline`/`uniform_resolver`/`OrchestrateTool` via replay.
+- `acp-agent` integration tests for mode advertisement, `set_mode`, and mode-branched prompt through a fake client.
+
 # Delivery Steps
 
 ### ✓ Step 1: Scaffold workspace and core abstractions
@@ -504,3 +649,27 @@ An orchestrator agent can be constructed and driven end-to-end, with optional wi
 - Add an optional toggle in `acp-agent`/`cli-agent` config to run in orchestrated mode (planner/executor/reviewer backends resolved from the existing factories).
 - Add an integration test in `orchestrated/tests/` driving a full Goal -> plan -> code -> review multi-pass flow with replay backends, asserting stored results and verdicts.
 - Update `docs/design/orchestrated-execution.md` with the Rust module mapping and the accepted decisions.
+
+### ✓ Step 13: Add the shared `run_pipeline` entry point and `orchestrate` tool
+The `orchestrated` crate exposes one reusable driver plus a tool, so orchestration can be launched identically from a mode or a tool call.
+
+- Add `run_pipeline(goal, orchestrator_backend, resolver, base_tools, sink, cancel) -> Result<StopReason>` to the `orchestrated` crate: seed `OrchestratedStepContext` with a single `PlanStepSpec` derived from `goal`, build the `Orchestrator` via `OrchestratorBuilder`, and drive `run_prompt` into the provided `UpdateSink`.
+- Add `uniform_resolver(factory)` returning a `ModelResolver` that maps every `ModelTier` to a fresh backend from the given factory.
+- Add `OrchestrateTool` (`orchestrate { goal }`, `requires_permission=false`) modeled on `subagents::SubagentTool`: it runs `run_pipeline` nested in the current turn with a `CapturingSink` and streams progress back as `ToolEvent`s.
+- Add unit/integration tests via `turn-replay`: `run_pipeline` drives one sub-agent pass and stores a result; the `orchestrate` tool returns a summary; a parity test asserts the tool and a direct `run_pipeline` call produce identical stored results.
+
+### ✓ Step 14: Advertise ACP session modes and handle `session/set_mode`
+The agent offers `chat` and `orchestrate` as native ACP session modes and remembers the selection per session.
+
+- Extend `SessionEntry` with a `mode: StdMutex<SessionModeId>` field defaulting to `chat`.
+- In `session/new`, attach `NewSessionResponse::modes(SessionModeState::new(current, [chat, orchestrate]))`; set the initial `current_mode_id` from the `ACP_ORCHESTRATED` config (default `chat`).
+- Register a `SetSessionModeRequest` handler (`session/set_mode`): validate the mode id against the advertised set, store it on the `SessionEntry`, and respond with `SetSessionModeResponse`; reject unknown ids with an error.
+- Add `acp-agent` integration tests through a fake client: `session/new` advertises both modes; `set_mode(orchestrate)` succeeds and updates the stored mode; an unknown id is rejected.
+
+### ✓ Step 15: Branch `session/prompt` on the mode and wire the CLI
+Selecting `orchestrate` (or calling the tool) actually runs the orchestration pipeline end-to-end, in both the ACP server and the CLI.
+
+- In `session/prompt`, read the entry's current mode: keep today's `TurnEngine` path for `chat`; for `orchestrate` call `orchestrated::run_pipeline` with `orchestrator_backend = factory()`, `resolver = uniform_resolver(factory)`, `base_tools = entry.tools`, the `AcpUpdateSink`, and the turn's `CancellationToken`; map the returned `StopReason`.
+- Optionally register `OrchestrateTool` into the base chat registry (behind a config flag) so the chat agent can launch orchestration itself.
+- In `cli-agent`, add a `/orchestrate <goal>` REPL command (and/or mode toggle) that calls `run_pipeline` with the `LocalClientAccess`-backed tools and `TerminalUpdateSink`.
+- Add an `acp-agent` end-to-end test (replay backends) asserting an `orchestrate`-mode prompt streams sub-agent progress and returns a stop reason; verify `session/cancel` cancels an in-flight orchestrated prompt; update `docs/design/orchestrated-execution.md` to document the runtime integration and the single-implicit-step limitation.

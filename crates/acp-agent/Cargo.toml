@@ -19,6 +19,7 @@ turn-replay.workspace = true
 tools-builtin.workspace = true
 mcp-client.workspace = true
 subagents.workspace = true
+orchestrated.workspace = true
 agent-client-protocol.workspace = true
 async-trait.workspace = true
 futures.workspace = true

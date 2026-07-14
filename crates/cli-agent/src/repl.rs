@@ -77,7 +77,8 @@ where
 
     writeln!(
         output,
-        "cli-agent interactive chat. Type a message and press Enter. Ctrl-D or 'exit' to quit."
+        "cli-agent interactive chat. Type a message and press Enter. Ctrl-D or 'exit' to quit.\n\
+         Use '/orchestrate <goal>' to launch the orchestration pipeline."
     )?;
 
     loop {
@@ -98,6 +99,27 @@ where
         if matches!(message, "exit" | "quit") {
             writeln!(output, "bye")?;
             break;
+        }
+
+        // `/orchestrate <goal>`: launch the orchestration pipeline instead of a
+        // plain chat turn. The rest of the line is the goal.
+        if let Some(goal) = message.strip_prefix("/orchestrate") {
+            let goal = goal.trim();
+            if goal.is_empty() {
+                writeln!(output, "usage: /orchestrate <goal>")?;
+                continue;
+            }
+            let cancel = CancellationToken::new();
+            let stop = {
+                let mut sink = TerminalUpdateSink::new(&mut output)
+                    .interactive(options.interactive_permissions);
+                run_orchestration(&deps, goal, &mut sink, &cancel, options.handle_ctrl_c).await
+            };
+            match stop {
+                Ok(reason) => render_stop_reason(&mut output, reason)?,
+                Err(err) => writeln!(output, "\n[error] {err}")?,
+            }
+            continue;
         }
 
         session.push_user_text(message);
@@ -142,6 +164,36 @@ async fn run_turn<W: Write + Send>(
             // Trip the token; the engine observes it and returns promptly.
             cancel.cancel();
             engine.run_prompt(session, sink, cancel).await
+        }
+    }
+}
+
+/// Drive the orchestration pipeline for `goal`, optionally racing it against
+/// `Ctrl-C` so an interrupt cancels the run without ending the process.
+///
+/// The orchestrator and all sub-agent tiers reuse the same decision backend
+/// factory as the chat loop (via [`orchestrated::uniform_resolver`]).
+async fn run_orchestration<W: Write + Send>(
+    deps: &AgentDeps,
+    goal: &str,
+    sink: &mut TerminalUpdateSink<W>,
+    cancel: &CancellationToken,
+    handle_ctrl_c: bool,
+) -> agent_core::Result<StopReason> {
+    let factory = deps.next_turn_factory.clone();
+    let backend = (deps.next_turn_factory)();
+    let resolver = orchestrated::uniform_resolver(factory);
+    let base_tools = deps.tools.clone();
+
+    if !handle_ctrl_c {
+        return orchestrated::run_pipeline(goal, backend, resolver, base_tools, sink, cancel).await;
+    }
+
+    tokio::select! {
+        result = orchestrated::run_pipeline(goal, backend, resolver, base_tools, sink, cancel) => result,
+        _ = tokio::signal::ctrl_c() => {
+            cancel.cancel();
+            Ok(StopReason::Cancelled)
         }
     }
 }

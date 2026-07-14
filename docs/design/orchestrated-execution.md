@@ -146,6 +146,29 @@ Reference-дизайн выше реализован в crate `crates/orchestrat
 | `OrchestratedExecutionAgent` | `orchestrator::{OrchestratorBuilder, Orchestrator}` — `TurnEngine` с единственным `run_subagent` |
 | резолв модели (`model_tier`/эскалация) | `worker::ModelResolver` (provider-neutral seam) + `FnModelResolver` |
 
+### Запуск в рантайме (ACP-мод и `orchestrate`-тул)
+
+Оркестрация доступна в рантайме двумя путями, оба ведут через единый вход
+`orchestrated::run_pipeline(goal, orchestrator_backend, resolver, base_tools, sink, cancel)`:
+
+- **Нативный ACP session-mode.** `acp-agent` на `session/new` анонсирует режимы
+  `chat` (по умолчанию) и `orchestrate` (`NewSessionResponse::modes`), а `session/set_mode`
+  переключает текущий режим сессии (`SessionEntry.mode`). В `session/prompt` при
+  `orchestrate` текст промпта трактуется как Goal и прогоняется через `run_pipeline`,
+  стримясь в тот же `AcpUpdateSink`; при `chat` — обычный `TurnEngine`. Флаг
+  `ACP_ORCHESTRATED` теперь задаёт **начальный** режим сессии (обратная совместимость).
+- **Инструмент `orchestrate { goal }`.** `orchestrated::OrchestrateTool` (по образцу
+  `subagents::SubagentTool`) запускает `run_pipeline` вложенно внутри текущего turn'а и
+  стримит прогресс суб-агентов как `ToolEvent`. Регистрируется в базовый реестр чата за
+  флагом `AgentConfig.enable_orchestrate_tool` (env `ACP_ORCHESTRATE_TOOL`), чтобы чат-агент
+  мог сам решить запустить пайплайн.
+- **CLI.** В `cli-agent` команда `/orchestrate <goal>` вызывает тот же `run_pipeline` с
+  `LocalClientAccess`-инструментами и `TerminalUpdateSink`.
+
+Все тиры модели резолвятся в один и тот же backend через
+`orchestrated::uniform_resolver(factory)` (Anthropic-или-replay, как у чата); фабрика
+вызывается **свежая** на каждый turn, чтобы stateful replay-бэкенды не переиспользовались.
+
 ### Принятые решения (v1)
 
 - **`SubAgentMode` — трейт + shared behavior-структуры** (композиция, не наследование):
@@ -171,7 +194,13 @@ Reference-дизайн выше реализован в crate `crates/orchestrat
 ### Ограничения v1
 
 - Режим `plan` пока **не заполняет** `PlanProposal` в контексте автоматически (свободный
-  текст плана не парсится в шаги) — план сидируется заранее (`OrchestratedStepContext::with_proposal`).
-  Reference-поведение (планировщик пишет структурированный план) — задел на будущее.
-- Интеграция в бинарники ограничена флагом-переключателем (`AgentConfig.enable_orchestrated`,
-  env `ACP_ORCHESTRATED`); полноценный orchestrated front-end UX — вне scope v1.
+  текст плана не парсится в шаги). При запуске через `run_pipeline` контекст сидируется
+  **одним неявным шагом**, выведенным из Goal (чтобы `code`/`review` работали сразу); `plan`
+  может его уточнить. Reference-поведение (структурированный план из планировщика) — задел
+  на будущее.
+- Все тиры модели (`Low`/`Medium`/`High`) резолвятся в один и тот же backend; отдельных
+  per-tier моделей в v1 нет (seam `ModelResolver` оставлен на будущее).
+- Оркестрированный `session/prompt` не переиспользует историю чат-сессии (Goal — это текст
+  промпта); суб-агенты в оркестрированном ACP-пути не получают ACP `ClientAccess`
+  (fs/terminal через редактор), так что fs/terminal-инструменты в оркестрации доступны
+  только в CLI (`LocalClientAccess`).

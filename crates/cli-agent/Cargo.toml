@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 agent-core.workspace = true
 acp-agent.workspace = true
+orchestrated.workspace = true
 async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true

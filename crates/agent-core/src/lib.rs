@@ -16,6 +16,7 @@
 
 pub mod cancel;
 pub mod client;
+pub mod compaction;
 pub mod compiler;
 pub mod engine;
 pub mod error;
@@ -28,6 +29,9 @@ pub mod tool;
 
 pub use cancel::CancellationToken;
 pub use client::{ClientAccess, TerminalOutcome};
+pub use compaction::{
+    ChainedCompactor, Compactor, HeuristicCompactor, LlmCompactor, TextSummarizer,
+};
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };

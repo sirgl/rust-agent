@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, AuthenticateRequest, AuthenticateResponse, CancelNotification, ContentBlock,
     Implementation, InitializeRequest, InitializeResponse, McpServer, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionId, StopReason as AcpStopReason,
+    NewSessionResponse, PromptRequest, PromptResponse, SessionId, SessionMode, SessionModeId,
+    SessionModeState, SetSessionModeRequest, SetSessionModeResponse, StopReason as AcpStopReason,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{Agent, Client, ConnectTo, on_receive_notification, on_receive_request};
@@ -48,6 +49,31 @@ use tracing::{debug, info, warn};
 use crate::client::AcpClientAccess;
 use crate::config::AgentConfig;
 use crate::sink::AcpUpdateSink;
+
+/// The mode id for the default plain-chat session mode.
+pub const CHAT_MODE_ID: &str = "chat";
+/// The mode id for the orchestrated-execution session mode.
+pub const ORCHESTRATE_MODE_ID: &str = "orchestrate";
+
+/// Build the ACP [`SessionModeState`] advertised on `session/new`, with the
+/// given `current` mode id and both `chat`/`orchestrate` modes available.
+fn session_mode_state(current: &str) -> SessionModeState {
+    SessionModeState::new(
+        SessionModeId::new(current.to_string()),
+        vec![
+            SessionMode::new(SessionModeId::new(CHAT_MODE_ID), "Chat")
+                .description("Plain streaming chat: a single turn engine answers the prompt."),
+            SessionMode::new(SessionModeId::new(ORCHESTRATE_MODE_ID), "Orchestrate").description(
+                "Orchestrated execution: an orchestrator drives sub-agents to accomplish the goal.",
+            ),
+        ],
+    )
+}
+
+/// Whether `mode_id` is one of the advertised session modes.
+fn is_known_mode(mode_id: &str) -> bool {
+    matches!(mode_id, CHAT_MODE_ID | ORCHESTRATE_MODE_ID)
+}
 
 /// Factory that produces a fresh [`NextTurnService`] for each prompt turn.
 ///
@@ -76,6 +102,9 @@ struct SessionEntry {
     /// This session's tool registry: the base tools plus any tools
     /// discovered from the session's `mcp_servers` at `session/new` time.
     tools: ToolRegistry,
+    /// The current ACP session mode (`chat` or `orchestrate`), switchable via
+    /// `session/set_mode`.
+    mode: StdMutex<SessionModeId>,
 }
 
 /// Shared registry of active sessions, keyed by session id string.
@@ -96,6 +125,16 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
     let prompt_sessions = sessions.clone();
     let prompt_factory = deps.next_turn_factory.clone();
     let cancel_sessions = sessions.clone();
+    let set_mode_sessions = sessions.clone();
+
+    // The initial mode a new session starts in: `orchestrate` when the
+    // orchestrated toggle is set (backward-compatible with `ACP_ORCHESTRATED`),
+    // otherwise plain `chat`.
+    let initial_mode_id = if deps.config.enable_orchestrated {
+        ORCHESTRATE_MODE_ID
+    } else {
+        CHAT_MODE_ID
+    };
 
     Agent
         .builder()
@@ -149,14 +188,18 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     state: Arc::new(AsyncMutex::new(state)),
                     cancel: StdMutex::new(CancellationToken::new()),
                     tools,
+                    mode: StdMutex::new(SessionModeId::new(initial_mode_id)),
                 });
                 new_sessions
                     .lock()
                     .expect("sessions mutex poisoned")
                     .insert(session_id.clone(), entry);
 
-                info!(session_id, "session/new");
-                responder.respond(NewSessionResponse::new(SessionId::new(session_id)))
+                info!(session_id, initial_mode = initial_mode_id, "session/new");
+                responder.respond(
+                    NewSessionResponse::new(SessionId::new(session_id))
+                        .modes(session_mode_state(initial_mode_id)),
+                )
             },
             on_receive_request!(),
         )
@@ -187,23 +230,50 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let tools = entry.tools.clone();
                 let acp_session_id = req.session_id.clone();
 
+                // Snapshot the session's current mode so we can branch the turn.
+                let orchestrate = {
+                    let mode = entry.mode.lock().expect("mode mutex poisoned");
+                    mode.0.as_ref() == ORCHESTRATE_MODE_ID
+                };
+
                 // The turn must run off the event loop so the sink's blocking
                 // permission requests do not deadlock the connection.
                 cx.spawn({
                     let cx = cx.clone();
                     async move {
-                        let next_turn = factory();
                         let client = Arc::new(AcpClientAccess::new(
                             cx.clone(),
                             acp_session_id.clone(),
                         ));
-                        let engine = TurnEngine::new(next_turn, tools).with_client(client);
                         let mut sink = AcpUpdateSink::new(cx, acp_session_id);
 
-                        let mut guard = entry.state.lock().await;
-                        guard.push_user_text(user_text);
-                        let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
-                        drop(guard);
+                        let result = if orchestrate {
+                            // Orchestrate mode: the prompt text is the goal; run
+                            // the shared orchestration pipeline, streaming through
+                            // the same sink and sharing the turn's cancel token.
+                            debug!(session_id, "session/prompt: orchestrate mode");
+                            let backend = factory();
+                            let resolver = orchestrated::uniform_resolver(factory.clone());
+                            orchestrated::run_pipeline(
+                                &user_text,
+                                backend,
+                                resolver,
+                                tools,
+                                &mut sink,
+                                &cancel,
+                            )
+                            .await
+                        } else {
+                            let next_turn = factory();
+                            let engine =
+                                TurnEngine::new(next_turn, tools).with_client(client);
+                            let mut guard = entry.state.lock().await;
+                            guard.push_user_text(user_text);
+                            let result =
+                                engine.run_prompt(&mut guard, &mut sink, &cancel).await;
+                            drop(guard);
+                            result
+                        };
 
                         match result {
                             Ok(stop) => {
@@ -246,6 +316,39 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 Ok(())
             },
             on_receive_notification!(),
+        )
+        // session/set_mode: switch the session's current mode.
+        .on_receive_request(
+            async move |req: SetSessionModeRequest, responder, _cx| {
+                let session_id = req.session_id.0.to_string();
+                let mode_id = req.mode_id.0.to_string();
+
+                let Some(entry) = set_mode_sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .get(&session_id)
+                    .cloned()
+                else {
+                    warn!(session_id, "session/set_mode for unknown session");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("unknown session: {session_id}")),
+                    );
+                };
+
+                if !is_known_mode(&mode_id) {
+                    warn!(session_id, mode = %mode_id, "session/set_mode: unknown mode");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("unknown session mode: {mode_id}")),
+                    );
+                }
+
+                *entry.mode.lock().expect("mode mutex poisoned") = req.mode_id.clone();
+                info!(session_id, mode = %mode_id, "session/set_mode");
+                responder.respond(SetSessionModeResponse::new())
+            },
+            on_receive_request!(),
         )
 }
 

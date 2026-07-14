@@ -31,6 +31,9 @@ pub struct AgentConfig {
     /// scope for v1. When enabled, callers assemble an orchestrator from the
     /// `orchestrated` crate using the same backend factories.
     pub enable_orchestrated: bool,
+    /// Whether to expose the `orchestrate` tool in the chat tool registry, so
+    /// the chat agent can launch the orchestration pipeline itself mid-turn.
+    pub enable_orchestrate_tool: bool,
 }
 
 impl Default for AgentConfig {
@@ -43,6 +46,7 @@ impl Default for AgentConfig {
             subagent_max_depth: DEFAULT_MAX_DEPTH,
             mcp_servers: Vec::new(),
             enable_orchestrated: false,
+            enable_orchestrate_tool: false,
         }
     }
 }
@@ -69,6 +73,9 @@ impl AgentConfig {
         }
         if let Ok(v) = std::env::var("ACP_ORCHESTRATED") {
             config.enable_orchestrated = matches!(v.trim(), "1" | "true" | "yes" | "on");
+        }
+        if let Ok(v) = std::env::var("ACP_ORCHESTRATE_TOOL") {
+            config.enable_orchestrate_tool = matches!(v.trim(), "1" | "true" | "yes" | "on");
         }
         config
     }

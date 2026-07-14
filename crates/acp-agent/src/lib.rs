@@ -24,6 +24,7 @@ use std::sync::Arc;
 use agent_client_protocol::{Client, ConnectTo, Stdio};
 use agent_core::{NextTurnService, StopReason, ToolRegistry, TurnEvent};
 use mcp_client::{register_mcp_tools, McpConnection};
+use orchestrated::{uniform_resolver, OrchestrateTool};
 use subagents::SubagentTool;
 use turn_replay::ReplayTurnService;
 
@@ -92,6 +93,15 @@ pub fn build_registry(config: &AgentConfig, next_turn_factory: &NextTurnFactory)
         let subagent = SubagentTool::new(nested_backend, nested_tools)
             .with_max_depth(config.subagent_max_depth);
         registry.register(Arc::new(subagent));
+    }
+    if config.enable_orchestrate_tool {
+        // The `orchestrate` tool lets the chat agent launch the orchestration
+        // pipeline itself. It reuses the same decision backend factory for both
+        // the orchestrator and (via a uniform resolver) all sub-agent tiers.
+        let factory = next_turn_factory.clone();
+        let resolver = uniform_resolver(next_turn_factory.clone());
+        let base_tools = tools_builtin::builtin_registry();
+        registry.register(Arc::new(OrchestrateTool::new(factory, resolver, base_tools)));
     }
     registry
 }

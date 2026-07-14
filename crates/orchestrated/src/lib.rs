@@ -22,6 +22,7 @@ pub mod action;
 pub mod context;
 pub mod mode;
 pub mod orchestrator;
+pub mod pipeline;
 pub mod registry;
 pub mod submit;
 pub mod worker;
@@ -36,6 +37,9 @@ pub use mode::{
 };
 pub use action::{RunSubAgentTool, RUN_SUBAGENT_TOOL_NAME};
 pub use orchestrator::{Orchestrator, OrchestratorBuilder, ORCHESTRATOR_SYSTEM_PROMPT};
+pub use pipeline::{
+    run_pipeline, uniform_resolver, BackendFactory, OrchestrateTool, ORCHESTRATE_TOOL_NAME,
+};
 pub use registry::{ModeRegistry, UnknownModeError};
 pub use submit::{new_slot, SubmitReviewTool, SubmitSlot, SubmitTool};
 pub use worker::{
