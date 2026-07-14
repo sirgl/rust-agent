@@ -217,6 +217,33 @@ mod tests {
     }
 }
 
+/// A recorded block of assistant "extended thinking".
+///
+/// Providers such as Anthropic emit reasoning as dedicated `thinking` content
+/// blocks that carry a cryptographic `signature`. When extended thinking is used
+/// together with tools, the provider **requires** the complete, unmodified
+/// thinking block(s) to be sent back on the following request (they must appear
+/// in the same assistant turn as the `tool_use`), otherwise it rejects the call.
+/// We therefore capture them verbatim here so the compiler can replay them
+/// faithfully — an application of the crate-wide "preserve & reuse" rule.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ThinkingRecord {
+    /// A regular thinking block with its opaque cryptographic signature.
+    Thinking {
+        /// The reasoning text.
+        text: String,
+        /// The signature that validates this block; must be echoed back unchanged.
+        signature: String,
+    },
+    /// A redacted (encrypted, opaque) thinking block. Its `data` is not human
+    /// readable but must still be preserved and echoed back unchanged.
+    Redacted {
+        /// The opaque encrypted payload.
+        data: String,
+    },
+}
+
 /// A recorded tool call made by the assistant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCallRecord {
@@ -261,6 +288,9 @@ pub enum HistoryEntry {
     User(UserMessage),
     /// An assistant message.
     Assistant(AssistantMessage),
+    /// A block of assistant extended-thinking (preserved verbatim with its
+    /// signature so it can be replayed back to the provider).
+    Thinking(ThinkingRecord),
     /// A tool call requested by the assistant.
     ToolCall(ToolCallRecord),
     /// The result of a previously requested tool call.
@@ -295,6 +325,11 @@ impl Conversation {
     /// Append an assistant text message.
     pub fn push_assistant_text(&mut self, text: impl Into<String>) {
         self.push(HistoryEntry::Assistant(AssistantMessage::text(text)));
+    }
+
+    /// Append an assistant extended-thinking block.
+    pub fn push_thinking(&mut self, record: ThinkingRecord) {
+        self.push(HistoryEntry::Thinking(record));
     }
 
     /// Append a tool call.

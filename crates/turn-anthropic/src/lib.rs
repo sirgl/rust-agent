@@ -38,7 +38,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 pub use mapper::StreamMapper;
-pub use request::{build_body, load_default_api_key, AnthropicConfig, Effort};
+pub use request::{build_body, load_default_api_key, AnthropicConfig, Effort, ThinkingConfig};
 pub use sse::SseDecoder;
 
 /// A real [`NextTurnService`] that answers turns via the Anthropic Messages API.

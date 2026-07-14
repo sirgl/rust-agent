@@ -8,9 +8,10 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentError, CancellationToken, EngineOutput, HistoryEntry, NextTurnService, Result,
-    SessionState, StopReason, Tool, ToolCallId, ToolCallStatus, ToolContext, ToolEvent,
-    ToolRegistry, TurnContext, TurnEngine, TurnEvent, TurnInbox, UpdateSink,
+    AgentError, CancellationToken, ClientAccess, ElicitationOutcome, EngineOutput, HistoryEntry,
+    NextTurnService, Result, SessionState, StopReason, TerminalOutcome, Tool, ToolCallId,
+    ToolCallStatus, ToolContext, ToolEvent, ToolRegistry, TurnContext, TurnEngine, TurnEvent,
+    TurnInbox, UpdateSink, DEFAULT_PROGRESS_NUDGE, MAX_TOOL_RESULT_CHARS,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -242,6 +243,64 @@ async fn plain_streaming_turn_forwards_chunks_and_returns_stop_reason() {
         }
         other => panic!("unexpected entry: {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn progress_nudge_is_injected_right_after_first_user_message() {
+    let svc = ReplayTurnService::single(vec![
+        TurnEvent::TextDelta("ok".into()),
+        TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]);
+    let mut session = SessionState::new("s1");
+    session.push_user_text("hi");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), ToolRegistry::new()).with_progress_nudge();
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    // The nudge is injected as a user message before the first decision round,
+    // i.e. immediately after the user's own message.
+    match &session.history.entries[1] {
+        HistoryEntry::User(msg) => {
+            let agent_core::ContentBlock::Text { text } = &msg.content[0];
+            assert_eq!(text, DEFAULT_PROGRESS_NUDGE);
+        }
+        other => panic!("expected injected nudge as second entry, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn no_progress_nudge_by_default() {
+    let svc = ReplayTurnService::single(vec![
+        TurnEvent::TextDelta("ok".into()),
+        TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]);
+    let mut session = SessionState::new("s1");
+    session.push_user_text("hi");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), ToolRegistry::new());
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    // Without opting in, history holds just the user message and the reply.
+    assert_eq!(session.history.len(), 2);
+    assert!(matches!(&session.history.entries[0], HistoryEntry::User(_)));
+    assert!(matches!(
+        &session.history.entries[1],
+        HistoryEntry::Assistant(_)
+    ));
 }
 
 #[tokio::test]
@@ -647,4 +706,166 @@ async fn steering_message_injected_mid_turn_extends_the_turn() {
 
     // The inbox was fully drained.
     assert!(inbox.lock().unwrap().is_empty());
+}
+
+/// A tool that returns a very large output, to exercise output offloading.
+struct BigOutputTool {
+    output: String,
+}
+
+#[async_trait]
+impl Tool for BigOutputTool {
+    fn name(&self) -> &str {
+        "big_output"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn requires_permission(&self) -> bool {
+        false
+    }
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        Ok(Box::pin(stream::iter(vec![
+            ToolEvent::Started,
+            ToolEvent::Completed(serde_json::json!(self.output)),
+        ])))
+    }
+}
+
+/// A [`ClientAccess`] that records the last `write_text_file` call so tests can
+/// assert the full offloaded output was persisted.
+#[derive(Default)]
+struct CapturingClient {
+    written: std::sync::Mutex<Option<(String, String)>>,
+}
+
+#[async_trait]
+impl ClientAccess for CapturingClient {
+    async fn read_text_file(&self, _path: &str) -> Result<String> {
+        Ok(String::new())
+    }
+    async fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
+        *self.written.lock().unwrap() = Some((path.to_string(), content.to_string()));
+        Ok(())
+    }
+    async fn run_terminal(&self, _command: &str, _args: &[String]) -> Result<TerminalOutcome> {
+        Ok(TerminalOutcome {
+            output: String::new(),
+            truncated: false,
+            exit_code: Some(0),
+            signal: None,
+        })
+    }
+    async fn request_elicitation(
+        &self,
+        _message: &str,
+        _requested_schema: serde_json::Value,
+    ) -> Result<ElicitationOutcome> {
+        Ok(ElicitationOutcome::Cancelled)
+    }
+}
+
+#[tokio::test]
+async fn large_tool_output_is_offloaded_and_truncated_in_history() {
+    // A result far larger than the inline threshold.
+    let big = "x".repeat(MAX_TOOL_RESULT_CHARS * 3);
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-1"),
+                name: "big_output".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(BigOutputTool { output: big.clone() }));
+    let client = Arc::new(CapturingClient::default());
+    let mut session = SessionState::new("s1");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), registry).with_client(client.clone());
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    // The full output was persisted via the client.
+    let written = client.written.lock().unwrap().clone().expect("output saved");
+    assert_eq!(written.1, big);
+    assert!(written.0.contains("acp-agent-tool-outputs"));
+
+    // The history tool result is truncated and points to the saved file.
+    let result = session
+        .history
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            HistoryEntry::ToolResult(rec) => Some(rec),
+            _ => None,
+        })
+        .expect("tool result recorded");
+    let agent_core::ContentBlock::Text { text } = &result.content[0];
+    assert!(text.chars().count() < big.chars().count());
+    assert!(text.contains("Output truncated"));
+    assert!(text.contains(&written.0));
+}
+
+#[tokio::test]
+async fn small_tool_output_is_kept_inline_verbatim() {
+    let small = "just a short result";
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-1"),
+                name: "big_output".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(BigOutputTool {
+        output: small.to_string(),
+    }));
+    let client = Arc::new(CapturingClient::default());
+    let mut session = SessionState::new("s1");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), registry).with_client(client.clone());
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    // Nothing offloaded, and the result is kept verbatim.
+    assert!(client.written.lock().unwrap().is_none());
+    let result = session
+        .history
+        .entries
+        .iter()
+        .find_map(|entry| match entry {
+            HistoryEntry::ToolResult(rec) => Some(rec),
+            _ => None,
+        })
+        .expect("tool result recorded");
+    let agent_core::ContentBlock::Text { text } = &result.content[0];
+    assert_eq!(text, small);
 }

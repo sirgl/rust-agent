@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::TurnError;
+use crate::history::ThinkingRecord;
 
 /// Identifier for a single tool call within a turn.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -76,7 +77,17 @@ pub enum TurnEvent {
     /// An incremental chunk of assistant-visible text.
     TextDelta(String),
     /// An incremental chunk of internal reasoning ("thinking").
+    ///
+    /// Emitted live for streaming display. It is *not* persisted on its own; the
+    /// complete, signed block arrives separately as [`TurnEvent::ThinkingBlock`]
+    /// once the reasoning block closes.
     Thinking(String),
+    /// A complete extended-thinking block (with its signature or redacted data).
+    ///
+    /// Persisted verbatim into history so it can be replayed back to the
+    /// provider on the next turn, which providers require when thinking is used
+    /// together with tools.
+    ThinkingBlock(ThinkingRecord),
     /// An updated plan.
     Plan(PlanUpdate),
     /// The decision layer requests that a tool be executed.

@@ -15,8 +15,8 @@
 #![warn(missing_docs)]
 
 pub mod agent;
-pub mod client;
 pub mod config;
+pub mod local_client;
 pub mod selection;
 pub mod sink;
 
@@ -30,8 +30,8 @@ use subagents::SubagentTool;
 use turn_replay::ReplayTurnService;
 
 pub use agent::{build_agent, AgentDeps, NextTurnFactory};
-pub use client::AcpClientAccess;
 pub use config::AgentConfig;
+pub use local_client::LocalClientAccess;
 pub use selection::ModelSelection;
 pub use sink::AcpUpdateSink;
 

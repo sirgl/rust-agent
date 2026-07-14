@@ -23,13 +23,30 @@ use crate::event::{StopReason, ToolCallId, TurnEvent};
 use crate::history::KnownTool;
 use crate::service::NextTurnService;
 use crate::session::SessionState;
-use crate::sink::{EngineOutput, ToolCallStatus, UpdateSink};
+use crate::sink::{EngineOutput, ToolCallStatus, ToolKind, UpdateSink};
 use crate::tool::{ToolContext, ToolEvent};
 use crate::tool::ToolRegistry;
 
 /// Default upper bound on decision/tool iterations within a single prompt to
 /// guard against a misbehaving backend looping forever.
 pub const DEFAULT_MAX_ITERATIONS: usize = 128;
+
+/// Default cadence (in decision rounds) for the progress nudge injected by the
+/// engine. A value of `5` means the nudge is injected before the 1st round
+/// (i.e. right after the user's message) and then again before rounds 6, 11, …
+pub const DEFAULT_NUDGE_INTERVAL: usize = 5;
+
+/// The short instruction the engine periodically injects (as a user message) to
+/// keep the agent communicating its intent to the user.
+///
+/// It deliberately asks for a *very short* (1-2 line) plan/progress note so the
+/// user is never left staring at a silent agent that only thinks and calls
+/// tools. It is injected right after the user's first message and then every
+/// [`DEFAULT_NUDGE_INTERVAL`] rounds.
+pub const DEFAULT_PROGRESS_NUDGE: &str = "\
+[system] In 1-2 short lines, tell the user what you plan to do next and why, \
+then continue. Keep it very brief — a quick plan/progress note, not the full \
+answer.";
 
 /// A shared queue of user messages injected into a running turn ("steering").
 ///
@@ -52,6 +69,9 @@ pub struct TurnEngine {
     client: Option<Arc<dyn ClientAccess>>,
     depth: usize,
     inbox: Option<TurnInbox>,
+    /// How often (in decision rounds) to inject the progress nudge, and the
+    /// message to inject. `None` disables the nudge (the default).
+    progress_nudge: Option<(usize, String)>,
 }
 
 impl TurnEngine {
@@ -64,6 +84,7 @@ impl TurnEngine {
             client: None,
             depth: 0,
             inbox: None,
+            progress_nudge: None,
         }
     }
 
@@ -85,6 +106,42 @@ impl TurnEngine {
     pub fn with_inbox(mut self, inbox: TurnInbox) -> Self {
         self.inbox = Some(inbox);
         self
+    }
+
+    /// Enable the periodic progress nudge with the default cadence and message.
+    ///
+    /// The engine injects [`DEFAULT_PROGRESS_NUDGE`] as a user message before the
+    /// first decision round (right after the user's message) and then every
+    /// [`DEFAULT_NUDGE_INTERVAL`] rounds, so the agent keeps telling the user
+    /// what it plans to do in 1-2 short lines.
+    pub fn with_progress_nudge(self) -> Self {
+        self.with_custom_progress_nudge(DEFAULT_NUDGE_INTERVAL, DEFAULT_PROGRESS_NUDGE)
+    }
+
+    /// Enable the periodic progress nudge with a custom cadence and message.
+    ///
+    /// An `interval` of `0` disables the nudge.
+    pub fn with_custom_progress_nudge(mut self, interval: usize, message: impl Into<String>) -> Self {
+        self.progress_nudge = if interval == 0 {
+            None
+        } else {
+            Some((interval, message.into()))
+        };
+        self
+    }
+
+    /// Inject the progress nudge for `iteration` if one is due.
+    ///
+    /// The nudge fires on iterations that are multiples of the configured
+    /// interval, so iteration `0` (right after the user's message) always gets
+    /// one, then every `interval` rounds thereafter.
+    fn maybe_inject_nudge(&self, session: &mut SessionState, iteration: usize) {
+        if let Some((interval, message)) = &self.progress_nudge {
+            if iteration.is_multiple_of(*interval) {
+                debug!("injecting progress nudge before round {iteration}");
+                session.push_user_text(message.clone());
+            }
+        }
     }
 
     /// Drain any queued steering messages into the session as user messages.
@@ -142,6 +199,10 @@ impl TurnEngine {
                 return Ok(StopReason::Cancelled);
             }
 
+            // Periodically remind the agent to tell the user what it plans to do
+            // next (right after the user's message, then every few rounds).
+            self.maybe_inject_nudge(session, iteration);
+
             // Fold in any steering messages injected since the previous round so
             // they become part of the context for this decision call.
             self.drain_inbox(session);
@@ -182,6 +243,18 @@ impl TurnEngine {
                     }
                     TurnEvent::Thinking(delta) => {
                         sink.send(EngineOutput::ThinkingChunk(delta)).await?;
+                    }
+                    TurnEvent::ThinkingBlock(record) => {
+                        // The live text was already streamed via `Thinking`;
+                        // here we only persist the complete, signed block so it
+                        // can be replayed back to the provider on the next turn
+                        // (required when thinking is combined with tool use).
+                        //
+                        // It is stored before any assistant text/tool call of
+                        // this turn (thinking blocks close first), so the
+                        // Anthropic dialect can place it first in the merged
+                        // assistant message, as the API requires.
+                        session.push_thinking(record);
                     }
                     TurnEvent::Plan(plan) => {
                         sink.send(EngineOutput::Plan(plan)).await?;
@@ -241,20 +314,37 @@ impl TurnEngine {
         let known = KnownTool::classify(&name, arguments.clone());
         session.push_tool_call(id.clone(), known);
 
+        // Look up the tool up front so we can surface rich metadata (title,
+        // kind, affected file locations) on the initial pending update.
+        let tool = self.tools.get(&name);
+        let (title, kind, locations) = match &tool {
+            Some(tool) => (
+                tool.title(&arguments).unwrap_or_else(|| name.clone()),
+                tool.kind(),
+                tool.locations(&arguments),
+            ),
+            None => (name.clone(), ToolKind::Other, Vec::new()),
+        };
+
         sink.send(EngineOutput::ToolCall {
             id: id.clone(),
             name: name.clone(),
+            title,
+            kind,
             status: ToolCallStatus::Pending,
+            locations,
+            raw_input: Some(arguments.clone()),
         })
         .await?;
 
-        let Some(tool) = self.tools.get(&name) else {
+        let Some(tool) = tool else {
             let msg = format!("unknown tool: {name}");
             warn!("{msg}");
             sink.send(EngineOutput::ToolCallUpdate {
                 id: id.clone(),
                 status: ToolCallStatus::Failed,
                 output: Some(msg.clone()),
+                raw_output: None,
             })
             .await?;
             session.push_tool_result(id, false, msg);
@@ -271,6 +361,7 @@ impl TurnEngine {
                     id: id.clone(),
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
+                    raw_output: None,
                 })
                 .await?;
                 session.push_tool_result(id, false, msg);
@@ -282,6 +373,7 @@ impl TurnEngine {
             id: id.clone(),
             status: ToolCallStatus::InProgress,
             output: None,
+            raw_output: None,
         })
         .await?;
 
@@ -302,6 +394,7 @@ impl TurnEngine {
                     id: id.clone(),
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
+                    raw_output: None,
                 })
                 .await?;
                 session.push_tool_result(id, false, msg);
@@ -312,6 +405,7 @@ impl TurnEngine {
         let mut collected = String::new();
         let mut success = true;
         let mut final_message: Option<String> = None;
+        let mut final_value: Option<serde_json::Value> = None;
 
         loop {
             let event = tokio::select! {
@@ -333,6 +427,7 @@ impl TurnEngine {
                         id: id.clone(),
                         status: ToolCallStatus::InProgress,
                         output: Some(delta),
+                        raw_output: None,
                     })
                     .await?;
                 }
@@ -342,6 +437,9 @@ impl TurnEngine {
                         collected.push_str(&rendered);
                     }
                     final_message = Some(rendered);
+                    if !value.is_null() {
+                        final_value = Some(value);
+                    }
                 }
                 ToolEvent::Failed(message) => {
                     success = false;
@@ -359,6 +457,7 @@ impl TurnEngine {
             id: id.clone(),
             status,
             output: final_message.clone(),
+            raw_output: final_value,
         })
         .await?;
 
@@ -371,9 +470,103 @@ impl TurnEngine {
         } else {
             collected
         };
+        // Very large tool outputs (e.g. reading a big file, a chatty terminal
+        // command, or a verbose MCP tool) are offloaded to a file and only a
+        // truncated preview is fed back to the model, so they don't blow up the
+        // context / token budget. The full output stays available on disk for
+        // the agent to `fs_read` on demand.
+        let result_text = self
+            .maybe_offload_large_output(session, &id, &name, result_text)
+            .await;
         session.push_tool_result(id, success, result_text);
         Ok(())
     }
+
+    /// If `text` exceeds [`MAX_TOOL_RESULT_CHARS`], write the full output to a
+    /// file (via the client's filesystem access) and return a truncated preview
+    /// annotated with the byte count and the file path; otherwise return `text`
+    /// unchanged.
+    ///
+    /// This applies uniformly to every tool dispatched through the engine —
+    /// built-in, MCP, and subagents — because they all funnel their results
+    /// here.
+    async fn maybe_offload_large_output(
+        &self,
+        session: &SessionState,
+        id: &ToolCallId,
+        name: &str,
+        text: String,
+    ) -> String {
+        if text.chars().count() <= MAX_TOOL_RESULT_CHARS {
+            return text;
+        }
+
+        let total_chars = text.chars().count();
+        let preview = truncate_preview(&text);
+
+        // Try to persist the full output so the agent can read it back in full.
+        let saved_path = match &self.client {
+            Some(client) => {
+                let path = offload_path(&session.session_id, id);
+                match client.write_text_file(&path, &text).await {
+                    Ok(()) => Some(path),
+                    Err(err) => {
+                        warn!("failed to offload large output for tool {name}: {err}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+
+        match saved_path {
+            Some(path) => format!(
+                "{preview}\n\n[Output truncated: showing {shown} of {total} characters. \
+                 The full output was saved to {path}. Use the fs_read tool to view it.]",
+                shown = preview.chars().count(),
+                total = total_chars,
+            ),
+            None => format!(
+                "{preview}\n\n[Output truncated: showing {shown} of {total} characters. \
+                 The full output was too large to keep in context and could not be saved to a file.]",
+                shown = preview.chars().count(),
+                total = total_chars,
+            ),
+        }
+    }
+}
+
+/// Maximum number of characters of a tool result kept inline in the
+/// conversation before it is offloaded to a file (see
+/// [`TurnEngine::maybe_offload_large_output`]).
+pub const MAX_TOOL_RESULT_CHARS: usize = 8000;
+
+/// Number of leading characters kept in a truncated preview.
+const PREVIEW_HEAD_CHARS: usize = 4000;
+/// Number of trailing characters kept in a truncated preview.
+const PREVIEW_TAIL_CHARS: usize = 2000;
+
+/// Build a head+tail preview of an over-long tool output.
+fn truncate_preview(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let head: String = chars.iter().take(PREVIEW_HEAD_CHARS).collect();
+    let tail: String = chars
+        .iter()
+        .skip(chars.len().saturating_sub(PREVIEW_TAIL_CHARS))
+        .collect();
+    format!("{head}\n...\n{tail}")
+}
+
+/// Compute a stable, unique file path for an offloaded tool output.
+fn offload_path(session_id: &str, id: &ToolCallId) -> String {
+    let sanitize = |s: &str| -> String {
+        s.chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    };
+    let dir = std::env::temp_dir().join("acp-agent-tool-outputs");
+    let file = format!("{}-{}.txt", sanitize(session_id), sanitize(id.as_str()));
+    dir.join(file).to_string_lossy().into_owned()
 }
 
 /// Persist accumulated assistant text as a single history entry, clearing the

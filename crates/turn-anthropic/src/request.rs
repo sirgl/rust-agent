@@ -43,6 +43,38 @@ impl std::str::FromStr for Effort {
     }
 }
 
+/// How extended thinking is requested from the model.
+///
+/// Anthropic has two thinking control dialects depending on the model:
+///
+/// - **Adaptive** (Claude Sonnet 5, Opus 4.7/4.8 and newer): request
+///   `thinking: {type: "adaptive"}` and steer depth via `output_config.effort`.
+///   The legacy `{type: "enabled", budget_tokens}` form is *rejected* (HTTP 400)
+///   by these models. On these models thinking text defaults to *omitted* (only
+///   the `signature` is returned), so `display: "summarized"` is requested to
+///   surface visible reasoning.
+/// - **Budget** (Opus 4.6 and earlier): the legacy `{type: "enabled",
+///   budget_tokens: N}` form.
+///
+/// The default is [`ThinkingConfig::Adaptive`] to match the default model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkingConfig {
+    /// Thinking turned off. Sent as `{type: "disabled"}` (the documented way to
+    /// turn off adaptive thinking, which is on-by-default on newer models).
+    Disabled,
+    /// Adaptive thinking. `display_summarized` requests visible summarized
+    /// reasoning text (otherwise newer models omit the thinking text).
+    Adaptive {
+        /// Whether to request `display: "summarized"` for visible reasoning.
+        display_summarized: bool,
+    },
+    /// Legacy budget-based extended thinking for older models.
+    Budget {
+        /// The `budget_tokens` value (clamped to the API minimum).
+        budget_tokens: u32,
+    },
+}
+
 /// Static configuration for talking to the Anthropic Messages API.
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -58,6 +90,13 @@ pub struct AnthropicConfig {
     pub base_url: String,
     /// Value of the required `anthropic-version` header.
     pub anthropic_version: String,
+    /// Extended-thinking configuration (see [`ThinkingConfig`]). Defaults to
+    /// adaptive thinking with visible summarized reasoning.
+    pub thinking: ThinkingConfig,
+    /// Whether to insert prompt-caching (`cache_control`) breakpoints to
+    /// maximize reuse of the (usually stable) system prompt + tool definitions
+    /// and the growing conversation prefix across turns. Enabled by default.
+    pub prompt_caching: bool,
 }
 
 impl AnthropicConfig {
@@ -68,15 +107,38 @@ impl AnthropicConfig {
     /// Default model used when none is configured.
     pub const DEFAULT_MODEL: &'static str = "claude-sonnet-5";
 
+    /// Minimum `budget_tokens` Anthropic accepts for extended thinking.
+    pub const MIN_THINKING_BUDGET: u32 = 1024;
+
+    /// Default budget used for legacy [`ThinkingConfig::Budget`] mode when a
+    /// budget is requested without an explicit value. Extended thinking is now
+    /// **on by default** (the typed history preserves and replays the signed
+    /// thinking blocks required for tool use), and can be disabled with
+    /// `ANTHROPIC_THINKING=0`.
+    pub const DEFAULT_THINKING_BUDGET: u32 = 2048;
+
+    /// Default response token budget.
+    ///
+    /// Anthropic *requires* a `max_tokens` field, so it cannot be removed; but
+    /// the old 4096 default truncated large generations (the model returned
+    /// `stop_reason: max_tokens` mid-answer). Modern Claude models accept a much
+    /// larger output budget, so we default high and let `ANTHROPIC_MAX_TOKENS`
+    /// override it.
+    pub const DEFAULT_MAX_TOKENS: u32 = 32000;
+
     /// Create a config with sane defaults for the given key and model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self {
             api_key: api_key.into(),
             model: model.into(),
             effort: None,
-            max_tokens: 4096,
+            max_tokens: Self::DEFAULT_MAX_TOKENS,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
+            thinking: ThinkingConfig::Adaptive {
+                display_summarized: true,
+            },
+            prompt_caching: true,
         }
     }
 
@@ -84,7 +146,12 @@ impl AnthropicConfig {
     /// `ANTHROPIC_API_KEY` (optional; falls back to the default
     /// `token.properties` key file described in
     /// [`load_default_api_key`] when unset), `ANTHROPIC_MODEL` (optional),
-    /// `ANTHROPIC_EFFORT` (optional), `ANTHROPIC_BASE_URL` (optional).
+    /// `ANTHROPIC_EFFORT` (optional), `ANTHROPIC_BASE_URL` (optional),
+    /// `ANTHROPIC_THINKING` / `ANTHROPIC_THINKING_BUDGET` (optional; override the
+    /// extended-thinking budget or disable it — thinking is **on by default**,
+    /// so `ANTHROPIC_THINKING=0`/`false` turns it off), and
+    /// `ANTHROPIC_PROMPT_CACHING` (optional; set to a falsy value to disable
+    /// prompt caching, which is on by default).
     /// Returns `None` if no API key can be resolved from either source.
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
@@ -102,8 +169,75 @@ impl AnthropicConfig {
         if let Ok(base) = std::env::var("ANTHROPIC_BASE_URL") {
             cfg.base_url = base;
         }
+        if let Ok(raw) = std::env::var("ANTHROPIC_MAX_TOKENS") {
+            if let Ok(n) = raw.trim().parse::<u32>() {
+                if n > 0 {
+                    cfg.max_tokens = n;
+                }
+            }
+        }
+        if let Some(thinking) = thinking_override_from_env() {
+            cfg.thinking = thinking;
+        }
+        if let Ok(flag) = std::env::var("ANTHROPIC_PROMPT_CACHING") {
+            cfg.prompt_caching = is_truthy(&flag);
+        }
         Some(cfg)
     }
+}
+
+/// Resolve an extended-thinking override from the environment.
+///
+/// Returns `None` when no thinking env var is set (keep the config default,
+/// which is adaptive thinking on), otherwise the requested [`ThinkingConfig`].
+///
+/// - `ANTHROPIC_THINKING_BUDGET=<n>` (positive integer) selects the legacy
+///   [`ThinkingConfig::Budget`] mode (only for older models that support it).
+/// - `ANTHROPIC_THINKING` accepts:
+///   - a falsy value / `0` -> [`ThinkingConfig::Disabled`];
+///   - a truthy value -> [`ThinkingConfig::Adaptive`] with visible reasoning;
+///   - a positive number -> legacy [`ThinkingConfig::Budget`].
+///
+/// When both are present, `ANTHROPIC_THINKING` is applied last and wins.
+fn thinking_override_from_env() -> Option<ThinkingConfig> {
+    let mut result: Option<ThinkingConfig> = None;
+    if let Ok(raw) = std::env::var("ANTHROPIC_THINKING_BUDGET") {
+        if let Ok(n) = raw.trim().parse::<u32>() {
+            result = Some(if n > 0 {
+                ThinkingConfig::Budget {
+                    budget_tokens: n.max(AnthropicConfig::MIN_THINKING_BUDGET),
+                }
+            } else {
+                ThinkingConfig::Disabled
+            });
+        }
+    }
+    if let Ok(flag) = std::env::var("ANTHROPIC_THINKING") {
+        if let Ok(n) = flag.trim().parse::<u32>() {
+            result = Some(if n > 0 {
+                ThinkingConfig::Budget {
+                    budget_tokens: n.max(AnthropicConfig::MIN_THINKING_BUDGET),
+                }
+            } else {
+                ThinkingConfig::Disabled
+            });
+        } else if is_truthy(&flag) {
+            result = Some(ThinkingConfig::Adaptive {
+                display_summarized: true,
+            });
+        } else {
+            result = Some(ThinkingConfig::Disabled);
+        }
+    }
+    result
+}
+
+/// Whether a textual flag should be treated as "on".
+fn is_truthy(value: &str) -> bool {
+    matches!(
+        value.trim().to_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 /// The property name looked up in the default key file.
@@ -223,9 +357,27 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
         messages.push(serde_json::to_value(msg).unwrap_or_else(|_| json!({})));
     }
 
+    // Merge consecutive messages that share the same role into one message with
+    // a concatenated `content` array. This is required for extended thinking +
+    // tool use: Anthropic mandates that the signed `thinking` block appear in the
+    // *same* assistant message as the following `tool_use` (thinking first). Our
+    // typed history stores thinking, assistant text, and the tool call as
+    // separate consecutive assistant entries, so merging folds them back into a
+    // single, correctly-ordered assistant turn. It also coalesces parallel
+    // tool_result user messages, which Anthropic prefers.
+    merge_consecutive_same_role(&mut messages);
+
+    let caching = config.prompt_caching;
+
+    // Cache the tail of the conversation so its (immutable) prefix is a cache
+    // hit on the next turn, which only appends new messages.
+    if caching {
+        mark_last_message_cacheable(&mut messages);
+    }
+
     let mut body = Map::new();
     body.insert("model".into(), json!(config.model));
-    body.insert("max_tokens".into(), json!(config.max_tokens));
+    body.insert("max_tokens".into(), json!(effective_max_tokens(config)));
     body.insert("stream".into(), json!(true));
     body.insert("messages".into(), Value::Array(messages));
 
@@ -233,25 +385,144 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
         body.insert("output_config".into(), json!({ "effort": effort }));
     }
 
+    // Configure extended thinking. The response then carries `thinking` blocks
+    // (surfaced end-to-end as thoughts, and preserved with their signature for
+    // replay). Newer models (Sonnet 5 / Opus 4.7+) require the `adaptive` form
+    // and reject `enabled`; older models use the legacy `budget_tokens` form.
+    match &config.thinking {
+        ThinkingConfig::Disabled => {
+            body.insert("thinking".into(), json!({ "type": "disabled" }));
+        }
+        ThinkingConfig::Adaptive { display_summarized } => {
+            let mut thinking = json!({ "type": "adaptive" });
+            if *display_summarized {
+                thinking["display"] = json!("summarized");
+            }
+            body.insert("thinking".into(), thinking);
+        }
+        ThinkingConfig::Budget { budget_tokens } => {
+            // `budget_tokens` must be strictly less than `max_tokens`, which
+            // `effective_max_tokens` guarantees.
+            let budget = (*budget_tokens).max(AnthropicConfig::MIN_THINKING_BUDGET);
+            body.insert(
+                "thinking".into(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+        }
+    }
+
     if !system_parts.is_empty() {
-        body.insert("system".into(), json!(system_parts.join("\n\n")));
+        let text = system_parts.join("\n\n");
+        // Cache the (usually stable) system prompt. Placed as a single text
+        // block with a cache breakpoint so both tools and system are reused.
+        if caching {
+            body.insert(
+                "system".into(),
+                json!([{
+                    "type": "text",
+                    "text": text,
+                    "cache_control": { "type": "ephemeral" },
+                }]),
+            );
+        } else {
+            body.insert("system".into(), json!(text));
+        }
     }
 
     if !req.tools.is_empty() {
+        let last = req.tools.len() - 1;
         let tools: Vec<Value> = req
             .tools
             .iter()
-            .map(|t| {
-                json!({
+            .enumerate()
+            .map(|(i, t)| {
+                let mut tool = json!({
                     "name": t.name,
                     "input_schema": t.input_schema,
-                })
+                });
+                // A single breakpoint on the last tool caches the whole tool
+                // block, which rarely changes between turns.
+                if caching && i == last {
+                    if let Some(obj) = tool.as_object_mut() {
+                        obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                    }
+                }
+                tool
             })
             .collect();
         body.insert("tools".into(), Value::Array(tools));
     }
 
     Value::Object(body)
+}
+
+/// The `max_tokens` actually sent. In legacy [`ThinkingConfig::Budget`] mode it
+/// is guaranteed to stay strictly greater than the thinking `budget_tokens` (an
+/// Anthropic API requirement); other modes send `max_tokens` unchanged.
+fn effective_max_tokens(config: &AnthropicConfig) -> u32 {
+    match &config.thinking {
+        ThinkingConfig::Budget { budget_tokens } => {
+            let budget = (*budget_tokens).max(AnthropicConfig::MIN_THINKING_BUDGET);
+            // Leave room for the visible answer on top of the thinking budget.
+            config.max_tokens.max(budget.saturating_add(4096))
+        }
+        ThinkingConfig::Disabled | ThinkingConfig::Adaptive { .. } => config.max_tokens,
+    }
+}
+
+/// Fold consecutive messages sharing the same `role` into a single message,
+/// concatenating their `content` arrays in order. This preserves block ordering
+/// within each merged turn (e.g. `thinking` -> `text` -> `tool_use`).
+///
+/// Messages whose `content` is not an array are left as standalone entries (they
+/// act as a boundary that is not merged), so no information is lost.
+fn merge_consecutive_same_role(messages: &mut Vec<Value>) {
+    if messages.len() < 2 {
+        return;
+    }
+    let mut merged: Vec<Value> = Vec::with_capacity(messages.len());
+    for msg in messages.drain(..) {
+        let can_merge = merged.last().is_some_and(|prev: &Value| {
+            let same_role = prev.get("role") == msg.get("role") && msg.get("role").is_some();
+            let both_arrays = prev.get("content").map(Value::is_array).unwrap_or(false)
+                && msg.get("content").map(Value::is_array).unwrap_or(false);
+            same_role && both_arrays
+        });
+        if can_merge {
+            // Append this message's content blocks onto the previous message.
+            let incoming = msg
+                .get("content")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(prev) = merged.last_mut() {
+                if let Some(prev_content) = prev.get_mut("content").and_then(Value::as_array_mut) {
+                    prev_content.extend(incoming);
+                }
+            }
+        } else {
+            merged.push(msg);
+        }
+    }
+    *messages = merged;
+}
+
+/// Attach an ephemeral cache breakpoint to the last content block of the last
+/// message, so the conversation prefix up to that point can be reused as a
+/// cache hit on the following turn. No-op when there are no messages or the
+/// last message has no structured content array.
+fn mark_last_message_cacheable(messages: &mut [Value]) {
+    let Some(last) = messages.last_mut() else {
+        return;
+    };
+    let Some(content) = last.get_mut("content").and_then(Value::as_array_mut) else {
+        return;
+    };
+    if let Some(block) = content.last_mut() {
+        if let Some(obj) = block.as_object_mut() {
+            obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+        }
+    }
 }
 
 /// Flatten the text content of a system-role message.
@@ -288,9 +559,13 @@ mod tests {
 
         let body = build_body(&req, &cfg());
         assert_eq!(body["model"], "claude-test");
-        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_tokens"], AnthropicConfig::DEFAULT_MAX_TOKENS);
         assert_eq!(body["stream"], true);
-        assert_eq!(body["system"], "be terse");
+        // With prompt caching on (the default), `system` is a structured block
+        // array carrying a cache breakpoint rather than a bare string.
+        assert_eq!(body["system"][0]["type"], "text");
+        assert_eq!(body["system"][0]["text"], "be terse");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][0]["content"][0]["type"], "text");
@@ -458,5 +733,152 @@ mod tests {
         let path = std::env::temp_dir().join("turn-anthropic-test-token-does-not-exist.properties");
         let _ = std::fs::remove_file(&path);
         assert_eq!(read_key_from_path(&path), None);
+    }
+
+    #[test]
+    fn legacy_budget_thinking_enables_and_raises_max_tokens() {
+        let mut cfg = cfg();
+        cfg.thinking = ThinkingConfig::Budget {
+            budget_tokens: 3000,
+        };
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["thinking"]["budget_tokens"], 3000);
+        // max_tokens must stay strictly above the thinking budget.
+        assert!(body["max_tokens"].as_u64().unwrap() > 3000);
+    }
+
+    #[test]
+    fn legacy_budget_thinking_clamped_to_minimum() {
+        let mut cfg = cfg();
+        cfg.thinking = ThinkingConfig::Budget { budget_tokens: 10 };
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            AnthropicConfig::MIN_THINKING_BUDGET
+        );
+    }
+
+    #[test]
+    fn adaptive_thinking_enabled_by_default() {
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        // The default config enables adaptive thinking with visible reasoning.
+        let body = build_body(&req, &cfg());
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn thinking_disabled_sends_disabled_type() {
+        let mut cfg = cfg();
+        cfg.thinking = ThinkingConfig::Disabled;
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert_eq!(body["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn merges_thinking_text_and_tool_use_into_one_assistant_message() {
+        use agent_core::history::ThinkingRecord;
+        use agent_core::{KnownTool, ToolCallId};
+
+        let mut session = SessionState::new("s1");
+        session.push_user_text("do it");
+        // A single assistant turn: thinking, then text, then a tool call —
+        // recorded as three consecutive assistant history entries.
+        session.push_thinking(ThinkingRecord::Thinking {
+            text: "let me think".into(),
+            signature: "sig-123".into(),
+        });
+        session.push_assistant_text("on it");
+        session.push_tool_call(
+            ToolCallId::new("call-1"),
+            KnownTool::classify("fs_read", serde_json::json!({ "path": "/a" })),
+        );
+        let ctx = session.turn_context();
+        let req = DefaultCompiler.compile(&ctx).unwrap();
+        // Disable caching so we assert purely on merge/ordering.
+        let mut cfg = cfg();
+        cfg.prompt_caching = false;
+        let body = build_body(&req, &cfg);
+
+        let messages = body["messages"].as_array().unwrap();
+        // user + one merged assistant message.
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "assistant");
+        let content = messages[1]["content"].as_array().unwrap();
+        // thinking first, then text, then tool_use — order preserved.
+        assert_eq!(content[0]["type"], "thinking");
+        assert_eq!(content[0]["thinking"], "let me think");
+        assert_eq!(content[0]["signature"], "sig-123");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[2]["type"], "tool_use");
+    }
+
+    #[test]
+    fn caching_marks_last_tool_and_last_message() {
+        let mut session = SessionState::new("s1");
+        session.push_user_text("hi");
+        session.available_tools.push(ToolDescriptor {
+            name: "a".into(),
+            schema: serde_json::json!({"type":"object"}),
+            requires_permission: false,
+        });
+        session.available_tools.push(ToolDescriptor {
+            name: "b".into(),
+            schema: serde_json::json!({"type":"object"}),
+            requires_permission: false,
+        });
+        let ctx = session.turn_context();
+        let req = DefaultCompiler.compile(&ctx).unwrap();
+        let body = build_body(&req, &cfg());
+
+        let tools = body["tools"].as_array().unwrap();
+        // Only the last tool carries a breakpoint (caches the whole tool block).
+        assert!(tools[0].get("cache_control").is_none());
+        assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+
+        // The last message's last content block is cacheable.
+        let messages = body["messages"].as_array().unwrap();
+        let last = messages.last().unwrap();
+        let last_block = last["content"].as_array().unwrap().last().unwrap();
+        assert_eq!(last_block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn caching_disabled_keeps_plain_system_and_no_breakpoints() {
+        let mut cfg = cfg();
+        cfg.prompt_caching = false;
+        let mut session = SessionState::new("s1");
+        session.system_prompt = Some("be terse".into());
+        session.push_user_text("hi");
+        session.available_tools.push(ToolDescriptor {
+            name: "a".into(),
+            schema: serde_json::json!({"type":"object"}),
+            requires_permission: false,
+        });
+        let ctx = session.turn_context();
+        let req = DefaultCompiler.compile(&ctx).unwrap();
+        let body = build_body(&req, &cfg);
+
+        assert_eq!(body["system"], "be terse");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        let messages = body["messages"].as_array().unwrap();
+        let last_block = messages.last().unwrap()["content"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap();
+        assert!(last_block.get("cache_control").is_none());
     }
 }

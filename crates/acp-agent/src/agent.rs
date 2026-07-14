@@ -52,8 +52,8 @@ use mcp_client::{register_mcp_tools, McpConnection};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
-use crate::client::AcpClientAccess;
 use crate::config::AgentConfig;
+use crate::local_client::LocalClientAccess;
 use crate::selection::ModelSelection;
 use crate::sink::AcpUpdateSink;
 
@@ -314,11 +314,12 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     let cx = cx.clone();
                     let selection = entry.selection.lock().expect("selection mutex poisoned").clone();
                     async move {
-                        let client = Arc::new(AcpClientAccess::new(
+                        let client = Arc::new(LocalClientAccess::with_elicitation(
                             cx.clone(),
                             acp_session_id.clone(),
                         ));
-                        let mut sink = AcpUpdateSink::new(cx, acp_session_id);
+                        let mut sink = AcpUpdateSink::new(cx, acp_session_id)
+                            .with_yolo(selection.permission.is_yolo());
 
                         let result = if orchestrate {
                             // Orchestrate mode: the prompt text is the goal; run
@@ -353,7 +354,8 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                             let next_turn = factory(&selection);
                             let engine = TurnEngine::new(next_turn, tools)
                                 .with_client(client)
-                                .with_inbox(inbox);
+                                .with_inbox(inbox)
+                                .with_progress_nudge();
                             let mut guard = entry.state.lock().await;
                             let result =
                                 engine.run_prompt(&mut guard, &mut sink, &cancel).await;
@@ -471,12 +473,16 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                         entry.selection.lock().expect("selection mutex poisoned").clone();
                     async move {
                         let next_turn = factory(&selection);
-                        let client =
-                            Arc::new(AcpClientAccess::new(cx.clone(), acp_session_id.clone()));
+                        let client = Arc::new(LocalClientAccess::with_elicitation(
+                            cx.clone(),
+                            acp_session_id.clone(),
+                        ));
                         let engine = TurnEngine::new(next_turn, tools)
                             .with_client(client)
-                            .with_inbox(inbox);
-                        let mut sink = AcpUpdateSink::new(cx, acp_session_id);
+                            .with_inbox(inbox)
+                            .with_progress_nudge();
+                        let mut sink = AcpUpdateSink::new(cx, acp_session_id)
+                            .with_yolo(selection.permission.is_yolo());
 
                         let mut guard = turn_entry.state.lock().await;
                         let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;

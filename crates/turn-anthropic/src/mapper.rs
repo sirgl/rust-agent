@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 
+use agent_core::history::ThinkingRecord;
 use agent_core::{StopReason, ToolCallId, TurnError, TurnEvent};
 use serde_json::Value;
 
@@ -46,8 +47,13 @@ use serde_json::Value;
 enum BlockState {
     /// A text block (no accumulation needed; deltas are forwarded live).
     Text,
-    /// A thinking block (deltas forwarded live).
-    Thinking,
+    /// A thinking block: deltas are forwarded live for display *and*
+    /// accumulated (text + signature) so the complete signed block can be
+    /// emitted at `content_block_stop` for faithful replay.
+    Thinking { text: String, signature: String },
+    /// A redacted (encrypted, opaque) thinking block; its `data` is captured so
+    /// it can be preserved and echoed back unchanged.
+    RedactedThinking { data: String },
     /// A tool-use block whose argument JSON is being assembled.
     ToolUse {
         id: String,
@@ -113,7 +119,29 @@ impl StreamMapper {
                 self.blocks.insert(index, BlockState::Text);
             }
             Some("thinking") => {
-                self.blocks.insert(index, BlockState::Thinking);
+                // A thinking block may carry an initial `thinking`/`signature`
+                // already at start; capture them so nothing is lost.
+                let text = block
+                    .and_then(|b| b.get("thinking"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let signature = block
+                    .and_then(|b| b.get("signature"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks
+                    .insert(index, BlockState::Thinking { text, signature });
+            }
+            Some("redacted_thinking") => {
+                let data = block
+                    .and_then(|b| b.get("data"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                self.blocks
+                    .insert(index, BlockState::RedactedThinking { data });
             }
             Some("tool_use") => {
                 let id = block
@@ -155,7 +183,23 @@ impl StreamMapper {
             }
             Some("thinking_delta") => {
                 if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                    // Accumulate for the complete signed block, and forward the
+                    // delta live for streaming display.
+                    if let Some(BlockState::Thinking { text: acc, .. }) =
+                        self.blocks.get_mut(&index)
+                    {
+                        acc.push_str(text);
+                    }
                     return vec![TurnEvent::Thinking(text.to_string())];
+                }
+            }
+            Some("signature_delta") => {
+                if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
+                    if let Some(BlockState::Thinking { signature, .. }) =
+                        self.blocks.get_mut(&index)
+                    {
+                        signature.push_str(sig);
+                    }
                 }
             }
             Some("input_json_delta") => {
@@ -165,7 +209,7 @@ impl StreamMapper {
                     }
                 }
             }
-            // signature_delta and unknowns are intentionally ignored.
+            // Unknown delta types are intentionally ignored.
             _ => {}
         }
         Vec::new()
@@ -184,7 +228,17 @@ impl StreamMapper {
                     arguments,
                 }]
             }
-            // Text/thinking blocks need no closing event.
+            // Emit the complete, signed thinking block for verbatim replay.
+            Some(BlockState::Thinking { text, signature }) => {
+                vec![TurnEvent::ThinkingBlock(ThinkingRecord::Thinking {
+                    text,
+                    signature,
+                })]
+            }
+            Some(BlockState::RedactedThinking { data }) => {
+                vec![TurnEvent::ThinkingBlock(ThinkingRecord::Redacted { data })]
+            }
+            // Text blocks need no closing event.
             _ => Vec::new(),
         }
     }
@@ -289,6 +343,51 @@ mod tests {
         );
         assert_eq!(out.len(), 1);
         assert!(matches!(&out[0], TurnEvent::Thinking(t) if t == "hmm"));
+    }
+
+    #[test]
+    fn emits_complete_signed_thinking_block_on_stop() {
+        let mut m = StreamMapper::new();
+        let out = push_all(
+            &mut m,
+            &[
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"first "}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"second"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"xyz"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ],
+        );
+        // Two live deltas, then the complete signed block at stop.
+        assert!(matches!(&out[0], TurnEvent::Thinking(t) if t == "first "));
+        assert!(matches!(&out[1], TurnEvent::Thinking(t) if t == "second"));
+        match out.last().unwrap() {
+            TurnEvent::ThinkingBlock(ThinkingRecord::Thinking { text, signature }) => {
+                assert_eq!(text, "first second");
+                assert_eq!(signature, "sig-xyz");
+            }
+            other => panic!("expected signed ThinkingBlock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn emits_redacted_thinking_block_on_stop() {
+        let mut m = StreamMapper::new();
+        let out = push_all(
+            &mut m,
+            &[
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"redacted_thinking","data":"enc-abc"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ],
+        );
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            TurnEvent::ThinkingBlock(ThinkingRecord::Redacted { data }) => {
+                assert_eq!(data, "enc-abc");
+            }
+            other => panic!("expected redacted ThinkingBlock, got {other:?}"),
+        }
     }
 
     #[test]

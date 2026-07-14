@@ -6,7 +6,7 @@
 //! [`crate::compiler::LlmCompiler`] seam.
 
 use crate::event::ToolCallId;
-use crate::history::{Conversation, HistoryEntry, KnownTool};
+use crate::history::{Conversation, HistoryEntry, KnownTool, ThinkingRecord};
 
 /// Descriptor for a tool that is available in a session.
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +56,11 @@ impl SessionState {
     /// Append an assistant text message.
     pub fn push_assistant_text(&mut self, text: impl Into<String>) {
         self.history.push_assistant_text(text);
+    }
+
+    /// Append an assistant extended-thinking block.
+    pub fn push_thinking(&mut self, record: ThinkingRecord) {
+        self.history.push_thinking(record);
     }
 
     /// Append a tool call.

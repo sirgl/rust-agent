@@ -15,12 +15,13 @@ use agent_client_protocol::schema::v1::{
     Content, ContentBlock, ContentChunk, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
     PlanEntryPriority, PlanEntryStatus, RequestPermissionOutcome, RequestPermissionRequest,
     SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus as AcpToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+    ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus, ToolCallUpdate,
+    ToolCallUpdateFields, ToolKind as AcpToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use agent_core::{
-    AgentError, EngineOutput, PlanStepStatus, PlanUpdate, Result, ToolCallId, ToolCallStatus,
-    UpdateSink,
+    AgentError, EngineOutput, PlanStepStatus, PlanUpdate, Result, ToolCallId, ToolCallLocation,
+    ToolCallStatus, ToolKind, UpdateSink,
 };
 use async_trait::async_trait;
 use tracing::debug;
@@ -34,13 +35,27 @@ const REJECT_OPTION_ID: &str = "reject-once";
 pub struct AcpUpdateSink {
     cx: ConnectionTo<Client>,
     session_id: SessionId,
+    /// When `true` (YOLO permission mode), permission-gated tool calls are
+    /// auto-granted without issuing a `session/request_permission` round-trip.
+    yolo: bool,
 }
 
 impl AcpUpdateSink {
-    /// Create a sink bound to a connection and session.
+    /// Create a sink bound to a connection and session (Normal permission mode).
     #[must_use]
     pub fn new(cx: ConnectionTo<Client>, session_id: SessionId) -> Self {
-        Self { cx, session_id }
+        Self {
+            cx,
+            session_id,
+            yolo: false,
+        }
+    }
+
+    /// Set whether the sink auto-grants permission-gated tool calls (YOLO mode).
+    #[must_use]
+    pub fn with_yolo(mut self, yolo: bool) -> Self {
+        self.yolo = yolo;
+        self
     }
 
     /// Send a single `session/update` notification, mapping transport errors.
@@ -66,11 +81,32 @@ impl UpdateSink for AcpUpdateSink {
                 )))
             }
             EngineOutput::Plan(plan) => self.notify(SessionUpdate::Plan(map_plan(&plan))),
-            EngineOutput::ToolCall { id, name, status } => {
-                let tool_call = ToolCall::new(id.0, name).status(map_status(status));
+            EngineOutput::ToolCall {
+                id,
+                name: _,
+                title,
+                kind,
+                status,
+                locations,
+                raw_input,
+            } => {
+                let mut tool_call = ToolCall::new(id.0, title)
+                    .kind(map_kind(kind))
+                    .status(map_status(status));
+                if !locations.is_empty() {
+                    tool_call = tool_call.locations(locations.iter().map(map_location).collect());
+                }
+                if let Some(input) = raw_input {
+                    tool_call = tool_call.raw_input(input);
+                }
                 self.notify(SessionUpdate::ToolCall(tool_call))
             }
-            EngineOutput::ToolCallUpdate { id, status, output } => {
+            EngineOutput::ToolCallUpdate {
+                id,
+                status,
+                output,
+                raw_output,
+            } => {
                 let mut fields = ToolCallUpdateFields::new().status(map_status(status));
                 if let Some(text) = output {
                     if !text.is_empty() {
@@ -79,12 +115,20 @@ impl UpdateSink for AcpUpdateSink {
                         ))]);
                     }
                 }
+                if let Some(out) = raw_output {
+                    fields = fields.raw_output(out);
+                }
                 self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.0, fields)))
             }
         }
     }
 
     async fn request_permission(&mut self, id: &ToolCallId, tool_name: &str) -> Result<bool> {
+        // YOLO mode: auto-grant without prompting the client.
+        if self.yolo {
+            debug!(tool = tool_name, "permission auto-granted (YOLO mode)");
+            return Ok(true);
+        }
         let tool_call = ToolCallUpdate::new(
             id.0.clone(),
             ToolCallUpdateFields::new()
@@ -121,6 +165,30 @@ impl UpdateSink for AcpUpdateSink {
 /// Wrap a plain string as a text [`ContentBlock`].
 fn text_block(text: String) -> ContentBlock {
     ContentBlock::Text(TextContent::new(text))
+}
+
+/// Map a provider-agnostic [`ToolKind`] to the ACP schema equivalent.
+fn map_kind(kind: ToolKind) -> AcpToolKind {
+    match kind {
+        ToolKind::Read => AcpToolKind::Read,
+        ToolKind::Edit => AcpToolKind::Edit,
+        ToolKind::Delete => AcpToolKind::Delete,
+        ToolKind::Move => AcpToolKind::Move,
+        ToolKind::Search => AcpToolKind::Search,
+        ToolKind::Execute => AcpToolKind::Execute,
+        ToolKind::Think => AcpToolKind::Think,
+        ToolKind::Fetch => AcpToolKind::Fetch,
+        ToolKind::Other => AcpToolKind::Other,
+    }
+}
+
+/// Map a provider-agnostic [`ToolCallLocation`] to the ACP schema equivalent.
+fn map_location(location: &ToolCallLocation) -> AcpToolCallLocation {
+    let acp = AcpToolCallLocation::new(location.path.clone());
+    match location.line {
+        Some(line) => acp.line(line),
+        None => acp,
+    }
 }
 
 /// Map an [`agent_core`] tool-call status to the ACP schema equivalent.

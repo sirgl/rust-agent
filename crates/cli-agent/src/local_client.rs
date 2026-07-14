@@ -8,10 +8,14 @@
 //! the real machine. The built-in tools themselves are unchanged: they depend
 //! only on the [`ClientAccess`] trait.
 
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-use agent_core::{AgentError, ClientAccess, Result, TerminalOutcome};
+use agent_core::{AgentError, ClientAccess, Result, TerminalChunk, TerminalOutcome};
 use async_trait::async_trait;
+use futures::channel::mpsc;
+use futures::stream::BoxStream;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::process::Command as TokioCommand;
 use tracing::debug;
 
 /// Byte limit applied to captured terminal output before truncation, matching
@@ -61,10 +65,15 @@ impl ClientAccess for LocalClientAccess {
         debug!(path, "local fs write");
         let path = path.to_string();
         let content = content.to_string();
-        tokio::task::spawn_blocking(move || std::fs::write(&path, content))
-            .await
-            .map_err(|err| AgentError::Other(format!("write task join error: {err}")))?
-            .map_err(|err| AgentError::Other(format!("write_text_file failed: {err}")))
+        tokio::task::spawn_blocking(move || {
+            if let Some(parent) = std::path::Path::new(&path).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)
+        })
+        .await
+        .map_err(|err| AgentError::Other(format!("write task join error: {err}")))?
+        .map_err(|err| AgentError::Other(format!("write_text_file failed: {err}")))
     }
 
     async fn run_terminal(&self, command: &str, args: &[String]) -> Result<TerminalOutcome> {
@@ -91,6 +100,95 @@ impl ClientAccess for LocalClientAccess {
             exit_code,
             signal,
         })
+    }
+
+    async fn run_terminal_streaming(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<BoxStream<'static, TerminalChunk>> {
+        debug!(command, "local terminal run (streaming)");
+        spawn_streaming_terminal(command.to_string(), args.to_vec())
+    }
+}
+
+/// Spawn `command` with piped stdout/stderr and return a stream of output
+/// chunks followed by a single [`TerminalChunk::Finished`].
+///
+/// Output is streamed line-by-line (stdout first, then stderr) as it is
+/// produced, giving the terminal UI a "live log". The combined output is capped
+/// at [`MAX_OUTPUT_BYTES`]; once exceeded, further output is dropped and the
+/// final outcome is marked truncated.
+fn spawn_streaming_terminal(
+    command: String,
+    args: Vec<String>,
+) -> Result<BoxStream<'static, TerminalChunk>> {
+    let mut child = TokioCommand::new(&command)
+        .args(&args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| AgentError::Other(format!("run_terminal failed: {err}")))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (tx, rx) = mpsc::unbounded::<TerminalChunk>();
+
+    tokio::spawn(async move {
+        let mut combined = String::new();
+        let mut truncated = false;
+
+        if let Some(stdout) = stdout {
+            stream_lines(stdout, &tx, &mut combined, &mut truncated).await;
+        }
+        if let Some(stderr) = stderr {
+            stream_lines(stderr, &tx, &mut combined, &mut truncated).await;
+        }
+
+        let (exit_code, signal) = match child.wait().await {
+            Ok(status) => (status.code().map(|c| c as u32), signal_of(&status)),
+            Err(_) => (None, None),
+        };
+
+        let _ = tx.unbounded_send(TerminalChunk::Finished(TerminalOutcome {
+            output: combined,
+            truncated,
+            exit_code,
+            signal,
+        }));
+    });
+
+    Ok(Box::pin(rx))
+}
+
+/// Read `reader` line-by-line, forwarding each line (with a trailing newline)
+/// as a [`TerminalChunk::Output`] while accumulating into `combined` under the
+/// [`MAX_OUTPUT_BYTES`] cap.
+async fn stream_lines<R: AsyncRead + Unpin>(
+    reader: R,
+    tx: &mpsc::UnboundedSender<TerminalChunk>,
+    combined: &mut String,
+    truncated: &mut bool,
+) {
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        if combined.len() >= MAX_OUTPUT_BYTES {
+            *truncated = true;
+            continue;
+        }
+        let mut chunk = line;
+        chunk.push('\n');
+        let remaining = MAX_OUTPUT_BYTES - combined.len();
+        if chunk.len() > remaining {
+            let mut end = remaining;
+            while end > 0 && !chunk.is_char_boundary(end) {
+                end -= 1;
+            }
+            chunk.truncate(end);
+            *truncated = true;
+        }
+        combined.push_str(&chunk);
+        let _ = tx.unbounded_send(TerminalChunk::Output(chunk));
     }
 }
 

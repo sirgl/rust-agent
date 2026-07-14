@@ -28,24 +28,26 @@ pub mod sink;
 pub mod tool;
 
 pub use cancel::CancellationToken;
-pub use client::{ClientAccess, ElicitationOutcome, TerminalOutcome};
+pub use client::{ClientAccess, ElicitationOutcome, TerminalChunk, TerminalOutcome};
 pub use compaction::{
     ChainedCompactor, Compactor, HeuristicCompactor, LlmCompactor, TextSummarizer,
 };
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };
-pub use engine::{TurnEngine, TurnInbox};
+pub use engine::{
+    TurnEngine, TurnInbox, DEFAULT_NUDGE_INTERVAL, DEFAULT_PROGRESS_NUDGE, MAX_TOOL_RESULT_CHARS,
+};
 pub use error::{AgentError, Result, TurnError};
 pub use event::{PlanStep, PlanStepStatus, PlanUpdate, StopReason, ToolCallId, TurnEvent};
 pub use history::{
     AssistantMessage, ContentBlock, Conversation, EditToolCall, FsReadToolCall, FsWriteToolCall,
-    HistoryEntry, IngestedRecord, KnownTool, TerminalRunToolCall, ToolCallRecord, ToolResultRecord,
-    UserMessage,
+    HistoryEntry, IngestedRecord, KnownTool, TerminalRunToolCall, ThinkingRecord, ToolCallRecord,
+    ToolResultRecord, UserMessage,
 };
 pub use service::NextTurnService;
 pub use session::{SessionState, ToolDescriptor, TurnContext};
-pub use sink::{EngineOutput, ToolCallStatus, UpdateSink};
+pub use sink::{EngineOutput, ToolCallLocation, ToolCallStatus, ToolKind, UpdateSink};
 pub use tool::{Tool, ToolContext, ToolEvent, ToolRegistry, ToolResult};
 
 /// Initialize a default `tracing` subscriber writing to stderr.

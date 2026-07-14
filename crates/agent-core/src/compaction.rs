@@ -110,6 +110,12 @@ fn entry_len(entry: &HistoryEntry) -> usize {
     match entry {
         HistoryEntry::User(m) => content_len(&m.content),
         HistoryEntry::Assistant(m) => content_len(&m.content),
+        HistoryEntry::Thinking(t) => match t {
+            crate::history::ThinkingRecord::Thinking { text, signature } => {
+                text.len() + signature.len()
+            }
+            crate::history::ThinkingRecord::Redacted { data } => data.len(),
+        },
         HistoryEntry::ToolCall(c) => c.tool.arguments().to_string().len(),
         HistoryEntry::ToolResult(r) => content_len(&r.content),
         HistoryEntry::Ingested(i) => i.payload.to_string().len(),

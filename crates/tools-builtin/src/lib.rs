@@ -28,12 +28,13 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentError, ClientAccess, ElicitationOutcome, Result, Tool, ToolContext, ToolEvent,
-    ToolRegistry,
+    AgentError, ClientAccess, ElicitationOutcome, Result, TerminalChunk, Tool, ToolCallLocation,
+    ToolContext, ToolEvent, ToolKind, ToolRegistry,
 };
 use async_trait::async_trait;
-use futures::stream::{self, BoxStream};
+use futures::stream::{self, BoxStream, StreamExt};
 use serde::Deserialize;
+use serde_json::json;
 use tracing::debug;
 
 /// Register all built-in filesystem and terminal tools into `registry`.
@@ -128,6 +129,23 @@ impl Tool for FsReadTool {
         false
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::Read
+    }
+
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        serde_json::from_value::<FsReadArgs>(args.clone())
+            .ok()
+            .map(|a| format!("Read {}", a.path))
+    }
+
+    fn locations(&self, args: &serde_json::Value) -> Vec<ToolCallLocation> {
+        serde_json::from_value::<FsReadArgs>(args.clone())
+            .ok()
+            .map(|a| vec![ToolCallLocation::new(a.path)])
+            .unwrap_or_default()
+    }
+
     async fn call(
         &self,
         args: serde_json::Value,
@@ -179,6 +197,23 @@ impl Tool for FsWriteTool {
     fn requires_permission(&self) -> bool {
         // Writing to disk is destructive.
         true
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Edit
+    }
+
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        serde_json::from_value::<FsWriteArgs>(args.clone())
+            .ok()
+            .map(|a| format!("Write {}", a.path))
+    }
+
+    fn locations(&self, args: &serde_json::Value) -> Vec<ToolCallLocation> {
+        serde_json::from_value::<FsWriteArgs>(args.clone())
+            .ok()
+            .map(|a| vec![ToolCallLocation::new(a.path)])
+            .unwrap_or_default()
     }
 
     async fn call(
@@ -241,6 +276,22 @@ impl Tool for TerminalRunTool {
         true
     }
 
+    fn kind(&self) -> ToolKind {
+        ToolKind::Execute
+    }
+
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        serde_json::from_value::<TerminalRunArgs>(args.clone())
+            .ok()
+            .map(|a| {
+                if a.args.is_empty() {
+                    format!("Run {}", a.command)
+                } else {
+                    format!("Run {} {}", a.command, a.args.join(" "))
+                }
+            })
+    }
+
     async fn call(
         &self,
         args: serde_json::Value,
@@ -249,38 +300,44 @@ impl Tool for TerminalRunTool {
         let args: TerminalRunArgs = parse_args(self.name(), args)?;
         let client: &Arc<dyn ClientAccess> = ctx.client()?;
         debug!(command = %args.command, "terminal_run");
-        match client.run_terminal(&args.command, &args.args).await {
-            Ok(outcome) => {
-                let mut stream_events = vec![ToolEvent::Started];
-                if !outcome.output.is_empty() {
-                    stream_events.push(ToolEvent::OutputDelta(outcome.output.clone()));
-                }
-                let payload = serde_json::json!({
+        // Stream output incrementally: each chunk of stdout/stderr becomes an
+        // `OutputDelta`, giving the client a "live log" as the command runs, and
+        // the final `Finished` chunk maps to `Completed`/`Failed`.
+        let term_stream = match client.run_terminal_streaming(&args.command, &args.args).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                return Ok(events(vec![
+                    ToolEvent::Started,
+                    ToolEvent::Failed(format!("failed to run `{}`: {err}", args.command)),
+                ]));
+            }
+        };
+
+        let command = args.command.clone();
+        let mapped = term_stream.map(move |chunk| match chunk {
+            TerminalChunk::Output(text) => ToolEvent::OutputDelta(text),
+            TerminalChunk::Finished(outcome) => {
+                let payload = json!({
                     "output": outcome.output,
                     "truncated": outcome.truncated,
                     "exit_code": outcome.exit_code,
                     "signal": outcome.signal,
                 });
                 if outcome.is_success() {
-                    stream_events.push(ToolEvent::Completed(payload));
+                    ToolEvent::Completed(payload)
                 } else {
                     let detail = match (outcome.exit_code, &outcome.signal) {
                         (_, Some(sig)) => format!("terminated by signal {sig}"),
                         (Some(code), None) => format!("exited with code {code}"),
                         (None, None) => "exited abnormally".to_string(),
                     };
-                    stream_events.push(ToolEvent::Failed(format!(
-                        "command `{}` {detail}: {}",
-                        args.command, outcome.output
-                    )));
+                    ToolEvent::Failed(format!("command `{command}` {detail}"))
                 }
-                Ok(events(stream_events))
             }
-            Err(err) => Ok(events(vec![
-                ToolEvent::Started,
-                ToolEvent::Failed(format!("failed to run `{}`: {err}", args.command)),
-            ])),
-        }
+        });
+
+        let started = stream::once(async { ToolEvent::Started });
+        Ok(Box::pin(started.chain(mapped)))
     }
 }
 
@@ -575,5 +632,87 @@ mod tests {
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("terminal_run"));
         assert!(registry.contains("elicitation"));
+    }
+
+    #[test]
+    fn tools_expose_rich_metadata() {
+        let read_args = serde_json::json!({ "path": "/tmp/a.txt" });
+        assert_eq!(FsReadTool.kind(), ToolKind::Read);
+        assert_eq!(FsReadTool.title(&read_args).as_deref(), Some("Read /tmp/a.txt"));
+        let read_locs = FsReadTool.locations(&read_args);
+        assert_eq!(read_locs.len(), 1);
+        assert_eq!(read_locs[0].path, "/tmp/a.txt");
+
+        let write_args = serde_json::json!({ "path": "/tmp/b.txt", "content": "x" });
+        assert_eq!(FsWriteTool.kind(), ToolKind::Edit);
+        assert_eq!(
+            FsWriteTool.title(&write_args).as_deref(),
+            Some("Write /tmp/b.txt")
+        );
+        assert_eq!(FsWriteTool.locations(&write_args).len(), 1);
+
+        let run_args = serde_json::json!({ "command": "ls", "args": ["-la"] });
+        assert_eq!(TerminalRunTool.kind(), ToolKind::Execute);
+        assert_eq!(TerminalRunTool.title(&run_args).as_deref(), Some("Run ls -la"));
+        assert!(TerminalRunTool.locations(&run_args).is_empty());
+    }
+
+    /// A fake client that streams several output chunks before finishing.
+    #[derive(Default)]
+    struct StreamingFakeClient;
+
+    #[async_trait]
+    impl ClientAccess for StreamingFakeClient {
+        async fn read_text_file(&self, _path: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn write_text_file(&self, _path: &str, _content: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn run_terminal(&self, _command: &str, _args: &[String]) -> Result<TerminalOutcome> {
+            unreachable!("streaming path should be used")
+        }
+        async fn run_terminal_streaming(
+            &self,
+            _command: &str,
+            _args: &[String],
+        ) -> Result<BoxStream<'static, TerminalChunk>> {
+            let chunks = vec![
+                TerminalChunk::Output("line1\n".into()),
+                TerminalChunk::Output("line2\n".into()),
+                TerminalChunk::Finished(TerminalOutcome {
+                    output: "line1\nline2\n".into(),
+                    truncated: false,
+                    exit_code: Some(0),
+                    signal: None,
+                }),
+            ];
+            Ok(Box::pin(stream::iter(chunks)))
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_run_streams_incremental_output() {
+        let client = Arc::new(StreamingFakeClient);
+        let ctx = ctx_with(client);
+        let tool = TerminalRunTool;
+        let stream = tool
+            .call(serde_json::json!({ "command": "echo" }), &ctx)
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+
+        assert!(matches!(evts[0], ToolEvent::Started));
+        let deltas: Vec<&String> = evts
+            .iter()
+            .filter_map(|e| match e {
+                ToolEvent::OutputDelta(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2, "expected two incremental output chunks");
+        assert_eq!(deltas[0], "line1\n");
+        assert_eq!(deltas[1], "line2\n");
+        assert!(matches!(evts.last(), Some(ToolEvent::Completed(_))));
     }
 }

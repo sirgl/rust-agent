@@ -10,6 +10,7 @@
 //! decision layer / dialect path.
 
 use async_trait::async_trait;
+use futures::stream::{self, BoxStream};
 
 use crate::error::{AgentError, Result};
 
@@ -50,6 +51,20 @@ impl TerminalOutcome {
     }
 }
 
+/// A single item in a streaming terminal run.
+///
+/// A terminal command is surfaced as a stream of zero or more
+/// [`TerminalChunk::Output`] deltas (incremental stdout/stderr as it is
+/// produced), followed by exactly one terminal [`TerminalChunk::Finished`]
+/// carrying the final [`TerminalOutcome`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalChunk {
+    /// An incremental chunk of combined stdout/stderr output.
+    Output(String),
+    /// The command finished; carries the final outcome.
+    Finished(TerminalOutcome),
+}
+
 /// Provider-independent access to the ACP client's filesystem and terminal
 /// capabilities.
 ///
@@ -66,6 +81,29 @@ pub trait ClientAccess: Send + Sync {
 
     /// Run a terminal command, waiting for it to exit, and return its outcome.
     async fn run_terminal(&self, command: &str, args: &[String]) -> Result<TerminalOutcome>;
+
+    /// Run a terminal command, streaming its output as it is produced.
+    ///
+    /// Returns a stream of [`TerminalChunk::Output`] deltas followed by a single
+    /// [`TerminalChunk::Finished`] with the final outcome. The default
+    /// implementation is a non-streaming fallback built on top of
+    /// [`run_terminal`](Self::run_terminal): it runs the command to completion
+    /// and yields the whole output as one chunk. Implementations backed by a
+    /// live process (e.g. the local machine) should override this to emit
+    /// incremental output for a "live log" experience.
+    async fn run_terminal_streaming(
+        &self,
+        command: &str,
+        args: &[String],
+    ) -> Result<BoxStream<'static, TerminalChunk>> {
+        let outcome = self.run_terminal(command, args).await?;
+        let mut chunks = Vec::new();
+        if !outcome.output.is_empty() {
+            chunks.push(TerminalChunk::Output(outcome.output.clone()));
+        }
+        chunks.push(TerminalChunk::Finished(outcome));
+        Ok(Box::pin(stream::iter(chunks)))
+    }
 
     /// Request structured input from the user via a form.
     ///

@@ -10,6 +10,7 @@ use crate::cancel::CancellationToken;
 use crate::client::ClientAccess;
 use crate::error::{AgentError, Result};
 use crate::event::ToolCallId;
+use crate::sink::{ToolCallLocation, ToolKind};
 
 /// A streaming event emitted while a tool executes.
 #[derive(Debug, Clone)]
@@ -82,6 +83,29 @@ pub trait Tool: Send + Sync {
 
     /// Whether this tool requires explicit user permission before execution.
     fn requires_permission(&self) -> bool;
+
+    /// The category of this tool, used by clients for icons and UI treatment.
+    ///
+    /// Defaults to [`ToolKind::Other`].
+    fn kind(&self) -> ToolKind {
+        ToolKind::Other
+    }
+
+    /// A human-readable title describing a specific invocation with `args`.
+    ///
+    /// Returning `None` (the default) lets the caller fall back to the tool
+    /// name. Implementations may derive a richer title from the arguments
+    /// (e.g. `"Read /path/to/file"`).
+    fn title(&self, _args: &serde_json::Value) -> Option<String> {
+        None
+    }
+
+    /// File locations this invocation touches, for client "follow-along".
+    ///
+    /// Defaults to an empty list.
+    fn locations(&self, _args: &serde_json::Value) -> Vec<ToolCallLocation> {
+        Vec::new()
+    }
 
     /// Execute the tool, streaming [`ToolEvent`]s back to the caller.
     async fn call(

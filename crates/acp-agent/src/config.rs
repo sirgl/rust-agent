@@ -9,6 +9,39 @@
 use mcp_client::McpServerConfig;
 use subagents::DEFAULT_MAX_DEPTH;
 
+/// Default system prompt seeded into every new session unless overridden.
+///
+/// It defines the agent's persona and working style (consistent, thorough,
+/// proactive, best-practices-driven) and, crucially, makes it *communicate its
+/// intent*: it should keep the user posted with very short (1-2 line) plan and
+/// progress notes instead of going silent for many steps of thinking and tool
+/// calls. The engine reinforces this by periodically injecting a short nudge
+/// (see `agent_core::DEFAULT_PROGRESS_NUDGE`).
+pub const DEFAULT_SYSTEM_PROMPT: &str = "\
+You are an AI coding agent working inside a user's editor. Act like a careful, \
+senior engineer.\n\
+\n\
+How you work:\n\
+- Be consistent and predictable; follow the existing conventions and patterns \
+of the project and keep your approach coherent across the whole task.\n\
+- Clarify the task in detail: figure out the precise intent and requirements. \
+If something is genuinely ambiguous or a decision is risky, ask a short, \
+focused clarifying question before doing heavy or irreversible work.\n\
+- Be proactive: anticipate what the user really needs, investigate edge cases, \
+error paths, concurrency and data races, and other corner cases rather than \
+only the happy path.\n\
+- Use best practices for correctness, safety and maintainability; prefer \
+simple, robust solutions over clever but fragile ones.\n\
+- Answer in a structured way (short sections/bullets when useful) but stay \
+succinct — no filler, minimal text, high signal.\n\
+\n\
+Communication rule (important): keep the user informed of your intent. Before \
+starting work on a request — and again as you make progress across multiple \
+tool calls — send a very short, plain-language message (1-2 lines maximum, \
+minimal text) saying what you plan to do next and why. Do not go silent for \
+many steps while only thinking or calling tools. These are quick plan/progress \
+notes, not the full answer.";
+
 /// Static configuration for the agent process.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -43,13 +76,13 @@ impl Default for AgentConfig {
         Self {
             name: "rust-acp-agent".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
-            system_prompt: None,
+            system_prompt: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
             enable_subagents: true,
             subagent_max_depth: DEFAULT_MAX_DEPTH,
             mcp_servers: Vec::new(),
             enable_orchestrated: false,
             enable_orchestrate_tool: false,
-            default_model: "claude-3-5-sonnet-latest".to_string(),
+            default_model: "claude-sonnet-5".to_string(),
         }
     }
 }
@@ -105,6 +138,15 @@ mod tests {
     #[test]
     fn default_model_is_sonnet() {
         let config = AgentConfig::default();
-        assert_eq!(config.default_model, "claude-3-5-sonnet-latest");
+        assert_eq!(config.default_model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn default_seeds_communication_system_prompt() {
+        let config = AgentConfig::default();
+        let prompt = config
+            .system_prompt
+            .expect("a default system prompt should be seeded");
+        assert!(prompt.contains("1-2 lines"));
     }
 }

@@ -98,16 +98,27 @@ impl<W: Write + Send> UpdateSink for TerminalUpdateSink<W> {
                 }
                 self.write_flush(&rendered)
             }
-            EngineOutput::ToolCall { id, name, status } => {
+            EngineOutput::ToolCall {
+                id,
+                name: _,
+                title,
+                status,
+                ..
+            } => {
                 self.ensure_newline()?;
                 self.write_flush(&format!(
                     "[tool {}] {} ({})\n",
                     id.0,
-                    name,
+                    title,
                     status_label(status)
                 ))
             }
-            EngineOutput::ToolCallUpdate { id, status, output } => {
+            EngineOutput::ToolCallUpdate {
+                id,
+                status,
+                output,
+                ..
+            } => {
                 self.ensure_newline()?;
                 let mut line = format!("[tool {}] -> {}", id.0, status_label(status));
                 if let Some(out) = output {
@@ -191,12 +202,17 @@ mod tests {
             EngineOutput::ToolCall {
                 id: id.clone(),
                 name: "fs_read".to_string(),
+                title: "fs_read".to_string(),
+                kind: agent_core::ToolKind::Read,
                 status: ToolCallStatus::Pending,
+                locations: Vec::new(),
+                raw_input: None,
             },
             EngineOutput::ToolCallUpdate {
                 id: id.clone(),
                 status: ToolCallStatus::Completed,
                 output: Some("ok".to_string()),
+                raw_output: None,
             },
         ]);
         // The mid-line message must be closed before the status line.

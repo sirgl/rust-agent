@@ -63,6 +63,22 @@ pub enum LlmContentBlock {
         /// The textual content.
         text: String,
     },
+    /// A block of assistant extended-thinking with its cryptographic signature.
+    ///
+    /// Providers that support extended thinking (e.g. Anthropic) require these
+    /// blocks to be echoed back unchanged in the assistant turn that also holds
+    /// the `tool_use`, so they must be rendered verbatim.
+    Thinking {
+        /// The reasoning text.
+        thinking: String,
+        /// The signature validating the block.
+        signature: String,
+    },
+    /// A redacted (encrypted, opaque) thinking block echoed back unchanged.
+    RedactedThinking {
+        /// The opaque encrypted payload.
+        data: String,
+    },
     /// A request from the assistant to invoke a tool.
     ToolUse {
         /// Correlation id.
@@ -176,6 +192,25 @@ impl LlmCompiler for DefaultCompiler {
                         })
                         .collect(),
                 }),
+                HistoryEntry::Thinking(rec) => {
+                    // Preserve & reuse: render the thinking block verbatim so the
+                    // provider receives the exact signed content it emitted.
+                    let block = match rec {
+                        crate::history::ThinkingRecord::Thinking { text, signature } => {
+                            LlmContentBlock::Thinking {
+                                thinking: text.clone(),
+                                signature: signature.clone(),
+                            }
+                        }
+                        crate::history::ThinkingRecord::Redacted { data } => {
+                            LlmContentBlock::RedactedThinking { data: data.clone() }
+                        }
+                    };
+                    messages.push(LlmMessage {
+                        role: LlmRole::Assistant,
+                        content: vec![block],
+                    });
+                }
                 HistoryEntry::ToolCall(rec) => messages.push(LlmMessage {
                     role: LlmRole::Assistant,
                     content: vec![LlmContentBlock::ToolUse {

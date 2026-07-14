@@ -7,28 +7,59 @@ use agent_client_protocol::schema::v1::{
     SessionConfigValueId,
 };
 
+/// The permission handling mode for a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    /// Ask the client before every permission-gated (destructive) tool call.
+    #[default]
+    Normal,
+    /// Auto-grant every permission-gated tool call without prompting.
+    Yolo,
+}
+
+impl PermissionMode {
+    /// The stable config value id for this mode.
+    #[must_use]
+    pub fn as_id(self) -> &'static str {
+        match self {
+            PermissionMode::Normal => "normal",
+            PermissionMode::Yolo => "yolo",
+        }
+    }
+
+    /// Parse a config value id into a [`PermissionMode`], if recognized.
+    #[must_use]
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "normal" => Some(PermissionMode::Normal),
+            "yolo" => Some(PermissionMode::Yolo),
+            _ => None,
+        }
+    }
+
+    /// Whether this mode auto-grants permission-gated tool calls.
+    #[must_use]
+    pub fn is_yolo(self) -> bool {
+        matches!(self, PermissionMode::Yolo)
+    }
+}
+
 /// Selection of a model and effort level for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelection {
-    /// The model identifier (e.g. `claude-3-5-sonnet-latest`).
+    /// The model identifier (e.g. `claude-sonnet-5`).
     pub model: String,
     /// The effort level for the model.
     pub effort: Effort,
+    /// How permission-gated tool calls are handled.
+    pub permission: PermissionMode,
 }
 
 /// The set of supported models.
 pub const MODEL_CATALOG: &[(&str, &str, &str)] = &[
-    (
-        "claude-3-5-sonnet-latest",
-        "Claude 3.5 Sonnet",
-        "Most balanced model",
-    ),
-    (
-        "claude-3-5-haiku-latest",
-        "Claude 3.5 Haiku",
-        "Fastest model",
-    ),
-    ("claude-3-opus-latest", "Claude 3 Opus", "Most powerful model"),
+    ("claude-sonnet-5", "Claude Sonnet", "Most balanced model"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5", "Fastest model"),
+    ("claude-opus-4-8", "Claude Opus", "Most powerful model"),
 ];
 
 impl ModelSelection {
@@ -37,6 +68,7 @@ impl ModelSelection {
         Self {
             model: config.default_model.clone(),
             effort: Effort::High,
+            permission: PermissionMode::default(),
         }
     }
 
@@ -85,6 +117,25 @@ impl ModelSelection {
                 )),
             )
             .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::new(
+                SessionConfigId::new("permissions"),
+                "Permissions",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    SessionConfigValueId::new(self.permission.as_id().to_string()),
+                    SessionConfigSelectOptions::Ungrouped(vec![
+                        SessionConfigSelectOption::new(
+                            SessionConfigValueId::new("normal"),
+                            "Normal",
+                        )
+                        .description("Ask before destructive tool calls".to_string()),
+                        SessionConfigSelectOption::new(
+                            SessionConfigValueId::new("yolo"),
+                            "YOLO",
+                        )
+                        .description("Auto-grant all tool calls without asking".to_string()),
+                    ]),
+                )),
+            ),
         ]
     }
 
@@ -117,6 +168,14 @@ impl ModelSelection {
                     }
                 }
             }
+            "permissions" => {
+                if let Some(s) = value.as_str() {
+                    if let Some(mode) = PermissionMode::from_id(s) {
+                        self.permission = mode;
+                        return true;
+                    }
+                }
+            }
             _ => {}
         }
         false
@@ -134,28 +193,29 @@ mod tests {
     fn initial_selection_from_config() {
         let config = AgentConfig::default();
         let selection = ModelSelection::for_config(&config);
-        assert_eq!(selection.model, "claude-3-5-sonnet-latest");
+        assert_eq!(selection.model, "claude-sonnet-5");
         assert_eq!(selection.effort, Effort::High);
     }
 
     #[test]
     fn generate_config_options() {
         let selection = ModelSelection {
-            model: "claude-3-5-haiku-latest".to_string(),
+            model: "claude-haiku-4-5".to_string(),
             effort: Effort::Low,
+            permission: PermissionMode::Normal,
         };
         let options = selection.config_options();
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 3);
 
         let model_opt = options.iter().find(|o| o.id.0.as_ref() == "model").unwrap();
         assert_eq!(model_opt.name, "Model");
         if let SessionConfigKind::Select(select) = &model_opt.kind {
-            assert_eq!(select.current_value.0.as_ref(), "claude-3-5-haiku-latest");
+            assert_eq!(select.current_value.0.as_ref(), "claude-haiku-4-5");
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
                 assert_eq!(opts.len(), 3);
                 assert!(opts
                     .iter()
-                    .any(|o| o.value.0.as_ref() == "claude-3-5-sonnet-latest"));
+                    .any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
             } else {
                 panic!("expected ungrouped options");
             }
@@ -178,28 +238,56 @@ mod tests {
     #[test]
     fn apply_valid_model_update() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
+            permission: PermissionMode::Normal,
         };
-        assert!(selection.apply_update("model", json!("claude-3-5-haiku-latest")));
-        assert_eq!(selection.model, "claude-3-5-haiku-latest");
+        assert!(selection.apply_update("model", json!("claude-haiku-4-5")));
+        assert_eq!(selection.model, "claude-haiku-4-5");
     }
 
     #[test]
     fn apply_invalid_model_update_is_ignored() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
+            permission: PermissionMode::Normal,
         };
         assert!(!selection.apply_update("model", json!("invalid-model")));
-        assert_eq!(selection.model, "claude-3-5-sonnet-latest");
+        assert_eq!(selection.model, "claude-sonnet-5");
+    }
+
+    #[test]
+    fn apply_valid_permissions_update() {
+        let mut selection = ModelSelection {
+            model: "claude-sonnet-5".to_string(),
+            effort: Effort::High,
+            permission: PermissionMode::Normal,
+        };
+        assert!(selection.apply_update("permissions", json!("yolo")));
+        assert_eq!(selection.permission, PermissionMode::Yolo);
+        assert!(selection.permission.is_yolo());
+        assert!(selection.apply_update("permissions", json!("normal")));
+        assert_eq!(selection.permission, PermissionMode::Normal);
+    }
+
+    #[test]
+    fn apply_invalid_permissions_update_is_ignored() {
+        let mut selection = ModelSelection {
+            model: "claude-sonnet-5".to_string(),
+            effort: Effort::High,
+            permission: PermissionMode::Normal,
+        };
+        assert!(!selection.apply_update("permissions", json!("reckless")));
+        assert_eq!(selection.permission, PermissionMode::Normal);
     }
 
     #[test]
     fn apply_valid_effort_update() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
+            permission: PermissionMode::Normal,
         };
         assert!(selection.apply_update("effort", json!("medium")));
         assert_eq!(selection.effort, Effort::Medium);
@@ -208,8 +296,9 @@ mod tests {
     #[test]
     fn apply_invalid_effort_update_is_ignored() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
+            permission: PermissionMode::Normal,
         };
         assert!(!selection.apply_update("effort", json!("extra-high")));
         assert_eq!(selection.effort, Effort::High);
@@ -218,13 +307,14 @@ mod tests {
     #[test]
     fn apply_update_from_acp_value() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
+            permission: PermissionMode::Normal,
         };
 
         // Simulating how we extract value from SessionConfigOptionValue in agent.rs
         // Using from_value to avoid needing to know exact struct variant field names
-        let val: SessionConfigOptionValue = serde_json::from_value(json!({"value": "claude-3-5-haiku-latest"})).unwrap();
+        let val: SessionConfigOptionValue = serde_json::from_value(json!({"value": "claude-haiku-4-5"})).unwrap();
 
         let json_value = if let Some(id) = val.as_value_id() {
             serde_json::Value::String(id.0.to_string())
@@ -235,6 +325,6 @@ mod tests {
         };
 
         assert!(selection.apply_update("model", json_value));
-        assert_eq!(selection.model, "claude-3-5-haiku-latest");
+        assert_eq!(selection.model, "claude-haiku-4-5");
     }
 }

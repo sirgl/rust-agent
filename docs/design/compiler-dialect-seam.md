@@ -176,12 +176,29 @@ Concretely, the services layer depends only on `agent-core` trait seams:
   (`tools_builtin::builtin_registry()`); the engine dispatches them regardless
   of which `NextTurnService` produced the `ToolCallRequested` event.
 - `agent-core::client::ClientAccess` — a provider-independent abstraction over
-  the ACP client's `fs/*` and `terminal/*` capabilities
-  (`read_text_file`, `write_text_file`, `run_terminal`). Tools depend on this
+  filesystem and terminal capabilities (`read_text_file`, `write_text_file`,
+  `run_terminal`) plus interactive `request_elicitation`. Tools depend on this
   trait, never on the concrete `agent-client-protocol` client. The ACP binary
-  supplies the concrete `acp-agent::AcpClientAccess` (the ACP *dialect* of the
-  seam), and tests supply an in-memory fake. This is what keeps the services
-  layer testable without a network or a real editor.
+  supplies `acp-agent::LocalClientAccess`, which performs filesystem/terminal
+  work **directly on the local machine** (`std::fs` / `std::process::Command`)
+  rather than routing it through ACP `fs/*` and `terminal/*` JSON-RPC; only
+  elicitation (which has no local equivalent) is still delegated to the
+  connected client. The CLI uses the same local-access shape. Tests supply an
+  in-memory fake, keeping the services layer testable without a network or a
+  real editor.
+
+### Permission modes (Normal / YOLO)
+
+The permission behavior is a per-session ACP config option (`permissions`,
+alongside `model`/`effort`):
+
+- **Normal** (default) — every permission-gated (destructive) tool call triggers
+  a blocking `session/request_permission` round-trip to the client.
+- **YOLO** — `AcpUpdateSink` auto-grants permission-gated tool calls without
+  prompting, so the turn never blocks on a client permission response.
+
+The selected mode lives on the session's `ModelSelection` (`PermissionMode`) and
+is threaded into `AcpUpdateSink::with_yolo` for each turn.
 
 If any code, spec, or doc ever implies "provider X implements tool Y" or
 "provider X needs its own filesystem/terminal code", that is a bug against this
