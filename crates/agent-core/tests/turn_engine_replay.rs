@@ -648,3 +648,140 @@ async fn steering_message_injected_mid_turn_extends_the_turn() {
     // The inbox was fully drained.
     assert!(inbox.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn thought_interval_injects_nudge_before_first_round() {
+    // A single-round turn: the thought nudge must have been injected before the
+    // decision call, so it lands in history right after the user prompt.
+    let svc = ReplayTurnService::single(vec![
+        TurnEvent::TextDelta("on it".into()),
+        TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]);
+    let mut session = SessionState::new("s1");
+    session.push_user_text("hi");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), ToolRegistry::new()).with_thought_interval(5);
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    let nudged = session.history.entries.iter().any(|entry| match entry {
+        HistoryEntry::User(msg) => msg.content.iter().any(|block| {
+            matches!(block, agent_core::ContentBlock::Text { text }
+                if text == agent_core::THOUGHT_NUDGE)
+        }),
+        _ => false,
+    });
+    assert!(nudged, "thought nudge should be injected on the first round");
+}
+
+/// A custom terminal tool (NOT `submit_result`) declaring `ends_turn() = true`,
+/// used to prove the terminal-tool mechanism is decided by the tool itself and
+/// works for any number of terminal tools, not a hardcoded name.
+struct FinishTool;
+
+#[async_trait]
+impl Tool for FinishTool {
+    fn name(&self) -> &str {
+        "finish"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+    fn requires_permission(&self) -> bool {
+        false
+    }
+    fn ends_turn(&self) -> bool {
+        true
+    }
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        Ok(Box::pin(stream::iter(vec![
+            ToolEvent::Started,
+            ToolEvent::Completed(serde_json::json!("finished")),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn require_terminal_tool_nudges_on_text_and_ends_on_terminal_tool() {
+    // Round 1: plain text + EndTurn (must NOT end the turn — it gets nudged).
+    // Round 2: call the custom terminal tool `finish` (ends the turn).
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::TextDelta("thinking".into()),
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ],
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-finish"),
+                name: "finish".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FinishTool));
+    let mut session = SessionState::new("s1");
+    session.push_user_text("go");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), registry).require_terminal_tool();
+
+    let stop = engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    // The turn ends only because the terminal tool was dispatched.
+    assert_eq!(stop, StopReason::EndTurn);
+
+    // The nudge was injected as a user message after the text-only round.
+    let nudged = session.history.entries.iter().any(|entry| match entry {
+        HistoryEntry::User(msg) => msg.content.iter().any(|block| {
+            matches!(block, agent_core::ContentBlock::Text { text }
+                if text == agent_core::TERMINAL_TOOL_NUDGE)
+        }),
+        _ => false,
+    });
+    assert!(nudged, "expected the terminal-tool nudge in history");
+}
+
+#[tokio::test]
+async fn without_require_terminal_tool_plain_text_still_ends_turn() {
+    // A terminal tool is registered, but enforcement is OFF: plain text ends
+    // the turn as before, and the terminal tool is never needed.
+    let svc = ReplayTurnService::single(vec![
+        TurnEvent::TextDelta("done".into()),
+        TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        },
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(FinishTool));
+    let mut session = SessionState::new("s1");
+    session.push_user_text("go");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), registry);
+
+    let stop = engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    assert_eq!(stop, StopReason::EndTurn);
+}

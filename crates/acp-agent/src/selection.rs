@@ -1,6 +1,6 @@
 //! Model and effort selection for ACP sessions.
 
-use turn_anthropic::Effort;
+use turn_anthropic::{Effort, MODELS};
 use agent_client_protocol::schema::v1::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
@@ -10,26 +10,12 @@ use agent_client_protocol::schema::v1::{
 /// Selection of a model and effort level for a session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelSelection {
-    /// The model identifier (e.g. `claude-3-5-sonnet-latest`).
+    /// The model identifier (e.g. `claude-sonnet-5`).
     pub model: String,
     /// The effort level for the model.
     pub effort: Effort,
 }
 
-/// The set of supported models.
-pub const MODEL_CATALOG: &[(&str, &str, &str)] = &[
-    (
-        "claude-3-5-sonnet-latest",
-        "Claude 3.5 Sonnet",
-        "Most balanced model",
-    ),
-    (
-        "claude-3-5-haiku-latest",
-        "Claude 3.5 Haiku",
-        "Fastest model",
-    ),
-    ("claude-3-opus-latest", "Claude 3 Opus", "Most powerful model"),
-];
 
 impl ModelSelection {
     /// Create a new selection based on the agent configuration.
@@ -49,14 +35,14 @@ impl ModelSelection {
                 SessionConfigKind::Select(SessionConfigSelect::new(
                     SessionConfigValueId::new(self.model.clone()),
                     SessionConfigSelectOptions::Ungrouped(
-                        MODEL_CATALOG
+                        MODELS
                             .iter()
-                            .map(|(id, name, desc)| {
+                            .map(|m| {
                                 SessionConfigSelectOption::new(
-                                    SessionConfigValueId::new(id.to_string()),
-                                    name.to_string(),
+                                    SessionConfigValueId::new(m.id.to_string()),
+                                    m.display_name.to_string(),
                                 )
-                                .description(desc.to_string())
+                                .description(m.description.to_string())
                             })
                             .collect(),
                     ),
@@ -103,7 +89,7 @@ impl ModelSelection {
         match config_id {
             "model" => {
                 if let Some(s) = value.as_str() {
-                    if MODEL_CATALOG.iter().any(|(id, _, _)| *id == s) {
+                    if MODELS.iter().any(|m| m.id == s) {
                         self.model = s.to_string();
                         return true;
                     }
@@ -134,14 +120,14 @@ mod tests {
     fn initial_selection_from_config() {
         let config = AgentConfig::default();
         let selection = ModelSelection::for_config(&config);
-        assert_eq!(selection.model, "claude-3-5-sonnet-latest");
+        assert_eq!(selection.model, "claude-sonnet-5");
         assert_eq!(selection.effort, Effort::High);
     }
 
     #[test]
     fn generate_config_options() {
         let selection = ModelSelection {
-            model: "claude-3-5-haiku-latest".to_string(),
+            model: "claude-haiku-4-5".to_string(),
             effort: Effort::Low,
         };
         let options = selection.config_options();
@@ -150,12 +136,12 @@ mod tests {
         let model_opt = options.iter().find(|o| o.id.0.as_ref() == "model").unwrap();
         assert_eq!(model_opt.name, "Model");
         if let SessionConfigKind::Select(select) = &model_opt.kind {
-            assert_eq!(select.current_value.0.as_ref(), "claude-3-5-haiku-latest");
+            assert_eq!(select.current_value.0.as_ref(), "claude-haiku-4-5");
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
-                assert_eq!(opts.len(), 3);
+                assert_eq!(opts.len(), MODELS.len());
                 assert!(opts
                     .iter()
-                    .any(|o| o.value.0.as_ref() == "claude-3-5-sonnet-latest"));
+                    .any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
             } else {
                 panic!("expected ungrouped options");
             }
@@ -178,27 +164,27 @@ mod tests {
     #[test]
     fn apply_valid_model_update() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
         };
-        assert!(selection.apply_update("model", json!("claude-3-5-haiku-latest")));
-        assert_eq!(selection.model, "claude-3-5-haiku-latest");
+        assert!(selection.apply_update("model", json!("claude-haiku-4-5")));
+        assert_eq!(selection.model, "claude-haiku-4-5");
     }
 
     #[test]
     fn apply_invalid_model_update_is_ignored() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
         };
         assert!(!selection.apply_update("model", json!("invalid-model")));
-        assert_eq!(selection.model, "claude-3-5-sonnet-latest");
+        assert_eq!(selection.model, "claude-sonnet-5");
     }
 
     #[test]
     fn apply_valid_effort_update() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
         };
         assert!(selection.apply_update("effort", json!("medium")));
@@ -208,7 +194,7 @@ mod tests {
     #[test]
     fn apply_invalid_effort_update_is_ignored() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
         };
         assert!(!selection.apply_update("effort", json!("extra-high")));
@@ -218,13 +204,13 @@ mod tests {
     #[test]
     fn apply_update_from_acp_value() {
         let mut selection = ModelSelection {
-            model: "claude-3-5-sonnet-latest".to_string(),
+            model: "claude-sonnet-5".to_string(),
             effort: Effort::High,
         };
 
         // Simulating how we extract value from SessionConfigOptionValue in agent.rs
         // Using from_value to avoid needing to know exact struct variant field names
-        let val: SessionConfigOptionValue = serde_json::from_value(json!({"value": "claude-3-5-haiku-latest"})).unwrap();
+        let val: SessionConfigOptionValue = serde_json::from_value(json!({"value": "claude-haiku-4-5"})).unwrap();
 
         let json_value = if let Some(id) = val.as_value_id() {
             serde_json::Value::String(id.0.to_string())
@@ -235,6 +221,6 @@ mod tests {
         };
 
         assert!(selection.apply_update("model", json_value));
-        assert_eq!(selection.model, "claude-3-5-haiku-latest");
+        assert_eq!(selection.model, "claude-haiku-4-5");
     }
 }

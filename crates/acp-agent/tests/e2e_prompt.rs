@@ -36,12 +36,87 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>, tools: ToolRegistry) -> AgentDe
     AgentDeps {
         next_turn_factory: factory,
         tools,
-        config: AgentConfig::default(),
+        // These scripted-replay tests assert fixed turn boundaries, so keep the
+        // legacy "plain text ends the turn" behavior. Terminal-tool enforcement
+        // is exercised by its own dedicated test below.
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
     }
 }
 
 /// Collector for `session/update` notifications received by the fake client.
 type Updates = Arc<Mutex<Vec<SessionUpdate>>>;
+
+#[tokio::test]
+async fn prompt_turn_persists_core_state_to_store() {
+    use agent_core::{InMemorySessionStore, SessionStore};
+
+    let script = vec![vec![
+        TurnEvent::TextDelta("Persisted answer.".to_string()),
+        TurnEvent::TurnFinished {
+            stop_reason: CoreStopReason::EndTurn,
+        },
+    ]];
+    let factory: NextTurnFactory = Arc::new(move |_selection| {
+        let service: Arc<dyn NextTurnService> =
+            Arc::new(turn_replay::ReplayTurnService::new(script.clone()));
+        service
+    });
+
+    // Share a concrete in-memory store so the test can inspect what the agent
+    // persisted after the turn completes.
+    let store = Arc::new(InMemorySessionStore::new());
+    let deps = AgentDeps {
+        next_turn_factory: factory,
+        tools: ToolRegistry::new(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: store.clone(),
+    };
+    let agent = build_agent(deps);
+
+    let session_id = Client
+        .builder()
+        .name("test-client")
+        .connect_with(agent, async move |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let new_session = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            let id = new_session.session_id.0.to_string();
+            cx.send_request(PromptRequest::new(
+                new_session.session_id,
+                vec![ContentBlock::from("hi")],
+            ))
+            .block_task()
+            .await?;
+            Ok(id)
+        })
+        .await
+        .expect("connection completed");
+
+    // The prompt path persists the record before responding, so by the time
+    // the request resolved the store must hold the updated core state.
+    let record = store
+        .load(&session_id)
+        .await
+        .expect("store load")
+        .expect("session persisted");
+    assert_eq!(record.session_id, session_id);
+    // The turn ran, so the user prompt and assistant answer are in history.
+    assert!(
+        !record.history.is_empty(),
+        "expected persisted history to contain the turn"
+    );
+}
 
 #[tokio::test]
 async fn plain_streaming_turn_streams_chunks_and_end_turn() {

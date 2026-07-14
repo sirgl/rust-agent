@@ -47,8 +47,10 @@ fn build_registry_includes_subagent_tool() {
 
 #[test]
 fn build_registry_omits_subagent_when_disabled() {
-    let mut config = AgentConfig::default();
-    config.enable_subagents = false;
+    let config = AgentConfig {
+        enable_subagents: false,
+        ..AgentConfig::default()
+    };
     let factory = acp_agent::canned_replay_factory();
     let registry = acp_agent::build_registry(&config, &factory);
     assert!(!registry.contains("delegate"));

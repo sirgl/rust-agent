@@ -79,8 +79,10 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
         tools: ToolRegistry::new(),
         config: AgentConfig {
             enable_subagents: false,
+            require_submit_result: false,
             ..AgentConfig::default()
         },
+        store: acp_agent::default_store(),
     }
 }
 

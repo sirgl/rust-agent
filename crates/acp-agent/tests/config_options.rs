@@ -33,7 +33,11 @@ async fn test_config_options_e2e() {
     let deps = AgentDeps {
         next_turn_factory: factory,
         tools: ToolRegistry::new(),
-        config: AgentConfig::default(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
     };
     let agent = build_agent(deps);
 
@@ -58,7 +62,7 @@ async fn test_config_options_e2e() {
 
             // Default model should be sonnet, default effort should be high
             if let SessionConfigKind::Select(select) = &model_opt.kind {
-                assert_eq!(&*select.current_value.0, "claude-3-5-sonnet-latest");
+                assert_eq!(&*select.current_value.0, "claude-sonnet-5");
             } else {
                 panic!("model option is not a select");
             }
@@ -96,14 +100,14 @@ async fn test_config_options_e2e() {
             {
                 let selection = last_selection.lock().unwrap().take().expect("no selection recorded");
                 assert_eq!(selection.effort, Effort::Low);
-                assert_eq!(selection.model, "claude-3-5-sonnet-latest");
+                assert_eq!(selection.model, "claude-sonnet-5");
             }
 
             // 4. Update model and verify next prompt uses it
             cx.send_request(SetSessionConfigOptionRequest::new(
                 new_session.session_id.clone(),
                 SessionConfigId::new("model"),
-                SessionConfigValueId::new("claude-3-5-haiku-latest")
+                SessionConfigValueId::new("claude-haiku-4-5")
             ))
             .block_task()
             .await?;
@@ -117,7 +121,7 @@ async fn test_config_options_e2e() {
 
             {
                 let selection = last_selection.lock().unwrap().take().expect("no selection recorded");
-                assert_eq!(selection.model, "claude-3-5-haiku-latest");
+                assert_eq!(selection.model, "claude-haiku-4-5");
                 assert_eq!(selection.effort, Effort::Low); // Should persist from previous update
             }
 
@@ -132,7 +136,7 @@ async fn test_config_options_e2e() {
 
             let model_opt = update_res.config_options.iter().find(|o| &*o.id.0 == "model").expect("missing model option");
             if let SessionConfigKind::Select(select) = &model_opt.kind {
-                assert_eq!(&*select.current_value.0, "claude-3-5-haiku-latest");
+                assert_eq!(&*select.current_value.0, "claude-haiku-4-5");
             }
 
             Ok(())

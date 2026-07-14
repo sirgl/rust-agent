@@ -53,7 +53,12 @@ pub struct AnthropicConfig {
     /// Selection of effort level.
     pub effort: Option<Effort>,
     /// Maximum number of tokens to sample for the response.
-    pub max_tokens: u32,
+    ///
+    /// The Anthropic Messages API *requires* `max_tokens`, so it is always sent.
+    /// When `None`, a per-model default is derived via
+    /// [`default_max_output_tokens`] so that the value matches the selected
+    /// model's real output budget instead of an arbitrary fixed cap.
+    pub max_tokens: Option<u32>,
     /// Base URL of the messages endpoint (override for tests/proxies).
     pub base_url: String,
     /// Value of the required `anthropic-version` header.
@@ -74,7 +79,7 @@ impl AnthropicConfig {
             api_key: api_key.into(),
             model: model.into(),
             effort: None,
-            max_tokens: 4096,
+            max_tokens: None,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
         }
@@ -223,9 +228,13 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
         messages.push(serde_json::to_value(msg).unwrap_or_else(|_| json!({})));
     }
 
+    let max_tokens = config
+        .max_tokens
+        .unwrap_or_else(|| crate::models::default_max_output_tokens(&config.model));
+
     let mut body = Map::new();
     body.insert("model".into(), json!(config.model));
-    body.insert("max_tokens".into(), json!(config.max_tokens));
+    body.insert("max_tokens".into(), json!(max_tokens));
     body.insert("stream".into(), json!(true));
     body.insert("messages".into(), Value::Array(messages));
 
@@ -288,7 +297,11 @@ mod tests {
 
         let body = build_body(&req, &cfg());
         assert_eq!(body["model"], "claude-test");
-        assert_eq!(body["max_tokens"], 4096);
+        // Unknown model -> conservative per-model default.
+        assert_eq!(
+            body["max_tokens"],
+            crate::models::default_max_output_tokens("claude-test")
+        );
         assert_eq!(body["stream"], true);
         assert_eq!(body["system"], "be terse");
         assert_eq!(body["messages"].as_array().unwrap().len(), 2);

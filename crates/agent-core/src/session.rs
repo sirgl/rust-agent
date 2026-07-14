@@ -5,8 +5,36 @@
 //! history into a provider-specific request is the job of the
 //! [`crate::compiler::LlmCompiler`] seam.
 
-use crate::event::ToolCallId;
+use serde::{Deserialize, Serialize};
+
+use crate::event::{TokenUsage, ToolCallId};
 use crate::history::{Conversation, HistoryEntry, KnownTool};
+
+/// The current version of the persisted [`SessionRecord`] format.
+pub const SESSION_RECORD_VERSION: u32 = 1;
+
+/// A serializable snapshot of the *core* session state.
+///
+/// This captures everything needed to reconstruct a session's memory across
+/// process restarts: the conversation history, cumulative usage, workspace
+/// roots, and system prompt. It intentionally excludes `available_tools`, which
+/// is re-derived from the live tool registry at load time (tool schemas depend
+/// on the set of MCP servers reconnected during a `session/load`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionRecord {
+    /// Version of the persisted record format.
+    pub version: u32,
+    /// The session identifier.
+    pub session_id: String,
+    /// Workspace root directories granted to the session.
+    pub workspace_roots: Vec<String>,
+    /// Strongly-typed conversation history.
+    pub history: Conversation,
+    /// Optional system prompt guiding the assistant.
+    pub system_prompt: Option<String>,
+    /// Cumulative token usage across every decision round in this session.
+    pub usage: TokenUsage,
+}
 
 /// Descriptor for a tool that is available in a session.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +60,8 @@ pub struct SessionState {
     pub available_tools: Vec<ToolDescriptor>,
     /// Optional system prompt guiding the assistant.
     pub system_prompt: Option<String>,
+    /// Cumulative token usage across every decision round in this session.
+    pub usage: TokenUsage,
 }
 
 impl SessionState {
@@ -71,6 +101,39 @@ impl SessionState {
     /// Append a previously-ingested/compiled fragment preserved for reuse.
     pub fn push_ingested(&mut self, source: impl Into<String>, payload: serde_json::Value) {
         self.history.push_ingested(source, payload);
+    }
+
+    /// Accumulate a token-usage record reported by the decision layer.
+    pub fn add_usage(&mut self, usage: TokenUsage) {
+        self.usage.add(usage);
+    }
+
+    /// Snapshot the *core* (serializable) state into a [`SessionRecord`].
+    ///
+    /// The `available_tools` field is deliberately not included; it is
+    /// re-derived from the live tool registry when the record is loaded.
+    pub fn to_record(&self) -> SessionRecord {
+        SessionRecord {
+            version: SESSION_RECORD_VERSION,
+            session_id: self.session_id.clone(),
+            workspace_roots: self.workspace_roots.clone(),
+            history: self.history.clone(),
+            system_prompt: self.system_prompt.clone(),
+            usage: self.usage,
+        }
+    }
+
+    /// Reconstruct a [`SessionState`] from a persisted [`SessionRecord`],
+    /// re-deriving `available_tools` from the supplied tool descriptors.
+    pub fn from_record(record: SessionRecord, available_tools: Vec<ToolDescriptor>) -> Self {
+        Self {
+            session_id: record.session_id,
+            workspace_roots: record.workspace_roots,
+            history: record.history,
+            available_tools,
+            system_prompt: record.system_prompt,
+            usage: record.usage,
+        }
     }
 
     /// Build an immutable [`TurnContext`] snapshot from the current state.

@@ -24,6 +24,7 @@ pub mod history;
 pub mod service;
 pub mod session;
 pub mod sink;
+pub mod store;
 pub mod tool;
 
 pub use cancel::CancellationToken;
@@ -31,17 +32,22 @@ pub use client::{ClientAccess, ElicitationOutcome, TerminalOutcome};
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };
-pub use engine::{TurnEngine, TurnInbox};
+pub use engine::{TurnEngine, TurnInbox, TERMINAL_TOOL_NUDGE, THOUGHT_NUDGE};
 pub use error::{AgentError, Result, TurnError};
-pub use event::{PlanStep, PlanStepStatus, PlanUpdate, StopReason, ToolCallId, TurnEvent};
+pub use event::{
+    PlanStep, PlanStepStatus, PlanUpdate, StopReason, TokenUsage, ToolCallId, TurnEvent,
+};
 pub use history::{
     AssistantMessage, ContentBlock, Conversation, EditToolCall, FsReadToolCall, FsWriteToolCall,
     HistoryEntry, IngestedRecord, KnownTool, TerminalRunToolCall, ToolCallRecord, ToolResultRecord,
     UserMessage,
 };
 pub use service::NextTurnService;
-pub use session::{SessionState, ToolDescriptor, TurnContext};
+pub use session::{
+    SessionRecord, SessionState, ToolDescriptor, TurnContext, SESSION_RECORD_VERSION,
+};
 pub use sink::{EngineOutput, ToolCallStatus, UpdateSink};
+pub use store::{InMemorySessionStore, JsonFileSessionStore, SessionStore};
 pub use tool::{Tool, ToolContext, ToolEvent, ToolRegistry, ToolResult};
 
 /// Initialize a default `tracing` subscriber writing to stderr.
@@ -157,6 +163,47 @@ mod tests {
             HistoryEntry::ToolCall(rec) => assert_eq!(rec.tool.name(), "edit"),
             other => panic!("unexpected entry: {other:?}"),
         }
+    }
+
+    #[test]
+    fn session_state_record_roundtrip_preserves_core_and_rederives_tools() {
+        let mut session = SessionState::new("sess-rec");
+        session.workspace_roots = vec!["/ws/a".into(), "/ws/b".into()];
+        session.system_prompt = Some("system".into());
+        session.push_user_text("q");
+        session.push_assistant_text("a");
+        session.add_usage(TokenUsage {
+            input_tokens: 3,
+            output_tokens: 5,
+            ..Default::default()
+        });
+        session.available_tools = vec![ToolDescriptor {
+            name: "edit".into(),
+            schema: serde_json::json!({}),
+            requires_permission: true,
+        }];
+
+        let record = session.to_record();
+        assert_eq!(record.version, SESSION_RECORD_VERSION);
+        assert_eq!(record.session_id, "sess-rec");
+        assert_eq!(record.workspace_roots, session.workspace_roots);
+        assert_eq!(record.history, session.history);
+        assert_eq!(record.system_prompt, session.system_prompt);
+        assert_eq!(record.usage, session.usage);
+
+        // Tools are re-derived from the supplied registry, not the record.
+        let new_tools = vec![ToolDescriptor {
+            name: "read".into(),
+            schema: serde_json::json!({ "type": "object" }),
+            requires_permission: false,
+        }];
+        let restored = SessionState::from_record(record, new_tools.clone());
+        assert_eq!(restored.session_id, "sess-rec");
+        assert_eq!(restored.workspace_roots, session.workspace_roots);
+        assert_eq!(restored.history, session.history);
+        assert_eq!(restored.system_prompt, session.system_prompt);
+        assert_eq!(restored.usage, session.usage);
+        assert_eq!(restored.available_tools, new_tools);
     }
 
     #[test]

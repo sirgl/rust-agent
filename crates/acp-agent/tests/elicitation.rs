@@ -32,7 +32,11 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
     AgentDeps {
         next_turn_factory: factory,
         tools: tools_builtin::builtin_registry(),
-        config: AgentConfig::default(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
     }
 }
 

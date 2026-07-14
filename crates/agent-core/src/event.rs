@@ -70,6 +70,40 @@ pub struct PlanUpdate {
     pub steps: Vec<PlanStep>,
 }
 
+/// Token usage reported by the model provider for a decision round.
+///
+/// Fields mirror the Anthropic `usage` object. `input_tokens` and
+/// `output_tokens` count *fresh* (uncached) tokens; cached prompt tokens are
+/// reported separately: `cache_read_input_tokens` are tokens **reused** from an
+/// existing prompt cache (billed at a large discount), while
+/// `cache_creation_input_tokens` are tokens written into the cache this round.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    /// Fresh (uncached) input tokens.
+    pub input_tokens: u64,
+    /// Output (sampled) tokens.
+    pub output_tokens: u64,
+    /// Cached input tokens that were reused this round.
+    pub cache_read_input_tokens: u64,
+    /// Input tokens written into the prompt cache this round.
+    pub cache_creation_input_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Accumulate another usage record into this one (field-wise sum).
+    pub fn add(&mut self, other: TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cache_read_input_tokens += other.cache_read_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
+    }
+
+    /// Total input tokens across fresh, cache-read and cache-creation.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
+}
+
 /// A streaming decision event describing what the agent does next.
 #[derive(Debug, Clone)]
 pub enum TurnEvent {
@@ -88,6 +122,8 @@ pub enum TurnEvent {
         /// Arguments as arbitrary JSON.
         arguments: serde_json::Value,
     },
+    /// Token usage reported for the current decision round.
+    Usage(TokenUsage),
     /// The turn finished with the given stop reason.
     TurnFinished {
         /// The reason the turn ended.

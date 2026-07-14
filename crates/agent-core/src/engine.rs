@@ -27,9 +27,22 @@ use crate::sink::{EngineOutput, ToolCallStatus, UpdateSink};
 use crate::tool::{ToolContext, ToolEvent};
 use crate::tool::ToolRegistry;
 
-/// Default upper bound on decision/tool iterations within a single prompt to
-/// guard against a misbehaving backend looping forever.
-pub const DEFAULT_MAX_ITERATIONS: usize = 128;
+/// The message injected as a user turn when the backend would end the turn
+/// without dispatching a terminal tool (see
+/// [`TurnEngine::require_terminal_tool`]). It reminds the model that only a
+/// terminal tool (`submit_result`) hands control back to the user.
+pub const TERMINAL_TOOL_NUDGE: &str = "\
+You stopped without ending the turn. The turn only ends — and control only \
+returns to the user — when you call the `submit_result` tool. If the task is \
+fully complete, call `submit_result` now with a concise summary. Otherwise, keep \
+working and call the appropriate tools.";
+
+/// The message injected periodically (see [`TurnEngine::with_thought_interval`])
+/// to prompt the model to briefly share what it is planning. Kept intentionally
+/// short so the streamed reply stays to one or two lines.
+pub const THOUGHT_NUDGE: &str = "\
+In one or two short lines, tell the user what you are doing or planning right \
+now. Keep it super short, then continue working.";
 
 /// A shared queue of user messages injected into a running turn ("steering").
 ///
@@ -48,10 +61,17 @@ pub type TurnInbox = Arc<StdMutex<Vec<String>>>;
 pub struct TurnEngine {
     next_turn: Arc<dyn NextTurnService>,
     tools: ToolRegistry,
-    max_iterations: usize,
+    /// Optional upper bound on decision/tool iterations within a single prompt.
+    /// `None` (the default) means the turn loop is unbounded and only ends on a
+    /// real stop reason (terminal tool, backend end-of-turn, cancellation).
+    max_iterations: Option<usize>,
     client: Option<Arc<dyn ClientAccess>>,
     depth: usize,
     inbox: Option<TurnInbox>,
+    require_terminal_tool: bool,
+    /// Optional cadence (in decision rounds) at which a [`THOUGHT_NUDGE`] is
+    /// injected so the model briefly narrates its plan. `None` disables it.
+    thought_interval: Option<usize>,
 }
 
 impl TurnEngine {
@@ -60,16 +80,21 @@ impl TurnEngine {
         Self {
             next_turn,
             tools,
-            max_iterations: DEFAULT_MAX_ITERATIONS,
+            max_iterations: None,
             client: None,
             depth: 0,
             inbox: None,
+            require_terminal_tool: false,
+            thought_interval: None,
         }
     }
 
-    /// Override the maximum number of loop iterations.
+    /// Cap the maximum number of loop iterations.
+    ///
+    /// By default the turn loop is unbounded; call this to impose a hard cap
+    /// (e.g. to bound a subagent's work budget).
     pub fn with_max_iterations(mut self, max_iterations: usize) -> Self {
-        self.max_iterations = max_iterations;
+        self.max_iterations = Some(max_iterations);
         self
     }
 
@@ -84,6 +109,36 @@ impl TurnEngine {
     /// between decision rounds and appended to the conversation.
     pub fn with_inbox(mut self, inbox: TurnInbox) -> Self {
         self.inbox = Some(inbox);
+        self
+    }
+
+    /// Require an explicit *terminal tool* to end the turn.
+    ///
+    /// When enabled, a decision round that finishes without dispatching a tool
+    /// whose [`Tool::ends_turn`] returns `true` does **not** end the turn:
+    /// instead a [`TERMINAL_TOOL_NUDGE`] user message is appended and the loop
+    /// continues, so the model is pushed to keep working and eventually call a
+    /// terminal tool. The turn ends only when some terminal tool is dispatched
+    /// (or on cancellation / the iteration guard). This makes hand-back to the
+    /// user an explicit, deliberate action rather than an implicit consequence
+    /// of the model emitting plain text.
+    ///
+    /// Which tools are terminal is decided by the tools themselves (via
+    /// [`Tool::ends_turn`]), so any number of terminal tools may be registered
+    /// without changing the engine.
+    pub fn require_terminal_tool(mut self) -> Self {
+        self.require_terminal_tool = true;
+        self
+    }
+
+    /// Periodically prompt the model to briefly share what it is planning.
+    ///
+    /// When set to `Some(n)` (with `n > 0`), a [`THOUGHT_NUDGE`] user message is
+    /// injected before the first decision round (right after the user's prompt)
+    /// and then again every `n` rounds, so a long-running turn keeps the user
+    /// informed. `None` (the default) disables the behavior.
+    pub fn with_thought_interval(mut self, interval: usize) -> Self {
+        self.thought_interval = (interval > 0).then_some(interval);
         self
     }
 
@@ -136,7 +191,14 @@ impl TurnEngine {
         sink: &mut dyn UpdateSink,
         cancel: &CancellationToken,
     ) -> Result<StopReason> {
-        for iteration in 0..self.max_iterations {
+        let mut iteration = 0usize;
+        loop {
+            if let Some(max) = self.max_iterations {
+                if iteration >= max {
+                    warn!("turn loop exceeded max iterations ({max})");
+                    return Ok(StopReason::EndTurn);
+                }
+            }
             if cancel.is_cancelled() {
                 debug!("cancellation observed before iteration {iteration}");
                 return Ok(StopReason::Cancelled);
@@ -145,6 +207,15 @@ impl TurnEngine {
             // Fold in any steering messages injected since the previous round so
             // they become part of the context for this decision call.
             self.drain_inbox(session);
+
+            // Periodically ask the model to briefly narrate its plan: on the
+            // first round (right after the user prompt) and every `interval`
+            // rounds thereafter.
+            if let Some(interval) = self.thought_interval {
+                if iteration.is_multiple_of(interval) {
+                    session.push_user_text(THOUGHT_NUDGE.to_string());
+                }
+            }
 
             let ctx = session.turn_context();
             let mut stream = self.next_turn.get_next_turn_streaming(&ctx).await?;
@@ -186,6 +257,9 @@ impl TurnEngine {
                     TurnEvent::Plan(plan) => {
                         sink.send(EngineOutput::Plan(plan)).await?;
                     }
+                    TurnEvent::Usage(usage) => {
+                        session.add_usage(usage);
+                    }
                     TurnEvent::ToolCallRequested {
                         id,
                         name,
@@ -194,10 +268,18 @@ impl TurnEngine {
                         had_tool_call = true;
                         // Persist any assistant text emitted before this tool call.
                         flush_assistant_text(session, &mut assistant_text);
+                        // A tool that declares itself terminal ends the turn once
+                        // it has been dispatched (only when enforcement is on).
+                        let is_terminal = self.require_terminal_tool
+                            && self.tools.get(&name).is_some_and(|t| t.ends_turn());
                         self.dispatch_tool(session, sink, cancel, id, name, arguments)
                             .await?;
                         if cancel.is_cancelled() {
                             return Ok(StopReason::Cancelled);
+                        }
+                        if is_terminal {
+                            debug!("terminal tool dispatched; ending turn");
+                            return Ok(StopReason::EndTurn);
                         }
                     }
                     TurnEvent::TurnFinished { stop_reason } => {
@@ -211,6 +293,15 @@ impl TurnEngine {
                             // alive and loop so the injected input is answered
                             // within the same prompt turn.
                             _ if self.has_pending_inbox() => break,
+                            // A terminal tool is required to end the turn, but
+                            // the backend finished without calling it. Nudge the
+                            // model and keep the turn alive so it explicitly
+                            // hands control back via a terminal tool.
+                            _ if self.require_terminal_tool => {
+                                debug!("turn finished without terminal tool; nudging to continue");
+                                session.push_user_text(TERMINAL_TOOL_NUDGE.to_string());
+                                break;
+                            }
                             other => return Ok(other),
                         }
                     }
@@ -220,10 +311,9 @@ impl TurnEngine {
                     }
                 }
             }
-        }
 
-        warn!("turn loop exceeded max iterations ({})", self.max_iterations);
-        Ok(StopReason::EndTurn)
+            iteration += 1;
+        }
     }
 
     /// Dispatch a single tool call: record it, request permission if required,

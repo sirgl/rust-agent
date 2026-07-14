@@ -16,9 +16,11 @@
 
 pub mod agent;
 pub mod client;
+pub mod commands;
 pub mod config;
 pub mod selection;
 pub mod sink;
+pub mod usage;
 
 use std::sync::Arc;
 
@@ -28,11 +30,17 @@ use mcp_client::{register_mcp_tools, McpConnection};
 use subagents::SubagentTool;
 use turn_replay::ReplayTurnService;
 
-pub use agent::{build_agent, AgentDeps, NextTurnFactory};
+pub use agent::{build_agent, default_store, AgentDeps, NextTurnFactory};
 pub use client::AcpClientAccess;
-pub use config::AgentConfig;
+pub use commands::{parse_command, run_command, AgentCommand};
+pub use config::{AgentConfig, DEFAULT_SYSTEM_PROMPT};
 pub use selection::ModelSelection;
 pub use sink::AcpUpdateSink;
+pub use usage::{format_usage, USAGE_COMMAND};
+// Re-export the model catalog helpers so downstream tools (e.g. the CLI
+// `/usage` command) can price token usage without depending on the backend
+// crate directly.
+pub use turn_anthropic::{model_spec, ModelSpec};
 
 // Re-export the capability seams so downstream wiring/tests can construct MCP
 // connections and subagent tools without depending on the crates directly.
@@ -137,10 +145,20 @@ pub fn default_deps() -> AgentDeps {
     };
     tracing::info!(backend, "acp-agent: selected default decision backend");
     let tools = build_registry(&config, &next_turn_factory);
+    let store = match &config.session_persistence_dir {
+        Some(dir) => {
+            tracing::info!(dir = %dir.display(), "acp-agent: persisting sessions to disk");
+            let store: Arc<dyn agent_core::SessionStore> =
+                Arc::new(agent_core::JsonFileSessionStore::new(dir.clone()));
+            store
+        }
+        None => default_store(),
+    };
     AgentDeps {
         next_turn_factory,
         tools,
         config,
+        store,
     }
 }
 
