@@ -28,14 +28,14 @@ pub mod sink;
 pub mod tool;
 
 pub use cancel::CancellationToken;
-pub use client::{ClientAccess, TerminalOutcome};
+pub use client::{ClientAccess, ElicitationOutcome, TerminalOutcome};
 pub use compaction::{
     ChainedCompactor, Compactor, HeuristicCompactor, LlmCompactor, TextSummarizer,
 };
 pub use compiler::{
     DefaultCompiler, LlmCompiler, LlmContentBlock, LlmMessage, LlmRequest, LlmRole, LlmToolSchema,
 };
-pub use engine::TurnEngine;
+pub use engine::{TurnEngine, TurnInbox};
 pub use error::{AgentError, Result, TurnError};
 pub use event::{PlanStep, PlanStepStatus, PlanUpdate, StopReason, ToolCallId, TurnEvent};
 pub use history::{

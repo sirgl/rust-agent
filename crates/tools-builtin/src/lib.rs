@@ -28,7 +28,8 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentError, ClientAccess, Result, Tool, ToolContext, ToolEvent, ToolRegistry,
+    AgentError, ClientAccess, ElicitationOutcome, Result, Tool, ToolContext, ToolEvent,
+    ToolRegistry,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -40,6 +41,7 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FsReadTool));
     registry.register(Arc::new(FsWriteTool));
     registry.register(Arc::new(TerminalRunTool));
+    registry.register(Arc::new(ElicitationTool));
 }
 
 /// Build a fresh registry pre-populated with the built-in tools.
@@ -78,6 +80,15 @@ struct FsWriteArgs {
     path: String,
     /// The exact text content to write.
     content: String,
+}
+
+/// Arguments for [`ElicitationTool`].
+#[derive(Debug, Deserialize)]
+struct ElicitationArgs {
+    /// Human-readable message describing what input is needed.
+    message: String,
+    /// JSON Schema (an `"object"` schema) describing the requested form fields.
+    requested_schema: serde_json::Value,
 }
 
 /// Arguments for [`TerminalRunTool`].
@@ -273,6 +284,78 @@ impl Tool for TerminalRunTool {
     }
 }
 
+/// The built-in `elicitation` tool: request structured input from the user.
+///
+/// Exposes the [`ClientAccess::request_elicitation`] capability to the decision
+/// layer so a model can ask the user for structured input (e.g. an API key or a
+/// configuration choice) mid-turn. The provided `requested_schema` is a JSON
+/// Schema describing the form fields; the client renders it and returns the
+/// user's response.
+pub struct ElicitationTool;
+
+#[async_trait]
+impl Tool for ElicitationTool {
+    fn name(&self) -> &str {
+        "elicitation"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Human-readable message describing what input is needed from the user."
+                },
+                "requested_schema": {
+                    "type": "object",
+                    "description": "A JSON Schema (an object schema with a `properties` map) describing the form fields to request from the user."
+                }
+            },
+            "required": ["message", "requested_schema"]
+        })
+    }
+
+    fn requires_permission(&self) -> bool {
+        // Asking the user for input is interactive, not destructive.
+        false
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        let args: ElicitationArgs = parse_args(self.name(), args)?;
+        let client: &Arc<dyn ClientAccess> = ctx.client()?;
+        debug!(message = %args.message, "elicitation");
+        match client
+            .request_elicitation(&args.message, args.requested_schema)
+            .await
+        {
+            Ok(ElicitationOutcome::Accepted(content)) => Ok(events(vec![
+                ToolEvent::Started,
+                ToolEvent::Completed(serde_json::json!({
+                    "accepted": true,
+                    "content": content,
+                })),
+            ])),
+            Ok(ElicitationOutcome::Declined) => Ok(events(vec![
+                ToolEvent::Started,
+                ToolEvent::Failed("user declined to provide the requested input".to_string()),
+            ])),
+            Ok(ElicitationOutcome::Cancelled) => Ok(events(vec![
+                ToolEvent::Started,
+                ToolEvent::Failed("elicitation was cancelled".to_string()),
+            ])),
+            Err(err) => Ok(events(vec![
+                ToolEvent::Started,
+                ToolEvent::Failed(format!("elicitation failed: {err}")),
+            ])),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +371,7 @@ mod tests {
         read_result: Mutex<Option<Result<String>>>,
         writes: Mutex<Vec<(String, String)>>,
         terminal_result: Mutex<Option<Result<TerminalOutcome>>>,
+        elicitation_result: Mutex<Option<Result<ElicitationOutcome>>>,
     }
 
     #[async_trait]
@@ -316,6 +400,17 @@ mod tests {
                     exit_code: Some(0),
                     signal: None,
                 }),
+            }
+        }
+
+        async fn request_elicitation(
+            &self,
+            _message: &str,
+            _requested_schema: serde_json::Value,
+        ) -> Result<ElicitationOutcome> {
+            match self.elicitation_result.lock().unwrap().take() {
+                Some(r) => r,
+                None => Ok(ElicitationOutcome::Accepted(serde_json::json!({}))),
             }
         }
     }
@@ -404,11 +499,81 @@ mod tests {
         assert!(matches!(result.err(), Some(AgentError::Other(_))));
     }
 
+    #[tokio::test]
+    async fn elicitation_accept_completes_with_content() {
+        let client = Arc::new(FakeClient::default());
+        *client.elicitation_result.lock().unwrap() = Some(Ok(ElicitationOutcome::Accepted(
+            serde_json::json!({ "name": "Ada" }),
+        )));
+        let ctx = ctx_with(client);
+        let tool = ElicitationTool;
+        assert!(!tool.requires_permission());
+        let stream = tool
+            .call(
+                serde_json::json!({
+                    "message": "What is your name?",
+                    "requested_schema": { "type": "object", "properties": {} }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+        match evts.last() {
+            Some(ToolEvent::Completed(payload)) => {
+                assert_eq!(payload["accepted"], serde_json::json!(true));
+                assert_eq!(payload["content"]["name"], serde_json::json!("Ada"));
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn elicitation_decline_maps_to_failed_event() {
+        let client = Arc::new(FakeClient::default());
+        *client.elicitation_result.lock().unwrap() = Some(Ok(ElicitationOutcome::Declined));
+        let ctx = ctx_with(client);
+        let tool = ElicitationTool;
+        let stream = tool
+            .call(
+                serde_json::json!({
+                    "message": "Provide a key",
+                    "requested_schema": { "type": "object" }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+        assert!(matches!(evts.last(), Some(ToolEvent::Failed(_))));
+    }
+
+    #[tokio::test]
+    async fn elicitation_cancel_maps_to_failed_event() {
+        let client = Arc::new(FakeClient::default());
+        *client.elicitation_result.lock().unwrap() = Some(Ok(ElicitationOutcome::Cancelled));
+        let ctx = ctx_with(client);
+        let tool = ElicitationTool;
+        let stream = tool
+            .call(
+                serde_json::json!({
+                    "message": "Provide a key",
+                    "requested_schema": { "type": "object" }
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+        assert!(matches!(evts.last(), Some(ToolEvent::Failed(_))));
+    }
+
     #[test]
     fn registry_registers_all_builtins() {
         let registry = builtin_registry();
         assert!(registry.contains("fs_read"));
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("terminal_run"));
+        assert!(registry.contains("elicitation"));
     }
 }

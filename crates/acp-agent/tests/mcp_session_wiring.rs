@@ -69,7 +69,7 @@ fn write_mock_server() -> std::path::PathBuf {
 /// turn must come from the session's own `mcp_servers`, proving the runtime
 /// wiring path rather than a pre-populated base registry).
 fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
-    let factory: NextTurnFactory = Arc::new(move || {
+    let factory: NextTurnFactory = Arc::new(move |_selection| {
         let service: Arc<dyn NextTurnService> =
             Arc::new(turn_replay::ReplayTurnService::new(script.clone()));
         service

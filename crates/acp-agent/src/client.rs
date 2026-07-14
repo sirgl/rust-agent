@@ -9,11 +9,12 @@
 //! every decision-layer provider.
 
 use agent_client_protocol::schema::v1::{
-    CreateTerminalRequest, ReadTextFileRequest, ReleaseTerminalRequest, SessionId,
-    TerminalOutputRequest, WaitForTerminalExitRequest, WriteTextFileRequest,
+    CreateElicitationRequest, CreateTerminalRequest, ElicitationAction, ElicitationFormMode,
+    ElicitationSchema, ElicitationSessionScope, ReadTextFileRequest, ReleaseTerminalRequest,
+    SessionId, TerminalOutputRequest, WaitForTerminalExitRequest, WriteTextFileRequest,
 };
 use agent_client_protocol::{Client, ConnectionTo};
-use agent_core::{AgentError, ClientAccess, Result, TerminalOutcome};
+use agent_core::{AgentError, ClientAccess, ElicitationOutcome, Result, TerminalOutcome};
 use async_trait::async_trait;
 use tracing::debug;
 
@@ -115,5 +116,40 @@ impl ClientAccess for AcpClientAccess {
             exit_code: exit.exit_status.exit_code,
             signal: exit.exit_status.signal,
         })
+    }
+
+    async fn request_elicitation(
+        &self,
+        message: &str,
+        requested_schema: serde_json::Value,
+    ) -> Result<ElicitationOutcome> {
+        debug!(message, "elicitation/create");
+        // Map the provider-independent JSON schema into the ACP form schema.
+        let schema: ElicitationSchema = serde_json::from_value(requested_schema)
+            .map_err(|err| map_err("invalid elicitation schema", err))?;
+        let scope = ElicitationSessionScope::new(self.session_id.clone());
+        let mode = ElicitationFormMode::new(scope, schema);
+        let request = CreateElicitationRequest::new(mode, message);
+
+        let response = self
+            .cx
+            .send_request(request)
+            .block_task()
+            .await
+            .map_err(|err| map_err("elicitation/create failed", err))?;
+
+        match response.action {
+            ElicitationAction::Accept(accept) => {
+                let content = accept.content.unwrap_or_default();
+                let value = serde_json::to_value(content)
+                    .map_err(|err| map_err("invalid elicitation content", err))?;
+                Ok(ElicitationOutcome::Accepted(value))
+            }
+            ElicitationAction::Decline => Ok(ElicitationOutcome::Declined),
+            ElicitationAction::Cancel => Ok(ElicitationOutcome::Cancelled),
+            other => Err(AgentError::Other(format!(
+                "unsupported elicitation action: {other:?}"
+            ))),
+        }
     }
 }

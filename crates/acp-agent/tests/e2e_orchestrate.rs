@@ -27,7 +27,7 @@ use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
 /// resolution, so this cleanly separates the two roles for the replay backend.
 fn staged_factory() -> NextTurnFactory {
     let calls = Arc::new(AtomicUsize::new(0));
-    Arc::new(move || {
+    Arc::new(move |_selection| {
         let n = calls.fetch_add(1, Ordering::SeqCst);
         let script = if n == 0 {
             // Orchestrator: call run_subagent(code, step 1), then finish.

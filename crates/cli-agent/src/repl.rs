@@ -15,7 +15,7 @@
 use std::io::{BufRead, Write};
 use std::sync::Arc;
 
-use acp_agent::AgentDeps;
+use acp_agent::{AgentDeps, ModelSelection};
 use agent_core::{
     CancellationToken, ClientAccess, SessionState, StopReason, ToolDescriptor, ToolRegistry,
     TurnEngine,
@@ -125,7 +125,8 @@ where
         session.push_user_text(message);
 
         let cancel = CancellationToken::new();
-        let next_turn = (deps.next_turn_factory)();
+        let selection = ModelSelection::for_config(&deps.config);
+        let next_turn = (deps.next_turn_factory)(&selection);
         let engine = TurnEngine::new(next_turn, deps.tools.clone()).with_client(client.clone());
 
         // Scope the sink so its mutable borrow of `output` is released before we
@@ -180,9 +181,15 @@ async fn run_orchestration<W: Write + Send>(
     cancel: &CancellationToken,
     handle_ctrl_c: bool,
 ) -> agent_core::Result<StopReason> {
-    let factory = deps.next_turn_factory.clone();
-    let backend = (deps.next_turn_factory)();
-    let resolver = orchestrated::uniform_resolver(factory);
+    // The orchestration pipeline uses a zero-argument `BackendFactory`, so adapt
+    // the selection-aware factory by binding it to the default selection derived
+    // from the agent configuration.
+    let selection = acp_agent::ModelSelection::for_config(&deps.config);
+    let selection_factory = deps.next_turn_factory.clone();
+    let backend_factory: orchestrated::BackendFactory =
+        Arc::new(move || selection_factory(&selection));
+    let backend = (backend_factory)();
+    let resolver = orchestrated::uniform_resolver(backend_factory);
     let base_tools = deps.tools.clone();
 
     if !handle_ctrl_c {
