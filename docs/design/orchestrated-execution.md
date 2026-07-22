@@ -148,14 +148,19 @@ Reference-дизайн выше реализован в crate `crates/orchestrat
 
 ### Запуск в рантайме (ACP-мод и `orchestrate`-тул)
 
-Оркестрация доступна в рантайме двумя путями, оба ведут через единый вход
-`orchestrated::run_pipeline(goal, orchestrator_backend, resolver, base_tools, sink, cancel)`:
+Оркестрация доступна в рантайме двумя путями поверх единого `PipelineSession`:
 
 - **Нативный ACP session-mode.** `acp-agent` на `session/new` анонсирует режимы
   `chat` (по умолчанию) и `orchestrate` (`NewSessionResponse::modes`), а `session/set_mode`
-  переключает текущий режим сессии (`SessionEntry.mode`). В `session/prompt` при
-  `orchestrate` текст промпта трактуется как Goal и прогоняется через `run_pipeline`,
-  стримясь в тот же `AcpUpdateSink`; при `chat` — обычный `TurnEngine`. Флаг
+  переключает текущий режим сессии (`SessionEntry.mode`). Первый `session/prompt` в
+  `orchestrate` лениво создаёт per-session `PipelineSession`, а следующие prompt'ы добавляются
+  в его существующую типизированную историю. Тот же объект сохраняет
+  `OrchestratedStepContext` (proposal, результаты и попытки суб-агентов). При первом входе
+  из `chat` runtime наследует полную типизированную историю, workspace и usage; исходные
+  пользовательские сообщения также входят в неявный Goal вместе с текущим уточнением.
+  Поэтому даже после отменённого первого turn короткая фраза вроде «с нуля» видит исходную
+  цель. После каждого orchestration-turn общая история синхронизируется обратно в chat-state,
+  так что переключение режимов двустороннее. Флаг
   `ACP_ORCHESTRATED` теперь задаёт **начальный** режим сессии (обратная совместимость).
 - **Инструмент `orchestrate { goal }`.** `orchestrated::OrchestrateTool` (по образцу
   `subagents::SubagentTool`) запускает `run_pipeline` вложенно внутри текущего turn'а и
@@ -166,8 +171,10 @@ Reference-дизайн выше реализован в crate `crates/orchestrat
   `LocalClientAccess`-инструментами и `TerminalUpdateSink`.
 
 Все тиры модели резолвятся в один и тот же backend через
-`orchestrated::uniform_resolver(factory)` (Anthropic-или-replay, как у чата); фабрика
-вызывается **свежая** на каждый turn, чтобы stateful replay-бэкенды не переиспользовались.
+`orchestrated::uniform_resolver(factory)` (Anthropic-или-replay, как у чата). Для каждого
+суб-агента фабрика создаёт отдельный backend; backend самого оркестратора живёт вместе с
+`PipelineSession`, чтобы stateful реализации и conversation history продолжались между
+prompt-turn'ами.
 
 ### Принятые решения (v1)
 
@@ -200,7 +207,9 @@ Reference-дизайн выше реализован в crate `crates/orchestrat
   на будущее.
 - Все тиры модели (`Low`/`Medium`/`High`) резолвятся в один и тот же backend; отдельных
   per-tier моделей в v1 нет (seam `ModelResolver` оставлен на будущее).
-- Оркестрированный `session/prompt` не переиспользует историю чат-сессии (Goal — это текст
-  промпта); суб-агенты в оркестрированном ACP-пути не получают ACP `ClientAccess`
+- После `session/load` runtime оркестрации явно начинается заново: текущий `SessionRecord` не хранит
+  `OrchestratedStepContext` results/attempts и не различает chat/orchestration histories.
+  Durable resume оркестрации требует версионированного расширения persisted schema и остаётся
+  отдельной задачей. Суб-агенты в оркестрированном ACP-пути не получают ACP `ClientAccess`
   (fs/terminal через редактор), так что fs/terminal-инструменты в оркестрации доступны
   только в CLI (`LocalClientAccess`).

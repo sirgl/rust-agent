@@ -8,6 +8,7 @@
 //! the real machine. The built-in tools themselves are unchanged: they depend
 //! only on the [`ClientAccess`] trait.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use agent_core::{AgentError, ClientAccess, Result, TerminalChunk, TerminalOutcome};
@@ -24,14 +25,51 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// [`ClientAccess`] implementation that executes against the local filesystem
 /// and shell.
-#[derive(Debug, Default, Clone)]
-pub struct LocalClientAccess;
+#[derive(Debug, Clone)]
+pub struct LocalClientAccess {
+    cwd: PathBuf,
+}
+
+impl Default for LocalClientAccess {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl LocalClientAccess {
     /// Create a new local client access handle.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            cwd: std::env::current_dir().expect("process working directory must be available"),
+        }
+    }
+
+    /// Create a local client bound to an explicit, validated working directory.
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Result<Self> {
+        let cwd = cwd.into();
+        let requested = cwd.display().to_string();
+        let metadata = std::fs::metadata(&cwd).map_err(|err| {
+            AgentError::Other(format!("invalid working directory `{requested}`: {err}"))
+        })?;
+        if !metadata.is_dir() {
+            return Err(AgentError::Other(format!(
+                "invalid working directory `{requested}`: path is not a directory"
+            )));
+        }
+        let cwd = std::fs::canonicalize(&cwd).map_err(|err| {
+            AgentError::Other(format!("invalid working directory `{requested}`: {err}"))
+        })?;
+        Ok(Self { cwd })
+    }
+
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        }
     }
 }
 
@@ -53,8 +91,8 @@ fn truncate_output(mut output: String) -> (String, bool) {
 #[async_trait]
 impl ClientAccess for LocalClientAccess {
     async fn read_text_file(&self, path: &str) -> Result<String> {
-        debug!(path, "local fs read");
-        let path = path.to_string();
+        let path = self.resolve_path(path);
+        debug!(path = %path.display(), cwd = %self.cwd.display(), "local fs read");
         tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
             .await
             .map_err(|err| AgentError::Other(format!("read task join error: {err}")))?
@@ -62,11 +100,11 @@ impl ClientAccess for LocalClientAccess {
     }
 
     async fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
-        debug!(path, "local fs write");
-        let path = path.to_string();
+        let path = self.resolve_path(path);
+        debug!(path = %path.display(), cwd = %self.cwd.display(), "local fs write");
         let content = content.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Some(parent) = std::path::Path::new(&path).parent() {
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, content)
@@ -77,13 +115,16 @@ impl ClientAccess for LocalClientAccess {
     }
 
     async fn run_terminal(&self, command: &str, args: &[String]) -> Result<TerminalOutcome> {
-        debug!(command, "local terminal run");
+        debug!(command, cwd = %self.cwd.display(), "local terminal run");
         let command = command.to_string();
         let args = args.to_vec();
-        let output = tokio::task::spawn_blocking(move || Command::new(&command).args(&args).output())
-            .await
-            .map_err(|err| AgentError::Other(format!("terminal task join error: {err}")))?
-            .map_err(|err| AgentError::Other(format!("run_terminal failed: {err}")))?;
+        let cwd = self.cwd.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(&command).args(&args).current_dir(cwd).output()
+        })
+        .await
+        .map_err(|err| AgentError::Other(format!("terminal task join error: {err}")))?
+        .map_err(|err| AgentError::Other(format!("run_terminal failed: {err}")))?;
 
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -107,8 +148,8 @@ impl ClientAccess for LocalClientAccess {
         command: &str,
         args: &[String],
     ) -> Result<BoxStream<'static, TerminalChunk>> {
-        debug!(command, "local terminal run (streaming)");
-        spawn_streaming_terminal(command.to_string(), args.to_vec())
+        debug!(command, cwd = %self.cwd.display(), "local terminal run (streaming)");
+        spawn_streaming_terminal(command.to_string(), args.to_vec(), self.cwd.clone())
     }
 }
 
@@ -122,9 +163,11 @@ impl ClientAccess for LocalClientAccess {
 fn spawn_streaming_terminal(
     command: String,
     args: Vec<String>,
+    cwd: PathBuf,
 ) -> Result<BoxStream<'static, TerminalChunk>> {
     let mut child = TokioCommand::new(&command)
         .args(&args)
+        .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -208,6 +251,25 @@ fn signal_of(_status: &std::process::ExitStatus) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shell_command_and_relative_files_use_configured_cwd() {
+        let root = std::env::temp_dir().join(format!("rust-cli-agent-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let client = LocalClientAccess::with_cwd(&root).unwrap();
+
+        client
+            .write_text_file("input.txt", "cli cwd")
+            .await
+            .unwrap();
+        let outcome = client
+            .run_shell_command("cat input.txt | tr '[:lower:]' '[:upper:]'")
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.output, "CLI CWD");
+    }
 
     #[tokio::test]
     async fn file_round_trip() {

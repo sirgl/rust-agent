@@ -11,7 +11,10 @@
 
 use std::sync::Arc;
 
-use agent_core::{NextTurnService, SessionState, ToolRegistry, TurnEngine};
+use agent_core::{
+    AgentPath, ClientAccess, NextTurnService, SessionState, SharedTurnObserver, ToolDescriptor,
+    ToolRegistry, TurnEngine, TurnInbox,
+};
 
 use crate::action::RunSubAgentTool;
 use crate::context::OrchestratedStepContext;
@@ -32,6 +35,8 @@ pub struct Orchestrator {
     engine: TurnEngine,
     context: Arc<OrchestratedStepContext>,
     system_prompt: String,
+    session_id: String,
+    tools: Vec<ToolDescriptor>,
 }
 
 impl Orchestrator {
@@ -48,9 +53,22 @@ impl Orchestrator {
     /// Build a fresh orchestrator [`SessionState`] seeded with the system prompt
     /// and the goal as the initial user message.
     pub fn new_session(&self, goal: impl Into<String>) -> SessionState {
-        let mut session = SessionState::new("orchestrator");
-        session.system_prompt = Some(self.system_prompt.clone());
+        let mut session = self.empty_session();
         session.push_user_text(goal.into());
+        session
+    }
+
+    /// Build a fresh orchestrator session without an initial user message.
+    ///
+    /// Long-lived frontends use this to append every prompt to the same typed
+    /// history while retaining the shared orchestration context.
+    pub fn empty_session(&self) -> SessionState {
+        let mut session = SessionState::new(self.session_id.clone());
+        session.system_prompt = Some(self.system_prompt.clone());
+        // Advertise the orchestrator's tools (i.e. `run_subagent`) to the
+        // decision layer, otherwise the model has no tool schema to call and
+        // merely describes the call in text (see orchestrate-mode bug).
+        session.available_tools = self.tools.clone();
         session
     }
 }
@@ -63,6 +81,11 @@ pub struct OrchestratorBuilder {
     base_tools: ToolRegistry,
     context: Arc<OrchestratedStepContext>,
     system_prompt: String,
+    observer: Option<SharedTurnObserver>,
+    agent_path: AgentPath,
+    session_id: String,
+    inbox: Option<TurnInbox>,
+    client: Option<Arc<dyn ClientAccess>>,
 }
 
 impl OrchestratorBuilder {
@@ -80,7 +103,50 @@ impl OrchestratorBuilder {
             base_tools: ToolRegistry::new(),
             context: OrchestratedStepContext::new(),
             system_prompt: ORCHESTRATOR_SYSTEM_PROMPT.to_string(),
+            observer: None,
+            agent_path: AgentPath::root(),
+            session_id: "orchestrator".to_string(),
+            inbox: None,
+            client: None,
         }
+    }
+
+    /// Attach a steering inbox drained between orchestrator decision rounds.
+    #[must_use]
+    pub fn with_inbox(mut self, inbox: TurnInbox) -> Self {
+        self.inbox = Some(inbox);
+        self
+    }
+
+    /// Attach client access inherited by orchestrator tools and nested workers.
+    #[must_use]
+    pub fn with_client(mut self, client: Arc<dyn ClientAccess>) -> Self {
+        self.client = Some(client);
+        self
+    }
+
+    /// Attach a provider-neutral observer so the orchestrator turn and, via the
+    /// propagated [`ToolContext`], its sub-agents are captured by the inspector.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Option<SharedTurnObserver>) -> Self {
+        self.observer = observer;
+        self
+    }
+
+    /// Set the [`AgentPath`] of the orchestrator agent (sub-agents derive
+    /// children of it).
+    #[must_use]
+    pub fn with_agent_path(mut self, agent_path: AgentPath) -> Self {
+        self.agent_path = agent_path;
+        self
+    }
+
+    /// Set the session id used for the orchestrator's session (and inherited by
+    /// its sub-agents), so all of a user session's agents group together.
+    #[must_use]
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = session_id.into();
+        self
     }
 
     /// Override the mode registry.
@@ -123,11 +189,35 @@ impl OrchestratorBuilder {
         let mut registry = ToolRegistry::new();
         registry.register(run_subagent);
 
-        let engine = TurnEngine::new(self.orchestrator_backend, registry);
+        // Snapshot tool descriptors so orchestrator sessions can advertise them
+        // to the model (the registry itself is only used to dispatch calls).
+        let tools: Vec<ToolDescriptor> = registry
+            .names()
+            .filter_map(|name| registry.get(name).map(|tool| (name.to_string(), tool)))
+            .map(|(name, tool)| ToolDescriptor {
+                name,
+                schema: tool.schema(),
+                requires_permission: tool.requires_permission(),
+            })
+            .collect();
+
+        let mut engine =
+            TurnEngine::new(self.orchestrator_backend, registry).with_agent_path(self.agent_path);
+        if let Some(inbox) = self.inbox {
+            engine = engine.with_inbox(inbox);
+        }
+        if let Some(client) = self.client {
+            engine = engine.with_client(client);
+        }
+        if let Some(observer) = self.observer {
+            engine = engine.with_observer(observer);
+        }
         Orchestrator {
             engine,
             context: self.context,
             system_prompt: self.system_prompt,
+            session_id: self.session_id,
+            tools,
         }
     }
 }
@@ -137,7 +227,9 @@ mod tests {
     use super::*;
     use crate::context::{PlanProposal, PlanStepSpec};
     use crate::worker::FnModelResolver;
-    use agent_core::{CancellationToken, EngineOutput, Result, StopReason, ToolCallId, TurnEvent, UpdateSink};
+    use agent_core::{
+        CancellationToken, EngineOutput, Result, StopReason, ToolCallId, TurnEvent, UpdateSink,
+    };
     use async_trait::async_trait;
     use turn_replay::ReplayTurnService;
 
@@ -207,5 +299,27 @@ mod tests {
         let result = context.result("code", 0).expect("executor result stored");
         assert!(result.success);
         assert_eq!(result.output, "implemented step");
+    }
+
+    #[tokio::test]
+    async fn new_session_advertises_run_subagent_tool() {
+        // Regression: the orchestrator session must expose `run_subagent`'s
+        // schema to the decision layer, otherwise a real LLM has no tool to call
+        // and only describes the call in text (orchestrate-mode did nothing).
+        let backend: Arc<dyn NextTurnService> = Arc::new(ReplayTurnService::new(vec![vec![
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]]));
+        let resolver = Arc::new(FnModelResolver(move |_t| backend.clone()));
+        let orch =
+            OrchestratorBuilder::new(Arc::new(ReplayTurnService::new(vec![])), resolver).build();
+
+        let session = orch.new_session("Build X");
+        let ctx = session.turn_context();
+        assert!(
+            ctx.available_tools.iter().any(|t| t.name == "run_subagent"),
+            "orchestrator session must advertise run_subagent to the model"
+        );
     }
 }

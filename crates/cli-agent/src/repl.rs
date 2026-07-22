@@ -72,6 +72,13 @@ where
     W: Write + Send,
 {
     let mut session = SessionState::new("cli-session");
+    session.set_workspace(
+        std::env::current_dir()
+            .expect("process working directory must be available")
+            .to_string_lossy()
+            .into_owned(),
+        std::iter::empty::<String>(),
+    );
     session.system_prompt = deps.config.system_prompt.clone();
     session.available_tools = tool_descriptors(&deps.tools);
 
@@ -137,9 +144,16 @@ where
         // Scope the sink so its mutable borrow of `output` is released before we
         // write the trailing stop-reason note below.
         let stop = {
-            let mut sink = TerminalUpdateSink::new(&mut output)
-                .interactive(options.interactive_permissions);
-            run_turn(&engine, &mut session, &mut sink, &cancel, options.handle_ctrl_c).await
+            let mut sink =
+                TerminalUpdateSink::new(&mut output).interactive(options.interactive_permissions);
+            run_turn(
+                &engine,
+                &mut session,
+                &mut sink,
+                &cancel,
+                options.handle_ctrl_c,
+            )
+            .await
         };
 
         match stop {
@@ -233,6 +247,8 @@ mod tests {
             tools: ToolRegistry::new(),
             config: acp_agent::AgentConfig::default(),
             store: acp_agent::default_store(),
+            turn_observer: None,
+            inspector_base_url: None,
         }
     }
 

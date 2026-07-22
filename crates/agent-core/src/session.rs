@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::event::{TokenUsage, ToolCallId};
 use crate::history::{Conversation, HistoryEntry, KnownTool, ThinkingRecord};
+use crate::todo::TodoList;
+use crate::trace::TraceContext;
 
 /// The current version of the persisted [`SessionRecord`] format.
 pub const SESSION_RECORD_VERSION: u32 = 1;
@@ -34,6 +36,9 @@ pub struct SessionRecord {
     pub system_prompt: Option<String>,
     /// Cumulative token usage across every decision round in this session.
     pub usage: TokenUsage,
+    /// Canonical todo state. Missing in legacy records and defaults to empty.
+    #[serde(default)]
+    pub todo_list: TodoList,
 }
 
 /// Descriptor for a tool that is available in a session.
@@ -62,6 +67,8 @@ pub struct SessionState {
     pub system_prompt: Option<String>,
     /// Cumulative token usage across every decision round in this session.
     pub usage: TokenUsage,
+    /// Canonical, validated todo state for this session.
+    pub todo_list: TodoList,
 }
 
 impl SessionState {
@@ -71,6 +78,27 @@ impl SessionState {
             session_id: session_id.into(),
             ..Default::default()
         }
+    }
+
+    /// Replace the ordered workspace roots for this session.
+    ///
+    /// The primary working directory is always stored at index `0`; all
+    /// additional roots retain the order supplied by the client.
+    pub fn set_workspace<I, S>(&mut self, cwd: impl Into<String>, additional_roots: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.workspace_roots.clear();
+        self.workspace_roots.push(cwd.into());
+        self.workspace_roots
+            .extend(additional_roots.into_iter().map(Into::into));
+    }
+
+    /// Return the session's primary working directory, when one is configured.
+    #[must_use]
+    pub fn working_directory(&self) -> Option<&str> {
+        self.workspace_roots.first().map(String::as_str)
     }
 
     /// Append a raw history entry.
@@ -125,6 +153,7 @@ impl SessionState {
             history: self.history.clone(),
             system_prompt: self.system_prompt.clone(),
             usage: self.usage,
+            todo_list: self.todo_list.clone(),
         }
     }
 
@@ -138,6 +167,7 @@ impl SessionState {
             available_tools,
             system_prompt: record.system_prompt,
             usage: record.usage,
+            todo_list: record.todo_list,
         }
     }
 
@@ -146,7 +176,11 @@ impl SessionState {
         TurnContext {
             history: self.history.clone(),
             available_tools: self.available_tools.clone(),
+            workspace_roots: self.workspace_roots.clone(),
             system_prompt: self.system_prompt.clone(),
+            todo_list: self.todo_list.clone(),
+            session_id: Some(self.session_id.clone()),
+            trace: None,
         }
     }
 }
@@ -158,6 +192,108 @@ pub struct TurnContext {
     pub history: Conversation,
     /// Tool schemas available to the decision layer.
     pub available_tools: Vec<ToolDescriptor>,
+    /// Ordered workspace roots; index `0` is the working directory.
+    pub workspace_roots: Vec<String>,
     /// Optional system prompt.
     pub system_prompt: Option<String>,
+    /// Snapshot of the session's canonical todo state.
+    pub todo_list: TodoList,
+    /// The id of the session this context belongs to, when known.
+    ///
+    /// Carried so that observability seams (e.g. an LLM-request inspector) can
+    /// attribute a decision-layer call to a specific session. It is `None` for
+    /// ad-hoc contexts constructed outside a [`SessionState`].
+    pub session_id: Option<String>,
+    /// Correlation identity assigned by the engine for the current round.
+    pub trace: Option<TraceContext>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{PlanStepStatus, SessionStateSnapshot, TodoItem, TodoItemId, TodoList};
+
+    fn todo_list() -> TodoList {
+        TodoList::new(vec![TodoItem {
+            id: TodoItemId::new("verify").unwrap(),
+            content: "Verify behavior".to_string(),
+            status: PlanStepStatus::InProgress,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn todo_state_roundtrips_through_record_and_context() {
+        let mut state = SessionState::new("session-todo");
+        state.todo_list = todo_list();
+
+        assert_eq!(state.turn_context().todo_list, state.todo_list);
+        let restored = SessionState::from_record(state.to_record(), Vec::new());
+        assert_eq!(restored.todo_list, state.todo_list);
+    }
+
+    #[test]
+    fn workspace_helpers_preserve_primary_and_additional_root_order() {
+        let mut state = SessionState::new("session-workspace");
+        state.set_workspace(
+            "/workspace/project",
+            ["/workspace/shared", "/workspace/generated"],
+        );
+
+        assert_eq!(state.working_directory(), Some("/workspace/project"));
+        assert_eq!(
+            state.workspace_roots,
+            vec![
+                "/workspace/project",
+                "/workspace/shared",
+                "/workspace/generated"
+            ]
+        );
+        assert_eq!(state.turn_context().workspace_roots, state.workspace_roots);
+    }
+
+    #[test]
+    fn empty_and_legacy_workspace_has_no_working_directory() {
+        let state = SessionState::new("session-empty");
+        assert_eq!(state.working_directory(), None);
+
+        let restored = SessionState::from_record(state.to_record(), Vec::new());
+        assert_eq!(restored.working_directory(), None);
+        assert!(restored.turn_context().workspace_roots.is_empty());
+    }
+
+    #[test]
+    fn legacy_record_without_todo_list_loads_empty() {
+        let record: SessionRecord = serde_json::from_value(serde_json::json!({
+            "version": SESSION_RECORD_VERSION,
+            "session_id": "legacy",
+            "workspace_roots": [],
+            "history": {"entries": []},
+            "system_prompt": null,
+            "usage": {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        }))
+        .expect("legacy records must remain loadable");
+
+        assert!(record.todo_list.items.is_empty());
+        assert!(SessionState::from_record(record, Vec::new())
+            .todo_list
+            .items
+            .is_empty());
+    }
+
+    #[test]
+    fn session_snapshot_serializes_todo_ids_content_and_status() {
+        let mut state = SessionState::new("session-todo");
+        state.todo_list = todo_list();
+        let value = serde_json::to_value(SessionStateSnapshot::from_state(&state)).unwrap();
+
+        assert_eq!(value["todo_list"]["items"][0]["id"], "verify");
+        assert_eq!(value["todo_list"]["items"][0]["content"], "Verify behavior");
+        assert_eq!(value["todo_list"]["items"][0]["status"], "in_progress");
+    }
 }

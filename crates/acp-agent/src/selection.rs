@@ -1,19 +1,19 @@
 //! Model and effort selection for ACP sessions.
 
-use turn_anthropic::{Effort, MODELS};
 use agent_client_protocol::schema::v1::{
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
     SessionConfigValueId,
 };
+use turn_anthropic::{Effort, MODELS};
 
 /// The permission handling mode for a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PermissionMode {
     /// Ask the client before every permission-gated (destructive) tool call.
-    #[default]
     Normal,
     /// Auto-grant every permission-gated tool call without prompting.
+    #[default]
     Yolo,
 }
 
@@ -55,7 +55,6 @@ pub struct ModelSelection {
     pub permission: PermissionMode,
 }
 
-
 impl ModelSelection {
     /// Create a new selection based on the agent configuration.
     pub fn for_config(config: &crate::config::AgentConfig) -> Self {
@@ -95,18 +94,12 @@ impl ModelSelection {
                 SessionConfigKind::Select(SessionConfigSelect::new(
                     SessionConfigValueId::new(self.effort_to_string()),
                     SessionConfigSelectOptions::Ungrouped(vec![
-                        SessionConfigSelectOption::new(
-                            SessionConfigValueId::new("low"),
-                            "Low",
-                        ),
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("low"), "Low"),
                         SessionConfigSelectOption::new(
                             SessionConfigValueId::new("medium"),
                             "Medium",
                         ),
-                        SessionConfigSelectOption::new(
-                            SessionConfigValueId::new("high"),
-                            "High",
-                        ),
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("high"), "High"),
                     ]),
                 )),
             )
@@ -122,11 +115,8 @@ impl ModelSelection {
                             "Normal",
                         )
                         .description("Ask before destructive tool calls".to_string()),
-                        SessionConfigSelectOption::new(
-                            SessionConfigValueId::new("yolo"),
-                            "YOLO",
-                        )
-                        .description("Auto-grant all tool calls without asking".to_string()),
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("yolo"), "YOLO")
+                            .description("Auto-grant all tool calls without asking".to_string()),
                     ]),
                 )),
             ),
@@ -180,15 +170,16 @@ impl ModelSelection {
 mod tests {
     use super::*;
     use crate::config::AgentConfig;
-    use serde_json::json;
     use agent_client_protocol::schema::v1::SessionConfigOptionValue;
+    use serde_json::json;
 
     #[test]
     fn initial_selection_from_config() {
         let config = AgentConfig::default();
         let selection = ModelSelection::for_config(&config);
-        assert_eq!(selection.model, "claude-sonnet-5");
+        assert_eq!(selection.model, "claude-haiku-4-5");
         assert_eq!(selection.effort, Effort::High);
+        assert_eq!(selection.permission, PermissionMode::Yolo);
     }
 
     #[test]
@@ -207,9 +198,7 @@ mod tests {
             assert_eq!(select.current_value.0.as_ref(), "claude-haiku-4-5");
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
                 assert_eq!(opts.len(), MODELS.len());
-                assert!(opts
-                    .iter()
-                    .any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
+                assert!(opts.iter().any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
             } else {
                 panic!("expected ungrouped options");
             }
@@ -308,7 +297,8 @@ mod tests {
 
         // Simulating how we extract value from SessionConfigOptionValue in agent.rs
         // Using from_value to avoid needing to know exact struct variant field names
-        let val: SessionConfigOptionValue = serde_json::from_value(json!({"value": "claude-haiku-4-5"})).unwrap();
+        let val: SessionConfigOptionValue =
+            serde_json::from_value(json!({"value": "claude-haiku-4-5"})).unwrap();
 
         let json_value = if let Some(id) = val.as_value_id() {
             serde_json::Value::String(id.0.to_string())

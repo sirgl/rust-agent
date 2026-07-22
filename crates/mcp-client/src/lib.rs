@@ -210,11 +210,7 @@ impl Tool for McpTool {
         _ctx: &ToolContext,
     ) -> Result<BoxStream<'static, ToolEvent>> {
         debug!(tool = %self.qualified_name, "mcp tool call");
-        match self
-            .connection
-            .call_tool(&self.descriptor.name, args)
-            .await
-        {
+        match self.connection.call_tool(&self.descriptor.name, args).await {
             Ok(result) if result.is_error => Ok(events(vec![
                 ToolEvent::Started,
                 ToolEvent::Failed(render_error(&result.content)),

@@ -10,8 +10,8 @@ use std::sync::Arc;
 use agent_core::{
     AgentError, CancellationToken, ClientAccess, ElicitationOutcome, EngineOutput, HistoryEntry,
     NextTurnService, Result, SessionState, StopReason, TerminalOutcome, Tool, ToolCallId,
-    ToolCallStatus, ToolContext, ToolEvent, ToolRegistry, TurnContext, TurnEngine, TurnEvent,
-    TurnInbox, UpdateSink, MAX_TOOL_RESULT_CHARS,
+    ToolCallStatus, ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry, TurnContext,
+    TurnEngine, TurnEvent, TurnInbox, UpdateSink, MAX_TOOL_RESULT_CHARS,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -99,6 +99,40 @@ impl Tool for EchoTool {
     }
 }
 
+struct AccumulatedMessageTool;
+
+#[async_trait]
+impl Tool for AccumulatedMessageTool {
+    fn name(&self) -> &str {
+        "accumulated"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({ "type": "object" })
+    }
+
+    fn requires_permission(&self) -> bool {
+        false
+    }
+
+    fn output_presentation(&self) -> ToolOutputPresentation {
+        ToolOutputPresentation::AccumulatedMessage
+    }
+
+    async fn call(
+        &self,
+        _args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        Ok(Box::pin(stream::iter([
+            ToolEvent::Started,
+            ToolEvent::OutputDelta("first ".into()),
+            ToolEvent::OutputDelta("second".into()),
+            ToolEvent::Completed(serde_json::Value::Null),
+        ])))
+    }
+}
+
 /// A tool that cancels the shared token as soon as it is invoked, before
 /// yielding any events, so tests can exercise cancellation observed during
 /// tool dispatch.
@@ -141,15 +175,10 @@ impl NextTurnService for SteeringOnFirstRoundService {
         &self,
         _ctx: &TurnContext,
     ) -> Result<BoxStream<'static, TurnEvent>> {
-        let n = self
-            .calls
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let n = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if n == 0 {
-            // Simulate a `_session/inject` arriving mid-turn.
-            self.inbox
-                .lock()
-                .unwrap()
-                .push("steer me".to_string());
+            // Simulate a `_session/steering` request arriving mid-turn.
+            self.inbox.lock().unwrap().push("steer me".to_string());
             Ok(Box::pin(stream::iter(vec![
                 TurnEvent::TextDelta("first".into()),
                 TurnEvent::TurnFinished {
@@ -288,7 +317,10 @@ async fn tool_call_round_trip_streams_updates_and_appends_typed_history() {
     ));
     assert!(matches!(
         &sink.outputs[1],
-        EngineOutput::ToolCallUpdate { status: ToolCallStatus::InProgress, .. }
+        EngineOutput::ToolCallUpdate {
+            status: ToolCallStatus::InProgress,
+            ..
+        }
     ));
     match &sink.outputs[2] {
         EngineOutput::ToolCallUpdate {
@@ -317,7 +349,63 @@ async fn tool_call_round_trip_streams_updates_and_appends_typed_history() {
         }
         other => panic!("unexpected entry: {other:?}"),
     }
-    assert!(matches!(&session.history.entries[2], HistoryEntry::Assistant(_)));
+    assert!(matches!(
+        &session.history.entries[2],
+        HistoryEntry::Assistant(_)
+    ));
+}
+
+#[tokio::test]
+async fn accumulated_tool_output_is_emitted_as_one_message() {
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-1"),
+                name: "accumulated".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(AccumulatedMessageTool));
+    let mut session = SessionState::new("s1");
+    let mut sink = FakeSink::default();
+
+    TurnEngine::new(Arc::new(svc), registry)
+        .run_prompt(&mut session, &mut sink, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sink.outputs
+            .iter()
+            .filter_map(|output| match output {
+                EngineOutput::MessageChunk(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec!["first second"]
+    );
+    assert!(!sink.outputs.iter().any(|output| matches!(
+        output,
+        EngineOutput::ToolCall { .. } | EngineOutput::ToolCallUpdate { .. }
+    )));
+    assert!(session
+        .history
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, HistoryEntry::ToolCall(_))));
+    assert!(session
+        .history
+        .entries
+        .iter()
+        .any(|entry| matches!(entry, HistoryEntry::ToolResult(_))));
 }
 
 #[tokio::test]
@@ -357,7 +445,9 @@ async fn unknown_tool_fails_gracefully_without_deadlocking() {
 #[tokio::test]
 async fn stop_reason_is_propagated_as_scripted() {
     for reason in [StopReason::MaxTokens, StopReason::Refusal] {
-        let svc = ReplayTurnService::single(vec![TurnEvent::TurnFinished { stop_reason: reason }]);
+        let svc = ReplayTurnService::single(vec![TurnEvent::TurnFinished {
+            stop_reason: reason,
+        }]);
         let mut session = SessionState::new("s1");
         let mut sink = FakeSink::default();
         let cancel = CancellationToken::new();
@@ -396,9 +486,7 @@ async fn tool_use_without_a_tool_call_is_returned_directly() {
 
 #[tokio::test]
 async fn turn_error_event_surfaces_as_an_error() {
-    let svc = ReplayTurnService::single(vec![TurnEvent::Error(agent_core::TurnError::new(
-        "boom",
-    ))]);
+    let svc = ReplayTurnService::single(vec![TurnEvent::Error(agent_core::TurnError::new("boom"))]);
     let mut session = SessionState::new("s1");
     let mut sink = FakeSink::default();
     let cancel = CancellationToken::new();
@@ -476,12 +564,24 @@ async fn cancellation_during_tool_dispatch_stops_without_completing_the_call() {
             ..
         }
     ));
-    // The tool call was recorded, but no result was ever appended.
-    assert_eq!(session.history.len(), 1);
+    // The cancelled call stays paired with a failed result so the next provider
+    // request does not contain an orphaned tool_use block.
+    assert_eq!(session.history.len(), 2);
     assert!(matches!(
         &session.history.entries[0],
         HistoryEntry::ToolCall(_)
     ));
+    match &session.history.entries[1] {
+        HistoryEntry::ToolResult(result) => {
+            assert_eq!(result.id, ToolCallId::new("call-1"));
+            assert!(!result.success);
+            assert_eq!(
+                result.content,
+                vec![agent_core::ContentBlock::text("cancelled by user")]
+            );
+        }
+        other => panic!("unexpected entry: {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -638,13 +738,15 @@ async fn steering_message_injected_mid_turn_extends_the_turn() {
 
     // The injected message was folded into the conversation as a user message.
     let injected_user_msg = session.history.entries.iter().any(|entry| match entry {
-        HistoryEntry::User(msg) => msg
-            .content
-            .iter()
-            .any(|block| matches!(block, agent_core::ContentBlock::Text { text } if text == "steer me")),
+        HistoryEntry::User(msg) => msg.content.iter().any(
+            |block| matches!(block, agent_core::ContentBlock::Text { text } if text == "steer me"),
+        ),
         _ => false,
     });
-    assert!(injected_user_msg, "injected steering message should be in history");
+    assert!(
+        injected_user_msg,
+        "injected steering message should be in history"
+    );
 
     // The inbox was fully drained.
     assert!(inbox.lock().unwrap().is_empty());
@@ -706,7 +808,60 @@ async fn thought_interval_injects_nudge_before_first_round() {
         }),
         _ => false,
     });
-    assert!(nudged, "thought nudge should be injected on the first round");
+    assert!(
+        nudged,
+        "thought nudge should be injected on the first round"
+    );
+    assert!(agent_core::THOUGHT_NUDGE.contains("one or two short lines"));
+    assert!(agent_core::THOUGHT_NUDGE.contains("todo list"));
+    assert!(agent_core::THOUGHT_NUDGE.contains("actual findings"));
+    assert!(agent_core::THOUGHT_NUDGE.contains("call the todo tools"));
+    assert!(agent_core::THOUGHT_NUDGE.contains("submit_result"));
+}
+
+#[tokio::test]
+async fn thought_interval_repeats_on_the_configured_fifth_round() {
+    let mut rounds = Vec::new();
+    for index in 0..5 {
+        rounds.push(vec![
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new(format!("echo-{index}")),
+                name: "echo".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ]);
+    }
+    rounds.push(vec![TurnEvent::TurnFinished {
+        stop_reason: StopReason::EndTurn,
+    }]);
+    let mut session = SessionState::new("s1");
+    session.push_user_text("hi");
+    let mut sink = FakeSink::default();
+    let mut tools = ToolRegistry::new();
+    tools.register(Arc::new(EchoTool));
+
+    TurnEngine::new(Arc::new(ReplayTurnService::new(rounds)), tools)
+        .with_thought_interval(5)
+        .run_prompt(&mut session, &mut sink, &CancellationToken::new())
+        .await
+        .unwrap();
+
+    let nudge_count = session
+        .history
+        .entries
+        .iter()
+        .filter(|entry| match entry {
+            HistoryEntry::User(msg) => msg.content.iter().any(|block| {
+                matches!(block, agent_core::ContentBlock::Text { text }
+                    if text == agent_core::THOUGHT_NUDGE)
+            }),
+            _ => false,
+        })
+        .count();
+    assert_eq!(nudge_count, 2, "before round 1 and again before round 6");
 }
 
 /// A custom terminal tool (NOT `submit_result`) declaring `ends_turn() = true`,
@@ -793,7 +948,9 @@ async fn large_tool_output_is_offloaded_and_truncated_in_history() {
         }],
     ]);
     let mut registry = ToolRegistry::new();
-    registry.register(Arc::new(BigOutputTool { output: big.clone() }));
+    registry.register(Arc::new(BigOutputTool {
+        output: big.clone(),
+    }));
     let client = Arc::new(CapturingClient::default());
     let mut session = SessionState::new("s1");
     let mut sink = FakeSink::default();
@@ -806,7 +963,12 @@ async fn large_tool_output_is_offloaded_and_truncated_in_history() {
         .unwrap();
 
     // The full output was persisted via the client.
-    let written = client.written.lock().unwrap().clone().expect("output saved");
+    let written = client
+        .written
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("output saved");
     assert_eq!(written.1, big);
     assert!(written.0.contains("acp-agent-tool-outputs"));
 
@@ -947,4 +1109,103 @@ async fn without_require_terminal_tool_plain_text_still_ends_turn() {
         .unwrap();
 
     assert_eq!(stop, StopReason::EndTurn);
+}
+
+#[tokio::test]
+async fn engine_notifies_observer_of_typed_response_with_usage_and_agent_path() {
+    use agent_core::{
+        AgentPath, SharedTurnObserver, TokenUsage, TraceEvent, TurnObservation, TurnObserver,
+        TurnResponseObservation,
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Recorder {
+        requests: Mutex<Vec<TurnObservation>>,
+        responses: Mutex<Vec<TurnResponseObservation>>,
+        events: Mutex<Vec<TraceEvent>>,
+    }
+    impl TurnObserver for Recorder {
+        fn on_turn_request(&self, o: &TurnObservation) {
+            self.requests.lock().unwrap().push(o.clone());
+        }
+        fn on_turn_response(&self, o: &TurnResponseObservation) {
+            self.responses.lock().unwrap().push(o.clone());
+        }
+        fn on_trace_event(&self, event: &TraceEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    // One round: some text, a usage report, a tool call, then finish.
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::TextDelta("hi".into()),
+            TurnEvent::Usage(TokenUsage {
+                input_tokens: 7,
+                output_tokens: 11,
+                cache_read_input_tokens: 13,
+                cache_creation_input_tokens: 0,
+            }),
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("c1"),
+                name: "echo".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    let recorder = Arc::new(Recorder::default());
+    let mut session = SessionState::new("s1");
+    session.push_user_text("go");
+    let mut sink = FakeSink::default();
+    let cancel = CancellationToken::new();
+    let engine = TurnEngine::new(Arc::new(svc), registry)
+        .with_observer(recorder.clone() as SharedTurnObserver)
+        .with_agent_path(AgentPath::root().child("code#1"));
+
+    engine
+        .run_prompt(&mut session, &mut sink, &cancel)
+        .await
+        .unwrap();
+
+    let responses = recorder.responses.lock().unwrap();
+    // The first round's response carries the accumulated usage, the tool call,
+    // the agent path, and a stop reason.
+    let first = &responses[0];
+    assert_eq!(first.agent_path, "root › code#1");
+    assert_eq!(first.assistant_text, "hi");
+    assert_eq!(first.usage.output_tokens, 11);
+    assert_eq!(first.usage.cache_read_input_tokens, 13);
+    assert_eq!(first.tool_calls.len(), 1);
+    assert_eq!(first.tool_calls[0].name, "echo");
+    assert_eq!(first.stop_reason, Some(StopReason::ToolUse));
+
+    // Request and response of one decision round must correlate by explicit ids,
+    // not by timestamps or the display-only agent path.
+    let requests = recorder.requests.lock().unwrap();
+    assert_eq!(requests[0].trace.turn_id, first.trace.turn_id);
+    assert_eq!(requests[0].trace.agent_run_id, first.trace.agent_run_id);
+    assert_eq!(requests[0].trace.round_id, first.trace.round_id);
+
+    // The lifecycle is append-only and balanced even for a multi-round turn.
+    let events = recorder.events.lock().unwrap();
+    assert!(matches!(
+        events.first(),
+        Some(TraceEvent::TurnStarted { .. })
+    ));
+    assert!(events.iter().any(|event| matches!(event,
+        TraceEvent::ToolCallStarted { tool_call_id, .. } if tool_call_id == "c1"
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(TraceEvent::TurnFinished { .. })
+    ));
 }

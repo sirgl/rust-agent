@@ -114,10 +114,7 @@ impl<W: Write + Send> UpdateSink for TerminalUpdateSink<W> {
                 ))
             }
             EngineOutput::ToolCallUpdate {
-                id,
-                status,
-                output,
-                ..
+                id, status, output, ..
             } => {
                 self.ensure_newline()?;
                 let mut line = format!("[tool {}] -> {}", id.0, status_label(status));
@@ -146,7 +143,7 @@ impl<W: Write + Send> UpdateSink for TerminalUpdateSink<W> {
             let stdin = std::io::stdin();
             let mut lock = stdin.lock();
             match lock.read_line(&mut buf) {
-                Ok(0) => None,      // EOF: treat as deny
+                Ok(0) => None, // EOF: treat as deny
                 Ok(_) => Some(buf),
                 Err(_) => None,
             }

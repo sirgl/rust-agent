@@ -81,9 +81,9 @@ impl StdioMcpConnection {
             cmd.env(key, value);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|err| AgentError::Other(format!("failed to launch mcp server `{name}`: {err}")))?;
+        let mut child = cmd.spawn().map_err(|err| {
+            AgentError::Other(format!("failed to launch mcp server `{name}`: {err}"))
+        })?;
         let stdin = child
             .stdin
             .take()
@@ -245,11 +245,11 @@ fn parse_call_result(result: &Value) -> McpToolResult {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     // Prefer the structured `content` field; fall back to the whole result.
-    let content = result.get("content").cloned().unwrap_or_else(|| result.clone());
-    McpToolResult {
-        is_error,
-        content,
-    }
+    let content = result
+        .get("content")
+        .cloned()
+        .unwrap_or_else(|| result.clone());
+    McpToolResult { is_error, content }
 }
 
 #[async_trait]
@@ -346,8 +346,11 @@ done
     #[tokio::test]
     async fn registers_real_stdio_tools_into_registry() {
         let path = write_mock_server();
-        let conn: Arc<dyn McpConnection> =
-            Arc::new(StdioMcpConnection::connect("mock", &path, &[], &[]).await.unwrap());
+        let conn: Arc<dyn McpConnection> = Arc::new(
+            StdioMcpConnection::connect("mock", &path, &[], &[])
+                .await
+                .unwrap(),
+        );
 
         let mut registry = ToolRegistry::new();
         let registered = register_mcp_tools(&mut registry, conn).await.unwrap();

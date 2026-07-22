@@ -6,11 +6,16 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 
+use crate::agent::AgentPath;
 use crate::cancel::CancellationToken;
 use crate::client::ClientAccess;
 use crate::error::{AgentError, Result};
 use crate::event::ToolCallId;
+use crate::observe::SharedTurnObserver;
+use crate::session::ToolDescriptor;
 use crate::sink::{ToolCallLocation, ToolKind};
+use crate::todo::TodoList;
+use crate::trace::TraceContext;
 
 /// A streaming event emitted while a tool executes.
 #[derive(Debug, Clone)]
@@ -23,6 +28,20 @@ pub enum ToolEvent {
     Completed(serde_json::Value),
     /// The tool failed with a descriptive message.
     Failed(String),
+    /// A validated replacement for the session's canonical todo state.
+    TodoListUpdated(TodoList),
+}
+
+/// How a tool's human-readable output is presented to the frontend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolOutputPresentation {
+    /// Render lifecycle and output through tool-call updates.
+    #[default]
+    ToolCall,
+    /// Forward output deltas immediately as assistant message chunks.
+    StreamingMessage,
+    /// Buffer all output deltas and emit one assistant message on completion.
+    AccumulatedMessage,
 }
 
 /// Context passed to a [`Tool`] when it is invoked.
@@ -38,6 +57,8 @@ pub struct ToolContext {
     pub cancel: CancellationToken,
     /// Current subagent nesting depth (0 for a top-level turn).
     pub depth: usize,
+    /// Ordered workspace roots; index `0` is the working directory.
+    pub workspace_roots: Vec<String>,
     /// Provider-independent access to the ACP client (fs/terminal).
     ///
     /// Optional so tests and non-ACP contexts (e.g. the replay integration
@@ -45,6 +66,21 @@ pub struct ToolContext {
     /// should obtain it via [`ToolContext::client`], which yields a structured
     /// error when absent rather than panicking.
     pub client: Option<Arc<dyn ClientAccess>>,
+    /// The provider-neutral observer of the engine that dispatched this tool,
+    /// if any. Tools that spawn nested engines (subagents, orchestration)
+    /// should attach it so the nested agent's requests/responses are captured
+    /// too. `None` when observation is disabled.
+    pub observer: Option<SharedTurnObserver>,
+    /// The [`AgentPath`] of the agent that dispatched this tool. Tools that
+    /// spawn a nested engine should give it `agent_path.child(<label>)` so the
+    /// sub-agent's output is attributed to it specifically.
+    pub agent_path: AgentPath,
+    /// Trace of the parent decision round that dispatched this tool.
+    pub trace: Option<TraceContext>,
+    /// Id of this concrete invocation, used to parent a nested agent run.
+    pub tool_call_id: Option<ToolCallId>,
+    /// Immutable snapshot of the session's canonical todo state at dispatch.
+    pub todo_list: TodoList,
 }
 
 impl ToolContext {
@@ -54,7 +90,13 @@ impl ToolContext {
             session_id: session_id.into(),
             cancel,
             depth: 0,
+            workspace_roots: Vec::new(),
             client: None,
+            observer: None,
+            agent_path: AgentPath::root(),
+            trace: None,
+            tool_call_id: None,
+            todo_list: TodoList::default(),
         }
     }
 
@@ -121,6 +163,11 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Choose how the tool's human-readable output is shown to the user.
+    fn output_presentation(&self) -> ToolOutputPresentation {
+        ToolOutputPresentation::ToolCall
+    }
+
     /// Execute the tool, streaming [`ToolEvent`]s back to the caller.
     async fn call(
         &self,
@@ -169,6 +216,18 @@ impl ToolRegistry {
     /// Iterate over the names of all registered tools.
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tools.keys().map(|s| s.as_str())
+    }
+
+    /// Snapshot the schemas advertised to the decision layer.
+    pub fn descriptors(&self) -> Vec<ToolDescriptor> {
+        self.tools
+            .iter()
+            .map(|(name, tool)| ToolDescriptor {
+                name: name.clone(),
+                schema: tool.schema(),
+                requires_permission: tool.requires_permission(),
+            })
+            .collect()
     }
 }
 

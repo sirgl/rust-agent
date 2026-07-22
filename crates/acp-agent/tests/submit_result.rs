@@ -57,6 +57,8 @@ async fn turn_ends_only_after_submit_result() {
             ..AgentConfig::default()
         },
         store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     };
     let agent = build_agent(deps);
 
@@ -98,7 +100,8 @@ async fn turn_ends_only_after_submit_result() {
 
     let snapshot = updates.lock().unwrap().clone();
 
-    // The first round's text was still streamed to the client.
+    // The first round's text was streamed, and the terminal `submit_result`'s
+    // summary is rendered as a plain agent message (not a tool call).
     let chunks: Vec<String> = snapshot
         .iter()
         .filter_map(|update| match update {
@@ -109,12 +112,21 @@ async fn turn_ends_only_after_submit_result() {
             _ => None,
         })
         .collect();
-    assert_eq!(chunks, vec!["Working on it...".to_string()]);
+    assert_eq!(
+        chunks,
+        vec![
+            "Working on it...".to_string(),
+            "finished the task".to_string()
+        ]
+    );
 
-    // The terminal `submit_result` tool call was dispatched.
-    let saw_submit = snapshot.iter().any(|update| match update {
+    // The terminal `submit_result` tool is NOT surfaced as a tool call anymore.
+    let saw_submit_call = snapshot.iter().any(|update| match update {
         SessionUpdate::ToolCall(call) => call.title.contains("submit_result"),
         _ => false,
     });
-    assert!(saw_submit, "expected a submit_result tool call to be streamed");
+    assert!(
+        !saw_submit_call,
+        "submit_result should be rendered as a message, not a tool call"
+    );
 }

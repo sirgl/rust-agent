@@ -2,15 +2,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    SessionConfigId, SessionConfigKind, SessionConfigValueId,
-    SetSessionConfigOptionRequest,
+    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionConfigId,
+    SessionConfigKind, SessionConfigValueId, SetSessionConfigOptionRequest,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::Client;
 use agent_core::{NextTurnService, StopReason as CoreStopReason, ToolRegistry, TurnEvent};
-use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
 use turn_anthropic::Effort;
 
 #[tokio::test]
@@ -21,12 +20,13 @@ async fn test_config_options_e2e() {
 
     let factory: NextTurnFactory = Arc::new(move |selection| {
         *last_selection_clone.lock().unwrap() = Some(selection.clone());
-        let service: Arc<dyn NextTurnService> = Arc::new(turn_replay::ReplayTurnService::new(vec![vec![
-            TurnEvent::TextDelta("Hello".to_string()),
-            TurnEvent::TurnFinished {
-                stop_reason: CoreStopReason::EndTurn,
-            },
-        ]]));
+        let service: Arc<dyn NextTurnService> =
+            Arc::new(turn_replay::ReplayTurnService::new(vec![vec![
+                TurnEvent::TextDelta("Hello".to_string()),
+                TurnEvent::TurnFinished {
+                    stop_reason: CoreStopReason::EndTurn,
+                },
+            ]]));
         service
     });
 
@@ -38,6 +38,8 @@ async fn test_config_options_e2e() {
             ..AgentConfig::default()
         },
         store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     };
     let agent = build_agent(deps);
 
@@ -54,15 +56,25 @@ async fn test_config_options_e2e() {
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
                 .await?;
-            
-            let options = new_session.config_options.expect("missing config options");
-            
-            let model_opt = options.iter().find(|o| &*o.id.0 == "model").expect("missing model option");
-            let effort_opt = options.iter().find(|o| &*o.id.0 == "effort").expect("missing effort option");
 
-            // Default model should be sonnet, default effort should be high
+            let options = new_session.config_options.expect("missing config options");
+
+            let model_opt = options
+                .iter()
+                .find(|o| &*o.id.0 == "model")
+                .expect("missing model option");
+            let effort_opt = options
+                .iter()
+                .find(|o| &*o.id.0 == "effort")
+                .expect("missing effort option");
+            let permissions_opt = options
+                .iter()
+                .find(|o| &*o.id.0 == "permissions")
+                .expect("missing permissions option");
+
+            // Default model should be Haiku, default effort should be high.
             if let SessionConfigKind::Select(select) = &model_opt.kind {
-                assert_eq!(&*select.current_value.0, "claude-sonnet-5");
+                assert_eq!(&*select.current_value.0, "claude-haiku-4-5");
             } else {
                 panic!("model option is not a select");
             }
@@ -73,16 +85,27 @@ async fn test_config_options_e2e() {
                 panic!("effort option is not a select");
             }
 
-            // 2. session/set_config_option updates the session state and returns the current options
-            let update_res = cx.send_request(SetSessionConfigOptionRequest::new(
-                new_session.session_id.clone(),
-                SessionConfigId::new("effort"),
-                SessionConfigValueId::new("low")
-            ))
-            .block_task()
-            .await?;
+            if let SessionConfigKind::Select(select) = &permissions_opt.kind {
+                assert_eq!(&*select.current_value.0, "yolo");
+            } else {
+                panic!("permissions option is not a select");
+            }
 
-            let effort_opt = update_res.config_options.iter().find(|o| &*o.id.0 == "effort").expect("missing effort option");
+            // 2. session/set_config_option updates the session state and returns the current options
+            let update_res = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    new_session.session_id.clone(),
+                    SessionConfigId::new("effort"),
+                    SessionConfigValueId::new("low"),
+                ))
+                .block_task()
+                .await?;
+
+            let effort_opt = update_res
+                .config_options
+                .iter()
+                .find(|o| &*o.id.0 == "effort")
+                .expect("missing effort option");
             if let SessionConfigKind::Select(select) = &effort_opt.kind {
                 assert_eq!(&*select.current_value.0, "low");
             } else {
@@ -96,18 +119,22 @@ async fn test_config_options_e2e() {
             ))
             .block_task()
             .await?;
-            
+
             {
-                let selection = last_selection.lock().unwrap().take().expect("no selection recorded");
+                let selection = last_selection
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("no selection recorded");
                 assert_eq!(selection.effort, Effort::Low);
-                assert_eq!(selection.model, "claude-sonnet-5");
+                assert_eq!(selection.model, "claude-haiku-4-5");
             }
 
             // 4. Update model and verify next prompt uses it
             cx.send_request(SetSessionConfigOptionRequest::new(
                 new_session.session_id.clone(),
                 SessionConfigId::new("model"),
-                SessionConfigValueId::new("claude-haiku-4-5")
+                SessionConfigValueId::new("claude-haiku-4-5"),
             ))
             .block_task()
             .await?;
@@ -120,21 +147,30 @@ async fn test_config_options_e2e() {
             .await?;
 
             {
-                let selection = last_selection.lock().unwrap().take().expect("no selection recorded");
+                let selection = last_selection
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("no selection recorded");
                 assert_eq!(selection.model, "claude-haiku-4-5");
                 assert_eq!(selection.effort, Effort::Low); // Should persist from previous update
             }
 
             // 5. Invalid update should be ignored and return previous valid state
-            let update_res = cx.send_request(SetSessionConfigOptionRequest::new(
-                new_session.session_id.clone(),
-                SessionConfigId::new("model"),
-                SessionConfigValueId::new("non-existent-model")
-            ))
-            .block_task()
-            .await?;
+            let update_res = cx
+                .send_request(SetSessionConfigOptionRequest::new(
+                    new_session.session_id.clone(),
+                    SessionConfigId::new("model"),
+                    SessionConfigValueId::new("non-existent-model"),
+                ))
+                .block_task()
+                .await?;
 
-            let model_opt = update_res.config_options.iter().find(|o| &*o.id.0 == "model").expect("missing model option");
+            let model_opt = update_res
+                .config_options
+                .iter()
+                .find(|o| &*o.id.0 == "model")
+                .expect("missing model option");
             if let SessionConfigKind::Select(select) = &model_opt.kind {
                 assert_eq!(&*select.current_value.0, "claude-haiku-4-5");
             }

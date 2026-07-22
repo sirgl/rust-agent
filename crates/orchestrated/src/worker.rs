@@ -13,8 +13,9 @@
 use std::sync::Arc;
 
 use agent_core::{
-    ClientAccess, EngineOutput, NextTurnService, Result, SessionState, StopReason, Tool,
-    ToolRegistry, TurnEngine, UpdateSink,
+    AgentPath, AgentRunMetadata, ClientAccess, EngineOutput, NextTurnService, Result, SessionState,
+    SharedTurnObserver, StopReason, Tool, ToolCallId, ToolRegistry, TraceContext, TurnEngine,
+    UpdateSink,
 };
 use async_trait::async_trait;
 
@@ -74,8 +75,25 @@ pub struct SubAgentRunParams<'a> {
     pub depth: usize,
     /// Optional ACP client access for the sub-agent's tools.
     pub client: Option<Arc<dyn ClientAccess>>,
+    /// Ordered workspace roots inherited from the orchestrator turn.
+    pub workspace_roots: Vec<String>,
     /// Cancellation token shared with the orchestrator turn.
     pub cancel: &'a agent_core::CancellationToken,
+    /// The session id to attribute this sub-agent's captured requests to.
+    /// Reusing the parent's id groups every agent of a session together in the
+    /// LLM inspector, with the [`AgentPath`] telling them apart.
+    pub session_id: String,
+    /// The [`AgentPath`] identifying this sub-agent within its session.
+    pub agent_path: AgentPath,
+    /// Optional observer propagated so the sub-agent's requests/responses are
+    /// captured too, attributed to its `agent_path`.
+    pub observer: Option<SharedTurnObserver>,
+    /// Parent orchestrator round that issued `run_subagent`.
+    pub parent_trace: Option<TraceContext>,
+    /// Concrete `run_subagent` call that spawned this run.
+    pub parent_tool_call_id: Option<ToolCallId>,
+    /// Typed mode/step/attempt/tier labels for the debug tree.
+    pub trace_metadata: AgentRunMetadata,
 }
 
 /// Runs a nested turn for a given [`SubAgentMode`].
@@ -99,7 +117,14 @@ impl OrchestratedSubAgentWorker {
             max_steps,
             depth,
             client,
+            workspace_roots,
             cancel,
+            session_id,
+            agent_path,
+            observer,
+            parent_trace,
+            parent_tool_call_id,
+            trace_metadata,
         } = params;
 
         let step_index = req.step_index;
@@ -115,13 +140,15 @@ impl OrchestratedSubAgentWorker {
 
         // 2. Build the nested session.
         let step_spec = ctx.proposal().and_then(|p| p.step(step_index).cloned());
-        let issue = self
-            .mode
-            .build_issue_description(req, step_spec.as_ref());
+        let issue = self.mode.build_issue_description(req, step_spec.as_ref());
         let observations = self.mode.build_pre_chat_observations(ctx, step_index);
 
-        let mut session = SessionState::new(format!("orchestrated::{}::{}", self.mode.id(), step_index));
+        // Reuse the parent's session id (grouping) but tag this sub-agent with a
+        // distinct `AgentPath` so its output is viewable separately.
+        let mut session = SessionState::new(session_id);
         session.system_prompt = Some(self.mode.system_prompt(ctx, step_index));
+        session.available_tools = tools.descriptors();
+        session.workspace_roots = workspace_roots;
         let mut prompt = issue;
         if !observations.is_empty() {
             prompt.push_str("\n\nContext:\n");
@@ -132,9 +159,17 @@ impl OrchestratedSubAgentWorker {
         // 3. Drive the engine to a stop reason.
         let mut engine = TurnEngine::new(next_turn, tools)
             .with_max_iterations(max_steps)
-            .with_depth(depth);
+            .with_depth(depth)
+            .with_agent_path(agent_path)
+            .with_trace_metadata(trace_metadata);
+        if let (Some(parent), Some(tool_call_id)) = (parent_trace, parent_tool_call_id) {
+            engine = engine.with_trace_parent(parent, tool_call_id.0);
+        }
         if let Some(client) = client {
             engine = engine.with_client(client);
+        }
+        if let Some(observer) = observer {
+            engine = engine.with_observer(observer);
         }
 
         let mut sink = CapturingSink::default();
@@ -181,7 +216,10 @@ mod tests {
     use super::*;
     use crate::context::{PlanProposal, PlanStepSpec, StepResult};
     use crate::mode::{code_mode, ExecutorBehavior, ReviewMode, ReviewerBehavior};
-    use agent_core::{CancellationToken, StopReason, ToolCallId, TurnEvent};
+    use agent_core::{
+        CancellationToken, StopReason, ToolCallId, TurnEvent, TurnObservation, TurnObserver,
+    };
+    use std::sync::Mutex;
     use turn_replay::ReplayTurnService;
 
     fn ctx_with_step() -> Arc<OrchestratedStepContext> {
@@ -193,6 +231,13 @@ mod tests {
 
     #[tokio::test]
     async fn executor_runs_submits_and_reports_success() {
+        #[derive(Default)]
+        struct RequestRecorder(Mutex<Vec<TurnObservation>>);
+        impl TurnObserver for RequestRecorder {
+            fn on_turn_request(&self, observation: &TurnObservation) {
+                self.0.lock().unwrap().push(observation.clone());
+            }
+        }
         // The nested turn immediately calls `submit`, then finishes.
         let replay = Arc::new(ReplayTurnService::new(vec![
             vec![
@@ -223,6 +268,7 @@ mod tests {
             scope: None,
             model_tier: None,
         };
+        let recorder = Arc::new(RequestRecorder::default());
 
         let outcome = worker
             .run(SubAgentRunParams {
@@ -233,7 +279,14 @@ mod tests {
                 max_steps: 10,
                 depth: 1,
                 client: None,
+                workspace_roots: vec!["/workspace/project".into(), "/workspace/shared".into()],
                 cancel: &cancel,
+                session_id: "sess-test".into(),
+                agent_path: AgentPath::root().child("code#1"),
+                observer: Some(recorder.clone()),
+                parent_trace: None,
+                parent_tool_call_id: None,
+                trace_metadata: AgentRunMetadata::default(),
             })
             .await
             .unwrap();
@@ -241,6 +294,12 @@ mod tests {
         assert!(outcome.success);
         assert_eq!(outcome.output, "implemented X");
         assert_eq!(outcome.submit.unwrap().output, "implemented X");
+        let requests = recorder.0.lock().unwrap();
+        assert!(requests[0].tools.iter().any(|tool| tool.name == "submit"));
+        assert_eq!(
+            requests[0].workspace_roots,
+            vec!["/workspace/project", "/workspace/shared"]
+        );
     }
 
     #[tokio::test]
@@ -292,7 +351,14 @@ mod tests {
                 max_steps: 10,
                 depth: 1,
                 client: None,
+                workspace_roots: Vec::new(),
                 cancel: &cancel,
+                session_id: "sess-test".into(),
+                agent_path: AgentPath::root().child("code#1"),
+                observer: None,
+                parent_trace: None,
+                parent_tool_call_id: None,
+                trace_metadata: AgentRunMetadata::default(),
             })
             .await
             .unwrap();

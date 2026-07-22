@@ -17,8 +17,9 @@ use acp_agent::{build_agent, default_store, AgentConfig, AgentDeps, NextTurnFact
 /// Build [`AgentDeps`] with an empty replay script and the given config.
 fn deps_with_config(config: AgentConfig) -> AgentDeps {
     let factory: NextTurnFactory = Arc::new(move |_selection| {
-        let service: Arc<dyn NextTurnService> =
-            Arc::new(turn_replay::ReplayTurnService::new(Vec::<Vec<TurnEvent>>::new()));
+        let service: Arc<dyn NextTurnService> = Arc::new(turn_replay::ReplayTurnService::new(
+            Vec::<Vec<TurnEvent>>::new(),
+        ));
         service
     });
     AgentDeps {
@@ -26,6 +27,8 @@ fn deps_with_config(config: AgentConfig) -> AgentDeps {
         tools: ToolRegistry::new(),
         config,
         store: default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     }
 }
 

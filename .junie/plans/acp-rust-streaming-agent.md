@@ -549,6 +549,209 @@ Drive the whole path with `turn-replay` for both the orchestrator and sub-agents
 - `orchestrated` unit/integration tests for `run_pipeline`/`uniform_resolver`/`OrchestrateTool` via replay.
 - `acp-agent` integration tests for mode advertisement, `set_mode`, and mode-branched prompt through a fake client.
 
+# Todo Planning Actions
+
+### Overview & Goals
+Add a canonical, typed, session-scoped todo list that the agent maintains through two provider-independent tools and that ACP renders as its native `Plan` progress UI. The list must survive prompt turns and `session/load`, be visible in the LLM Inspector session state, and remain consistent with the typed tool history sent back to the decision layer.
+
+The periodic nudge must still request only a one-to-two-line user update, but must also tell the agent to compare its todo plan with observed reality, repair stale or incomplete plans when needed, and use `submit_result` immediately instead of narrating when work is complete.
+
+### Functional Requirements
+- Register `update_todo_list` and `mark_todo_completed` in `tools_builtin::builtin_registry()` so chat agents and any nested agent using the standard built-ins get the same service implementation regardless of Anthropic/replay/future provider.
+- `update_todo_list` replaces the entire list atomically with `items: [{ id, content, status }]`; omission means removal and an empty array intentionally clears the plan.
+- Item IDs are stable, non-empty strings chosen by the caller and unique within the replacement list. Content must be non-empty. Status is one of `pending`, `in_progress`, or `completed`.
+- `mark_todo_completed { id }` changes exactly the matching item to `completed`, preserves order/content/other statuses, succeeds idempotently for an already-completed item, and fails without mutation for an unknown ID.
+- Every successful mutation immediately emits the **entire** list as `EngineOutput::Plan`; `AcpUpdateSink` projects it to one ACP `SessionUpdate::Plan`. Stable IDs remain internal because the ACP `PlanEntry` schema carries only content/priority/status.
+- Both tools return the resulting full typed list in their tool result so the next decision round sees the exact IDs and statuses through normal typed history; do not inject a duplicate todo snapshot into every LLM request, preserving prompt prefixes and token-cache reuse.
+- Persist the todo list in `SessionRecord`, restore it in `SessionState::from_record`, and re-emit it during `session/load`; old records without the field load with an empty list.
+- Include the todo list in `SessionStateSnapshot` and the Inspector's Session State panel/API.
+- Update `THOUGHT_NUDGE` so its first-round and every-`thought_interval` injection asks the agent to verify that the todo list matches actual findings/progress and call the todo tools when it does not. Keep the visible narration to one or two short lines and retain the existing immediate-`submit_result` rule.
+- Extend the default ACP system prompt to tell the agent to create and maintain a todo list for non-trivial work, revise it when evidence changes, and mark work complete only when verified.
+
+### Key Decisions
+- **`SessionState` is the source of truth** (chosen over a tool-owned store). `SessionRecord`, ACP projection, Inspector snapshots, and tool execution all observe one state rather than eventually synchronizing parallel stores.
+- **Stable item IDs** (chosen over indexes or text matching). Reordering and rewording do not make a later completion call target the wrong item.
+- **Validated state-transition events**. Tools receive a cloned todo snapshot through `ToolContext` and emit a typed `ToolEvent::TodoListUpdated`; `TurnEngine`, which already has exclusive `&mut SessionState`, applies it and emits the ACP plan without holding a lock across `.await`.
+- **Full ACP projection after every mutation**. ACP `Plan` is treated as a replace-all read model, avoiding fragile client-side delta reconciliation.
+- Existing provider-originated `TurnEvent::Plan` remains a presentation-only compatibility path because it has no stable IDs; canonical persistent updates go through the two todo tools.
+
+### Data Model / Contracts
+```rust
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TodoList {
+    pub items: Vec<TodoItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub id: TodoItemId,
+    pub content: String,
+    pub status: PlanStepStatus,
+}
+
+pub enum ToolEvent {
+    // existing events ...
+    TodoListUpdated(TodoList),
+}
+
+// Full replacement; validates all items before emitting an update.
+update_todo_list({ items: [{ id, content, status }] })
+
+// Idempotent completion of one stable item.
+mark_todo_completed({ id })
+```
+
+`TodoItemId` validates non-empty input. `TodoList::validate` rejects duplicate IDs and empty content before any state is changed. `TodoList::to_plan_update` deliberately drops IDs only at the ACP presentation boundary.
+
+### Concrete Changes
+- **`agent-core/src/event.rs` (or a focused `todo.rs`)** — define/re-export `TodoItemId`, `TodoItem`, and `TodoList`; reuse `PlanStepStatus` for the status vocabulary.
+- **`agent-core/src/session.rs`** — add `todo_list` to `SessionState`, `TurnContext`, and `SessionRecord` with backward-compatible deserialization; include it in record round-trips.
+- **`agent-core/src/tool.rs` / `engine.rs`** — expose the current snapshot in `ToolContext`, handle `ToolEvent::TodoListUpdated`, atomically update session state, and emit the full `EngineOutput::Plan` before completing the tool call.
+- **`agent-core/src/history.rs`** — classify both new built-ins into dedicated `KnownTool` variants so arguments remain typed while preserving faithful compiler round-tripping.
+- **`tools-builtin/src/lib.rs`** — implement and register `UpdateTodoListTool` and `MarkTodoCompletedTool` with `ToolKind::Think`, concise titles, strict JSON schemas, no permission requirement, and structured full-list results.
+- **`acp-agent/src/agent.rs` / `sink.rs`** — reuse the existing plan mapper for runtime updates and emit a restored non-empty plan during `session/load`.
+- **`agent-core/src/observe.rs` and `llm-inspector` state API/UI** — expose/render the canonical todo list as part of persisted session state, not as a reconstructed list from logs.
+- **`agent-core/src/engine.rs` and `acp-agent/src/config.rs`** — revise the nudge and default system-prompt wording without changing the configured first-round/every-five-round cadence.
+- **`docs/design/todo-planning.md`** — document ownership, transition semantics, ACP projection, history/token behavior, persistence, and failure cases.
+
+### Architecture
+```mermaid
+graph TD
+    LLM[Decision backend] -->|todo tool call| Tool[Built-in todo tool]
+    Tool -->|validated TodoListUpdated| Engine[TurnEngine]
+    Engine -->|exclusive mutation| State[SessionState todo_list]
+    Engine -->|full Plan| ACP[ACP client]
+    State -->|SessionRecord| Store[SessionStore]
+    State -->|SessionStateSnapshot| Inspector[LLM Inspector]
+    Engine -->|typed result history| LLM
+```
+
+### Validation
+- Unit-test ID/content/duplicate validation, full replacement/clear behavior, unknown-ID failure, order preservation, and idempotent completion.
+- Replay-engine tests must prove a successful update mutates `SessionState`, emits exactly one full `Plan`, records the typed call/result, and exposes the updated list to a subsequent `mark_todo_completed` call.
+- Failure tests must prove malformed/duplicate/unknown input produces no state mutation and no ACP plan update.
+- Persistence tests must cover current record round-trip and loading a legacy JSON record with no todo field.
+- ACP tests must assert exact `PlanEntry` content/order/status after update, completion, and `session/load` restore.
+- Inspector tests must assert `/api/state?session=...` and the Session State panel expose IDs/content/status.
+- Nudge tests must assert injection before round 1 and at the configured fifth-round cadence, including plan-vs-reality/update wording and the existing `submit_result` instruction.
+
+# ACP Turn and Message Boundary Safety
+
+### Investigation Findings
+The supplied `acp-debug-663d8145-20260716-102913.zip` demonstrates an overlapping-turn race rather than an ACP plan/rendering defect:
+- The assistant message `...-msg-11` starts at event sequence 136.
+- The user sends a new message at sequence 153 after the client has already emitted `ThreadWaiting(reason=userCancellationTimeout)` at sequence 135.
+- The next prompt starts at sequence 155, but assistant deltas at sequences 174–189 are still appended to the same `...-msg-11`, which is completed only at sequence 190.
+- `AcpUpdateSink` cannot choose a new message identity: ACP `SessionUpdate::AgentMessageChunk` contains content but no `message_id`. JetBrains derives assistant-message boundaries from prompt lifecycle, so late output from a retired prompt continues the previously open text block.
+
+The current `SessionEntry` uses an independently replaceable `CancellationToken` and `AtomicBool running`. Each `session/prompt` can spawn a new task immediately, while an older task may still send updates, clear `running`, publish state, or persist its record. The `AsyncMutex<SessionState>` serializes state access but does not establish output ownership or protect lifecycle side effects from stale tasks.
+
+### Requirements
+- A session has at most one **current turn generation**. Starting a new `session/prompt` atomically retires and cancels the previous generation before any new agent output is emitted.
+- Retired generations must not send message/thinking chunks, ACP plans (including todo projections), tool updates, or permission requests, even if a backend/tool produces output after cancellation.
+- Starting a replacement turn should allow a short bounded grace period for cooperative shutdown, but must not block indefinitely on a backend or tool that ignores cancellation. A generation fence remains authoritative after the wait expires.
+- Completion from an older task must not mark a newer turn idle, replace its cancellation token, publish stale Inspector state, or overwrite a newer persisted `SessionRecord`.
+- The typed conversation remains ordered under the existing exclusive `SessionState` borrow. A new user prompt is compiled only after prior state mutation has quiesced; stale output suppression must not create concurrent history mutation.
+- `_session/inject` retains its steering semantics: inject into the current generation when one exists; otherwise create a fresh generation through the same coordinator rather than a parallel lifecycle path.
+- Cancellation and dropped-stale-output decisions must be visible in structured tracing/Inspector metadata with session and generation identifiers, without exposing dropped content to the ACP user.
+- Ordinary sequential prompts, deferred inspector greeting, slash commands, orchestrate mode, todo-to-ACP-plan updates, and `session/load` replay must preserve their existing behavior.
+
+### Key Decisions
+- **Per-session `TurnCoordinator` is the lifecycle source of truth.** Replace independent `cancel`/`running` bookkeeping with one atomic active-turn record containing a monotonic generation, cancellation token, and completion signal.
+- **Cancel + fence + bounded wait.** A replacement prompt first retires/cancels the old lease, optionally waits for cooperative completion for a bounded interval, then starts the new generation. Waiting alone is insufficient because tools can ignore cancellation; fencing alone wastes resources and leaves cleanup races.
+- **Generation-scoped sink wrapper.** Wrap `AcpUpdateSink` in a turn-scoped `UpdateSink` that checks its lease before every `send` and `request_permission`. A stale permission request is denied locally and never reaches the client.
+- **Compare-and-clear cleanup.** A task may clear the active turn and publish/persist final state only if its generation is still current. Cleanup from a stale task becomes a no-op except for diagnostics.
+- **No protocol-specific message IDs.** Do not invent synthetic boundaries or text separators: ACP has no message-id field on `AgentMessageChunk`; correct request completion and stale-output suppression create the client-visible boundary.
+
+### Proposed Changes
+- **`acp-agent/src/agent.rs` (or focused `turn_coordinator.rs`)** — add `TurnCoordinator`, `TurnLease`, monotonic generation allocation, retirement/cancellation, bounded completion wait, current-generation checks, and compare-and-clear completion. Store it in `SessionEntry` and derive running/cancel behavior from it.
+- **`acp-agent/src/sink.rs`** — add a generic generation-scoped wrapper around `AcpUpdateSink`; gate every `EngineOutput` variant and permission request, and trace suppressed stale events by kind without forwarding payloads.
+- **Prompt/inject wiring** — acquire a lease before flushing turn-scoped output or starting engines; use the same lease in chat and orchestrate paths; make `_session/inject` consult the coordinator; route `session/cancel` to the active lease.
+- **State/record side effects** — guard `publish_session_state`, `persist_record`, and `running`/completion transitions with the lease. Preserve the state mutex as the sole writer for history/todo/usage, but prevent an obsolete record from winning a persistence race.
+- **Regression coverage** — model the bundle with a controllable replay backend: turn A emits a chunk and blocks, the client cancels/times out and starts turn B, turn A attempts a late message/plan/tool update, and turn B answers. Assert no A output occurs after the second user prompt, B has a distinct client-visible message boundary, stale completion cannot clear B, and only the newest record/state snapshot is published.
+
+### Architecture
+```mermaid
+graph TD
+    Prompt[New ACP prompt] --> Coordinator[TurnCoordinator]
+    Coordinator -->|retire + cancel| Old[Old turn lease]
+    Coordinator -->|new generation| New[Current turn lease]
+    Old -->|late output| Fence[Generation-scoped sink]
+    Fence -->|drop + trace| Inspector[Inspector diagnostics]
+    New -->|current output| Fence
+    Fence --> ACP[ACP session/update]
+    New -->|compare-and-clear| State[Session state + persistence]
+```
+
+### Validation
+- Unit-test coordinator generation monotonicity, cancellation, bounded waiting, compare-and-clear, and missed-notification safety.
+- Test the scoped sink across every `EngineOutput` variant plus `request_permission`; current output passes once, stale output is dropped, and no payload leaks into diagnostics.
+- Add an ACP integration test reproducing event order equivalent to sequences 135–190 from the bundle, including a new user prompt before the old backend cooperatively stops.
+- Verify chat/orchestrate/inject paths use the same coordinator and that a stale turn cannot emit a todo `Plan`, overwrite persistence, or clear a newer active turn.
+- Retain the existing todo-plan tests proving successful current-generation mutations still map to one full native ACP `Plan` and restore correctly on `session/load`.
+
+# ACP Session Workspace and Shell Execution
+
+### Investigation Findings
+The supplied `acp-debug-a13868fd-20260721-141316.zip` shows that the IDE correctly associated the thread with `/Users/roman.ivanov/IdeaProjects/untitled118` (`ThreadCreated` sequence 0 and `RuntimeSessionBound` sequence 10), but the agent did not apply that directory to local operations:
+- `NewSessionRequest.cwd` is already stored first in `SessionState.workspace_roots` (`acp-agent/src/agent.rs:346-350`), but `LocalClientAccess` stores only the elicitation connection and session id (`local_client.rs:42-67`).
+- Both blocking and streaming terminal paths call `Command::new`/`TokioCommand::new` without `current_dir` (`local_client.rs:91-100, 190-223`), so they inherit the ACP server process directory rather than the ACP session project.
+- The model sent `terminal_run.command` as shell text: `find ... | head -30` (events 21-24) and `ls -la` (events 28-31). `TerminalRunTool` forwards the whole string as an executable name (`tools-builtin/src/lib.rs:386-405`), producing `ENOENT`; this is independent of, but compounds, the missing cwd.
+- Relative filesystem paths are passed directly to `std::fs`, so `.` is interpreted relative to the server process. The attempted reads of `/` and `.` then fail because `fs_read` is a file reader, not a directory-listing tool (events 35-41).
+- `SessionState.workspace_roots` is observable/persisted but absent from `TurnContext`, so the model is not told the working directory. `session/load` receives a current `cwd` and additional directories but ignores both, retaining potentially stale persisted roots.
+
+### Requirements
+- Every ACP session has an immutable, explicit **working directory** derived from the current `session/new.cwd` or `session/load.cwd`; additional directories remain available as ordered workspace roots.
+- The existing ordered `workspace_roots` remains the canonical state: index 0 is the working directory and the remainder are additional roots. Add focused access/update helpers rather than a duplicate cwd field that can drift.
+- Terminal and relative filesystem operations execute relative to that session's working directory. Absolute paths remain unchanged; relative paths may contain `..` and are not presented as a security sandbox.
+- `terminal_run.command` is a full shell command and supports flags, pipes, redirects, quoting, and command chaining. The low-level executable-plus-args capability may remain internal for compatibility, but the LLM-facing tool contract is unambiguous.
+- Never call process-global `std::env::set_current_dir`: concurrent ACP sessions may target different projects and must remain isolated and thread-safe.
+- The decision layer receives a concise provider-neutral environment description containing the working directory and additional roots. It is compiled once through the common compiler path, not reimplemented per provider/dialect.
+- Root chat agents, orchestrators, ordinary subagents, orchestrated workers, and `_session/inject` turns use the same session-scoped workspace context and local client.
+- `session/load` refreshes the execution context from the load request before replay/continuation and persists/publishes the refreshed roots.
+- Invalid or missing working directories fail with an actionable error containing the requested path; diagnostics include session id and cwd without leaking command output.
+
+### Key Decisions
+- **Captured per-session cwd, not global cwd.** `LocalClientAccess` owns an immutable `PathBuf` and applies it to each child process/path resolution. This is naturally `Send + Sync` and safe for the IDE's pooled, multi-session ACP runtime.
+- **One canonical ordered root list.** `SessionState.workspace_roots[0]` is the primary cwd. Helpers such as `set_workspace(cwd, additional)` and `working_directory()` make the invariant explicit while preserving the existing persisted/Inspector schema.
+- **Explicit shell seam.** Add a shell-command operation to `ClientAccess` (including streaming) and have `TerminalRunTool` use it. Local implementations select the platform shell and set cwd; the existing direct executable API remains available for internal callers and avoids heuristic string parsing.
+- **Compiler-owned environment context.** Add workspace roots to `TurnContext`; `DefaultCompiler` appends a stable, clearly delimited workspace block to the system instructions. This keeps service/tool behavior provider-independent and preserves prompt-cache reuse across rounds in one session.
+- **Relative paths resolve at the access boundary.** `LocalClientAccess` resolves relative read/write paths against its cwd so all built-in and offload callers share one policy; absolute paths pass through untouched.
+
+### Proposed Changes
+- **`agent-core/src/session.rs`** — add `SessionState::set_workspace`, `working_directory`, and workspace propagation into `TurnContext`; keep record serialization backward-compatible via the existing `workspace_roots` field.
+- **`agent-core/src/tool.rs` / `engine.rs`** — carry the ordered workspace context into `ToolContext` so nested tools/agents can inherit it without reaching into ACP-specific state.
+- **`agent-core/src/compiler.rs`** — compile a stable workspace section (primary cwd plus additional roots and relative-path semantics) into the common system request; add exact-output tests and preserve unchanged behavior when no roots exist.
+- **`agent-core/src/client.rs`** — define explicit shell execution/streaming methods while retaining direct executable-plus-args methods for compatibility and test fakes.
+- **`acp-agent/src/local_client.rs`** — store a validated session cwd, resolve relative fs paths, and set `current_dir` for both blocking and streaming process execution; implement shell command execution without process-global mutation.
+- **`cli-agent/src/local_client.rs`** — implement the same shell seam using the REPL's launch directory so the shared `terminal_run` contract does not vary by frontend.
+- **`tools-builtin/src/lib.rs`** — make the schema/documentation explicitly describe one shell command, route through the shell seam, and retain typed-history deserialization compatibility for legacy `args` payloads.
+- **`acp-agent/src/agent.rs`** — use `set_workspace` in both `session/new` and `session/load`; construct every prompt/inject `LocalClientAccess` from the session's primary cwd; ensure orchestrate mode receives the same access object.
+- **`subagents/src/lib.rs` and `orchestrated/src/worker.rs`** — copy workspace roots from `ToolContext` into nested `SessionState` so each nested LLM sees the same environment while reusing the captured local client.
+- **Inspector/docs** — label the first root as working directory in session state and include cwd in structured terminal tracing; document shell semantics, relative paths, multi-root behavior, load refresh, and lack of sandboxing.
+
+### Architecture
+```mermaid
+graph TD
+    ACP[ACP new/load cwd] --> State[SessionState workspace_roots]
+    State --> Context[TurnContext + ToolContext]
+    Context --> Compiler[DefaultCompiler workspace block]
+    Compiler --> LLM[Provider dialect]
+    State --> Access[Session LocalClientAccess]
+    Access -->|resolve relative path| FS[Local filesystem]
+    Access -->|shell + current_dir| Process[Child process]
+    Context --> Child[Subagent session]
+```
+
+### Validation
+- Unit-test root ordering, `working_directory()` behavior, empty/legacy records, and `session/load` replacement of stale persisted roots.
+- Test relative read/write and shell commands (`pwd`, `ls -la`, pipelines/redirection) from a temporary cwd while the test process remains in a different directory; assert the process-global cwd never changes.
+- Test absolute paths remain absolute and invalid cwd errors identify the failing path.
+- Run two sessions concurrently with different temporary roots and identically named files; assert terminal/fs output never crosses sessions.
+- Add a bundle-derived ACP integration test: create a session with a temporary project, replay `terminal_run { command: "find . ... | head" }`, and assert successful output from that project reaches typed tool history/the next model round instead of `ENOENT`.
+- Cover chat, `_session/inject`, orchestrate mode, ordinary subagents, and orchestrated workers to prove the same root reaches both their local tools and compiled request context.
+- Run workspace tests, strict Clippy, formatting, and diff checks.
+
 # Delivery Steps
 
 ### ✓ Step 1: Scaffold workspace and core abstractions
@@ -673,3 +876,133 @@ Selecting `orchestrate` (or calling the tool) actually runs the orchestration pi
 - Optionally register `OrchestrateTool` into the base chat registry (behind a config flag) so the chat agent can launch orchestration itself.
 - In `cli-agent`, add a `/orchestrate <goal>` REPL command (and/or mode toggle) that calls `run_pipeline` with the `LocalClientAccess`-backed tools and `TerminalUpdateSink`.
 - Add an `acp-agent` end-to-end test (replay backends) asserting an `orchestrate`-mode prompt streams sub-agent progress and returns a stop reason; verify `session/cancel` cancels an in-flight orchestrated prompt; update `docs/design/orchestrated-execution.md` to document the runtime integration and the single-implicit-step limitation.
+
+### ✓ Step 16: Deep debug view — responses, usage, per-agent output, session state
+Extend the LLM inspector so it shows, per session and per agent, not just requests but the model's responses, token usage/reuse, agent logs, and the live session state.
+
+- `agent-core`: add a hierarchical `AgentPath` identity carried by `TurnEngine` (`with_agent_path`), included in a new `TurnResponseObservation` and in `TurnObservation`; extend `TurnObserver` with a default `on_turn_response`; the engine accumulates each round's assistant text, thinking, tool calls, `TokenUsage`, stop reason, and duration and notifies the observer.
+- Propagate the observer and `AgentPath` through `ToolContext` so nested engines (`subagents::SubagentTool`, `orchestrated` worker/`run_pipeline`) attach the same inspector and a child agent path, reusing the parent session id so every agent of a session is captured and viewable separately.
+- `llm-inspector`: add `Response` and `Log` captured-payload kinds; implement `on_turn_response`; add a `tracing` `Layer` that forwards agent log events to the inspector; render responses (with usage/token-reuse), logs, a per-agent grouping tree, and a per-session state/usage summary in the web UI.
+- Wire the tracing layer into `acp-agent` startup; add tests (response capture, usage aggregation, per-agent path grouping, log capture) and update `docs/design/llm-inspector.md`.
+
+### ✓ Step 17: Hierarchical execution trace and inspector UX
+Replace the inspector's flat record grouping with an explicit, reliable execution hierarchy that remains understandable with many sub-agents and retries.
+
+- Investigate the supplied ACP debug bundle and correlate its turns, orchestrator rounds, tool calls, sub-agent attempts, responses, and failures with the current observer records; use the findings as regression scenarios.
+- Add provider-neutral trace identity and lifecycle events for `Session -> Prompt turn -> Agent run -> LLM round -> Tool call -> Child agent run`, including stable IDs, parent/tool-call links, monotonic ordering, status, timing, usage, and mode/step/attempt metadata.
+- Propagate trace context through root engines, ordinary subagents, orchestrated workers, provider request observation, tool dispatch, and tracing spans without inferring hierarchy from timestamps or display paths.
+- Build an append-only inspector event/read-model layer that correlates typed requests, provider bodies, responses, logs, tools, and state snapshots while preserving existing JSONL/debug compatibility and marking interrupted work explicitly.
+- Rework the web UI into session navigation, an execution tree, and contextual details (summary/conversation/request/provider/response/tools/logs/raw/session state), with live active/error states and compact duration/token/cache information.
+- Add deterministic tests for nested agents, repeated attempts, correlation and ordering, incomplete lifecycles, filtering, and UI/API serialization; run all affected and workspace tests/clippy and update `docs/design/llm-inspector.md`.
+
+### ✓ Step 18: Preserve orchestrated context across ACP prompt turns
+An ACP session in `orchestrate` mode continues the same orchestrator conversation and shared step context across successive user prompts instead of creating an isolated pipeline for every prompt.
+
+- Investigate the supplied ACP debug bundle and add a deterministic regression test proving that the second prompt sees the first prompt's orchestrator history and `OrchestratedStepContext` results.
+- Introduce a per-session orchestration runtime that owns the persistent orchestrator `SessionState` and shared `OrchestratedStepContext`, while keeping cancellation and per-prompt tracing boundaries correct.
+- Reuse the runtime from the ACP orchestrate-mode branch; define safe behavior for mode switches, session load, and tool-registry/backend configuration without holding locks across awaited work.
+- Run affected and workspace tests/clippy and document orchestration continuity in `docs/design/orchestrated-execution.md`.
+
+### ✓ Step 19: Fix remaining orchestration continuity regression
+The real ACP multi-turn scenario from the latest debug bundle preserves and reuses orchestration context exactly as observed by the model and inspector.
+
+- Correlate the latest ACP transport, engine transcript, client state, and inspector records to identify where continuity is still lost.
+- Add a deterministic regression test matching the real mode/prompt lifecycle and verify it fails before the fix.
+- Apply the minimal lifecycle/state fix without holding locks across unrelated awaits or regressing cancellation and mode switching.
+- Run affected and workspace tests/clippy and update the orchestration design notes if runtime semantics change.
+
+### ✓ Step 20: Render each sub-agent result as one ACP message
+Results from ordinary and orchestrated sub-agents are visible to the user as one accumulated assistant message per completed sub-agent run instead of only as tool-call output.
+
+- Add a provider-neutral tool output presentation contract so tools can request accumulated assistant-message rendering without core name checks.
+- Opt the ordinary `subagent` and orchestrated `run_subagent` tools into accumulated message rendering while retaining typed tool call/result history for the decision layer.
+- Add deterministic engine and ACP orchestration tests proving chunks are combined into one user-visible message per sub-agent result, then run affected and workspace validation.
+
+### ✓ Step 21: Make Anthropic thinking compatible with the selected model
+The default Haiku ACP session must start successfully while supported Sonnet/Opus models retain extended thinking.
+
+- Encode thinking capability in Anthropic model metadata and derive the request mode from it instead of assuming adaptive thinking for every model.
+- Add regression tests for Haiku and adaptive-capable models, including explicit disablement and legacy thinking behavior.
+- Run affected and workspace tests/clippy and document the model-aware behavior.
+
+### ✓ Step 22: Reliably show the inspector URL in the first ACP message
+Every ACP session must expose a working inspector URL in its first user-visible agent message, including when the IDE runs a pool of agent processes.
+
+- Reproduce the first-message behavior at the ACP protocol boundary and distinguish content chunks from user-visible messages.
+- Remove inspector startup/address races that can leave a session without a URL, while keeping the URL bound to the correct process and session.
+- Add deterministic regression coverage for the first message and pooled-process startup, then run affected and workspace validation.
+
+### ✓ Step 23: Add canonical typed todo state to agent-core
+Each session owns a validated todo list with stable item IDs that survives persistence and is visible to tools and observers.
+
+- Define `TodoItemId`, `TodoItem`, and `TodoList` in `agent-core`, with validation for non-empty IDs/content, unique IDs, ordered items, and `pending`/`in_progress`/`completed` statuses.
+- Add the list to `SessionState`, `TurnContext`, `ToolContext`, `SessionRecord`, and `SessionStateSnapshot`; use backward-compatible defaults for records created before the field existed.
+- Add typed `KnownTool` argument variants for `update_todo_list` and `mark_todo_completed` so history/compiler round-trips do not fall back to untyped string matching.
+- Cover model validation, session/record round-trips, legacy-record loading, and snapshot serialization with focused tests.
+
+### ✓ Step 24: Implement todo actions and ACP plan projection
+The model can replace the todo list or complete one item, and every successful transition appears immediately as a full native ACP plan.
+
+- Implement/register `UpdateTodoListTool` and `MarkTodoCompletedTool` in `tools-builtin`, including strict schemas, friendly `Think` metadata, atomic full replacement, idempotent completion, and structured full-list results.
+- Add `ToolEvent::TodoListUpdated` handling to `TurnEngine`: apply the validated event to the exclusively borrowed `SessionState`, then emit one full `EngineOutput::Plan` while preserving ordinary typed tool-call/result history.
+- Reuse `AcpUpdateSink::map_plan`; on `session/load`, project a restored non-empty todo list so the editor immediately reconstructs plan progress.
+- Add replay/ACP regression tests for replace, clear, complete, idempotency, ordering/status mapping, unknown/duplicate failures with no mutation, and restored-plan rendering.
+
+### ✓ Step 25: Keep todo guidance and debug state aligned with reality
+The agent is explicitly reminded to reconcile its plan with actual progress, and developers can inspect that canonical state.
+
+- Revise `THOUGHT_NUDGE` to request a one-to-two-line progress/next-step message, verify the todo list against evidence, update it when stale, and call `submit_result` immediately when complete; retain first-round and configured five-round cadence behavior.
+- Extend `DEFAULT_SYSTEM_PROMPT` with disciplined todo maintenance for non-trivial work without adding provider-specific prompt logic or duplicating the list on every request.
+- Extend the LLM Inspector session-state API/UI to render todo IDs, content, and statuses from `SessionStateSnapshot`.
+- Add nudge cadence/content, Inspector state, and end-to-end replay tests; document the design in `docs/design/todo-planning.md` and run workspace tests, strict clippy, and formatting/diff validation.
+
+### ✓ Step 26: Introduce a per-session turn coordinator and generation-scoped ACP sink
+Each session has one authoritative active turn, and output from a retired generation cannot reach the ACP client.
+
+- Add `TurnCoordinator`/`TurnLease` with monotonic generation IDs, cancellation, a race-safe completion signal, bounded retirement waiting, and compare-and-clear completion.
+- Replace direct `CancellationToken`/`AtomicBool running` decisions in `SessionEntry` with coordinator queries while retaining exclusive `SessionState` mutation.
+- Wrap `AcpUpdateSink` so every message, thought, todo plan, tool update, and permission request is accepted only for the current lease.
+- Emit structured diagnostics for retirement and dropped stale output without recording sensitive payload text.
+- Add focused coordinator and sink tests covering late output, ignored cancellation, stale cleanup, and every output kind.
+
+### ✓ Step 27: Route prompt, cancellation, orchestration, and injection through one lifecycle
+New user prompts reliably create a new assistant-message boundary without breaking chat, orchestrate mode, or steering.
+
+- Acquire/retire turn leases in `session/prompt` before any turn-scoped output, including the deferred Inspector greeting and slash-command response.
+- Route `session/cancel` to the active lease and make `_session/inject` either steer the current generation or start a coordinated fresh generation.
+- Pass the same scoped sink/lease through chat and orchestration engines; ensure a stale task cannot clear a newer active turn.
+- Gate state publication and persistence by generation so late completion cannot overwrite a newer snapshot or `SessionRecord`.
+- Add mode/inject/cancel tests and retain current todo-to-ACP-plan and `session/load` behavior.
+
+### ✓ Step 28: Reproduce the ACP bundle race and document message-boundary guarantees
+The exact cancel-timeout/interleaved-prompt scenario no longer appends new output to the assistant block preceding the latest user message.
+
+- Add a controllable backend integration fixture matching bundle sequences 135–190: old turn streams, client cancellation times out, a new user prompt starts, and old code attempts late message/plan/tool output.
+- Assert all post-retirement old output is absent, the new turn completes normally, permission requests are not leaked, and only the newest state/record wins.
+- Validate ordinary sequential prompts, inspector-first-message behavior, todo `Plan` projection, orchestration, and session loading for regressions.
+- Update the ACP lifecycle/debug design documentation with protocol limitations, coordinator invariants, and Inspector diagnostics; run workspace tests, strict Clippy, formatting, and diff checks.
+
+### ✓ Step 29: Make workspace context canonical and visible to every agent
+Each root and nested agent receives the ACP session's current working directory and additional roots in a provider-neutral context.
+
+- Add explicit ordered-root helpers to `SessionState` and propagate `workspace_roots` through `TurnContext` and `ToolContext` without introducing a duplicate cwd field.
+- Extend `DefaultCompiler` with a stable workspace environment block describing the primary cwd, additional roots, and relative-path behavior.
+- Copy workspace roots into ordinary subagent and orchestrated-worker sessions so nested model requests see the same project context.
+- Add focused compiler/session/subagent tests, including empty and legacy state, exact root ordering, and prompt-cache-stable output.
+
+### ✓ Step 30: Execute filesystem and shell tools in an isolated session cwd
+Built-in local tools resolve relative paths and full shell commands against the correct ACP session directory without mutating process-global state.
+
+- Extend `ClientAccess` with explicit shell-command streaming and retain direct executable-plus-args operations as a low-level compatibility seam.
+- Give ACP `LocalClientAccess` an immutable validated cwd; resolve relative reads/writes against it and apply `current_dir` to blocking/streaming child processes.
+- Make `terminal_run` advertise and execute a full shell command, including flags, pipes, redirects, and chaining; keep typed legacy `args` history readable.
+- Implement the same shell seam for CLI local access so the shared built-in tool has one frontend-independent contract.
+- Add temporary-directory tests for relative/absolute paths, `pwd`, `ls -la`, pipelines, invalid cwd diagnostics, and two concurrent clients with isolated roots.
+
+### ✓ Step 31: Wire ACP new/load and all turn paths to the workspace-bound client
+Fresh, loaded, steered, and orchestrated ACP turns all operate in the cwd supplied by the client and expose it in diagnostics.
+
+- In `session/new`, establish ordered roots from `cwd` plus `additional_directories`; in `session/load`, refresh stale persisted roots from the current load request before publishing and persisting state.
+- Construct the per-turn `LocalClientAccess` from the session's primary cwd in both `session/prompt` and `_session/inject`, and reuse it through chat, orchestrate, MCP-triggered built-ins, and subagents.
+- Add a bundle-derived ACP regression that successfully runs `find . ... | head` in a temporary project, plus coverage for load-to-new-cwd, inject, orchestration, and nested agents.
+- Show cwd explicitly in Inspector session state/structured terminal logs, document workspace and shell semantics, and run workspace tests, strict Clippy, formatting, and diff validation.

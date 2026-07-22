@@ -7,6 +7,17 @@
 //! 5-minute cache **write** costs 1.25× the base input rate and a cache
 //! **read** (a reused/cached token) costs 0.1× the base input rate.
 
+/// Thinking-control dialect accepted by a Claude model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkingDialect {
+    /// `thinking: { type: "adaptive" }`, controlled by output effort.
+    Adaptive,
+    /// `thinking: { type: "enabled", budget_tokens: N }`.
+    Budget,
+    /// Thinking is disabled unless the caller explicitly overrides it.
+    Disabled,
+}
+
 /// Static specification for a single Claude model.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ModelSpec {
@@ -18,6 +29,10 @@ pub struct ModelSpec {
     pub description: &'static str,
     /// Maximum output tokens supported on the synchronous Messages API.
     pub max_output_tokens: u32,
+    /// Thinking-control dialect accepted by this model.
+    pub thinking_dialect: ThinkingDialect,
+    /// Whether the model accepts `output_config.effort`.
+    pub supports_effort: bool,
     /// Base input price per million tokens (USD).
     pub input_price_per_mtok: f64,
     /// Output price per million tokens (USD).
@@ -46,6 +61,8 @@ pub const MODELS: &[ModelSpec] = &[
         display_name: "Claude Sonnet 5",
         description: "Best combination of speed and intelligence",
         max_output_tokens: 128_000,
+        thinking_dialect: ThinkingDialect::Adaptive,
+        supports_effort: true,
         input_price_per_mtok: 3.0,
         output_price_per_mtok: 15.0,
     },
@@ -54,6 +71,8 @@ pub const MODELS: &[ModelSpec] = &[
         display_name: "Claude Opus 4.8",
         description: "For complex agentic coding and enterprise work",
         max_output_tokens: 128_000,
+        thinking_dialect: ThinkingDialect::Adaptive,
+        supports_effort: true,
         input_price_per_mtok: 5.0,
         output_price_per_mtok: 25.0,
     },
@@ -62,6 +81,8 @@ pub const MODELS: &[ModelSpec] = &[
         display_name: "Claude Haiku 4.5",
         description: "Fastest model with near-frontier intelligence",
         max_output_tokens: 64_000,
+        thinking_dialect: ThinkingDialect::Budget,
+        supports_effort: false,
         input_price_per_mtok: 1.0,
         output_price_per_mtok: 5.0,
     },
@@ -70,6 +91,8 @@ pub const MODELS: &[ModelSpec] = &[
         display_name: "Claude Fable 5",
         description: "Highest capability for long-running agents",
         max_output_tokens: 128_000,
+        thinking_dialect: ThinkingDialect::Adaptive,
+        supports_effort: true,
         input_price_per_mtok: 10.0,
         output_price_per_mtok: 50.0,
     },
@@ -102,6 +125,23 @@ pub fn default_max_output_tokens(model: &str) -> u32 {
         .unwrap_or(FALLBACK_MAX_OUTPUT_TOKENS)
 }
 
+/// The default thinking dialect for a model.
+///
+/// Unknown models default to disabled thinking rather than risking an invalid
+/// provider request with a control dialect they may not support.
+pub fn default_thinking_dialect(model: &str) -> ThinkingDialect {
+    model_spec(model)
+        .map(|m| m.thinking_dialect)
+        .unwrap_or(ThinkingDialect::Disabled)
+}
+
+/// Whether a model accepts the Anthropic `output_config.effort` field.
+///
+/// Unknown models conservatively omit the optional field.
+pub fn supports_effort(model: &str) -> bool {
+    model_spec(model).is_some_and(|m| m.supports_effort)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,6 +150,25 @@ mod tests {
     fn known_models_have_expected_budgets() {
         assert_eq!(default_max_output_tokens("claude-sonnet-5"), 128_000);
         assert_eq!(default_max_output_tokens("claude-haiku-4-5"), 64_000);
+    }
+
+    #[test]
+    fn known_models_expose_their_thinking_dialect() {
+        assert_eq!(
+            default_thinking_dialect("claude-sonnet-5"),
+            ThinkingDialect::Adaptive
+        );
+        assert_eq!(
+            default_thinking_dialect("claude-haiku-4-5"),
+            ThinkingDialect::Budget
+        );
+        assert_eq!(
+            default_thinking_dialect("unknown-model"),
+            ThinkingDialect::Disabled
+        );
+        assert!(supports_effort("claude-sonnet-5"));
+        assert!(!supports_effort("claude-haiku-4-5"));
+        assert!(!supports_effort("unknown-model"));
     }
 
     #[test]

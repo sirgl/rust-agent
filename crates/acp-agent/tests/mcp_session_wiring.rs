@@ -14,8 +14,10 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Client, on_receive_notification};
-use agent_core::{NextTurnService, StopReason as CoreStopReason, ToolCallId, ToolRegistry, TurnEvent};
+use agent_client_protocol::{on_receive_notification, Client};
+use agent_core::{
+    NextTurnService, StopReason as CoreStopReason, ToolCallId, ToolRegistry, TurnEvent,
+};
 use serde_json::json;
 
 use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
@@ -83,6 +85,8 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
             ..AgentConfig::default()
         },
         store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     }
 }
 
@@ -137,12 +141,10 @@ async fn mcp_stdio_server_from_session_new_is_callable_in_prompt_turn() {
             // This is the ACP-native path: the client declares the MCP server
             // it wants for this session directly in `session/new`, exactly as
             // a real editor would.
-            let new_session = cx
-                .send_request(
-                    NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Stdio(
-                        McpServerStdio::new("mockserver", server_path_for_request),
-                    )]),
-                )
+            let new_session =
+                cx.send_request(NewSessionRequest::new("/tmp").mcp_servers(vec![
+                    McpServer::Stdio(McpServerStdio::new("mockserver", server_path_for_request)),
+                ]))
                 .block_task()
                 .await?;
 
@@ -192,35 +194,34 @@ async fn unknown_mcp_transport_is_skipped_without_failing_session_new() {
     ]]);
     let agent = build_agent(deps);
 
-    let stop = Client
-        .builder()
-        .name("test-client")
-        .connect_with(agent, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            let new_session = cx
-                .send_request(
-                    NewSessionRequest::new("/tmp").mcp_servers(vec![McpServer::Http(
-                        agent_client_protocol::schema::v1::McpServerHttp::new(
+    let stop =
+        Client
+            .builder()
+            .name("test-client")
+            .connect_with(agent, async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new_session = cx
+                    .send_request(NewSessionRequest::new("/tmp").mcp_servers(vec![
+                        McpServer::Http(agent_client_protocol::schema::v1::McpServerHttp::new(
                             "unsupported-http",
                             "https://example.invalid/mcp",
-                        ),
-                    )]),
-                )
-                .block_task()
-                .await?;
-            let response = cx
-                .send_request(PromptRequest::new(
-                    new_session.session_id,
-                    vec![ContentBlock::from("hi")],
-                ))
-                .block_task()
-                .await?;
-            Ok(response.stop_reason)
-        })
-        .await
-        .expect("connection completed");
+                        )),
+                    ]))
+                    .block_task()
+                    .await?;
+                let response = cx
+                    .send_request(PromptRequest::new(
+                        new_session.session_id,
+                        vec![ContentBlock::from("hi")],
+                    ))
+                    .block_task()
+                    .await?;
+                Ok(response.stop_reason)
+            })
+            .await
+            .expect("connection completed");
 
     assert_eq!(stop, StopReason::EndTurn);
 }

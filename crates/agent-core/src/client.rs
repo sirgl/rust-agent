@@ -73,10 +73,16 @@ pub enum TerminalChunk {
 /// client.
 #[async_trait]
 pub trait ClientAccess: Send + Sync {
-    /// Read the full text content of a file at `path` (absolute).
+    /// Read the full text content of a file at `path`.
+    ///
+    /// Local implementations resolve relative paths from their captured
+    /// session working directory; absolute paths remain unchanged.
     async fn read_text_file(&self, path: &str) -> Result<String>;
 
-    /// Write `content` to a file at `path` (absolute), creating or truncating it.
+    /// Write `content` to a file at `path`, creating or truncating it.
+    ///
+    /// Local implementations resolve relative paths from their captured
+    /// session working directory; absolute paths remain unchanged.
     async fn write_text_file(&self, path: &str, content: &str) -> Result<()>;
 
     /// Run a terminal command, waiting for it to exit, and return its outcome.
@@ -105,6 +111,22 @@ pub trait ClientAccess: Send + Sync {
         Ok(Box::pin(stream::iter(chunks)))
     }
 
+    /// Run a complete shell command, including quoting, pipes, redirects, and
+    /// command chaining, and wait for its outcome.
+    async fn run_shell_command(&self, command: &str) -> Result<TerminalOutcome> {
+        let (shell, args) = shell_invocation(command);
+        self.run_terminal(shell, &args).await
+    }
+
+    /// Run a complete shell command and stream output as it is produced.
+    async fn run_shell_command_streaming(
+        &self,
+        command: &str,
+    ) -> Result<BoxStream<'static, TerminalChunk>> {
+        let (shell, args) = shell_invocation(command);
+        self.run_terminal_streaming(shell, &args).await
+    }
+
     /// Request structured input from the user via a form.
     ///
     /// `message` is a human-readable description of what input is needed, and
@@ -124,4 +146,14 @@ pub trait ClientAccess: Send + Sync {
             "elicitation is not supported by this client".to_string(),
         ))
     }
+}
+
+#[cfg(unix)]
+fn shell_invocation(command: &str) -> (&'static str, Vec<String>) {
+    ("/bin/sh", vec!["-lc".to_string(), command.to_string()])
+}
+
+#[cfg(windows)]
+fn shell_invocation(command: &str) -> (&'static str, Vec<String>) {
+    ("cmd.exe", vec!["/C".to_string(), command.to_string()])
 }

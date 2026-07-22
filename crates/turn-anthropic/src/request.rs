@@ -53,12 +53,19 @@ impl std::str::FromStr for Effort {
 ///   by these models. On these models thinking text defaults to *omitted* (only
 ///   the `signature` is returned), so `display: "summarized"` is requested to
 ///   surface visible reasoning.
-/// - **Budget** (Opus 4.6 and earlier): the legacy `{type: "enabled",
-///   budget_tokens: N}` form.
+/// - **Budget** (Haiku 4.5 and earlier Claude 4 models): the legacy
+///   `{type: "enabled", budget_tokens: N}` form.
 ///
-/// The default is [`ThinkingConfig::Adaptive`] to match the default model.
+/// The default is [`ThinkingConfig::Auto`], resolved from model metadata when
+/// the request is built. This matters because ACP can change the selected model
+/// after the base configuration has been loaded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ThinkingConfig {
+    /// Select the provider dialect from the current model's metadata.
+    Auto {
+        /// Whether adaptive models should return visible summarized reasoning.
+        display_summarized: bool,
+    },
     /// Thinking turned off. Sent as `{type: "disabled"}` (the documented way to
     /// turn off adaptive thinking, which is on-by-default on newer models).
     Disabled,
@@ -95,8 +102,8 @@ pub struct AnthropicConfig {
     pub base_url: String,
     /// Value of the required `anthropic-version` header.
     pub anthropic_version: String,
-    /// Extended-thinking configuration (see [`ThinkingConfig`]). Defaults to
-    /// adaptive thinking with visible summarized reasoning.
+    /// Extended-thinking configuration (see [`ThinkingConfig`]). Defaults to a
+    /// model-aware mode with visible summarized reasoning where supported.
     pub thinking: ThinkingConfig,
     /// Whether to insert prompt-caching (`cache_control`) breakpoints to
     /// maximize reuse of the (usually stable) system prompt + tool definitions
@@ -140,7 +147,7 @@ impl AnthropicConfig {
             max_tokens: None,
             base_url: Self::DEFAULT_BASE_URL.to_string(),
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
-            thinking: ThinkingConfig::Adaptive {
+            thinking: ThinkingConfig::Auto {
                 display_summarized: true,
             },
             prompt_caching: true,
@@ -193,14 +200,14 @@ impl AnthropicConfig {
 
 /// Resolve an extended-thinking override from the environment.
 ///
-/// Returns `None` when no thinking env var is set (keep the config default,
-/// which is adaptive thinking on), otherwise the requested [`ThinkingConfig`].
+/// Returns `None` when no thinking env var is set (keep the model-aware config
+/// default), otherwise the requested [`ThinkingConfig`].
 ///
 /// - `ANTHROPIC_THINKING_BUDGET=<n>` (positive integer) selects the legacy
 ///   [`ThinkingConfig::Budget`] mode (only for older models that support it).
 /// - `ANTHROPIC_THINKING` accepts:
 ///   - a falsy value / `0` -> [`ThinkingConfig::Disabled`];
-///   - a truthy value -> [`ThinkingConfig::Adaptive`] with visible reasoning;
+///   - a truthy value -> [`ThinkingConfig::Auto`] with visible reasoning;
 ///   - a positive number -> legacy [`ThinkingConfig::Budget`].
 ///
 /// When both are present, `ANTHROPIC_THINKING` is applied last and wins.
@@ -227,7 +234,7 @@ fn thinking_override_from_env() -> Option<ThinkingConfig> {
                 ThinkingConfig::Disabled
             });
         } else if is_truthy(&flag) {
-            result = Some(ThinkingConfig::Adaptive {
+            result = Some(ThinkingConfig::Auto {
                 display_summarized: true,
             });
         } else {
@@ -381,12 +388,19 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
     }
 
     let mut body = Map::new();
+    let thinking = resolved_thinking(config);
     body.insert("model".into(), json!(config.model));
-    body.insert("max_tokens".into(), json!(effective_max_tokens(config)));
+    body.insert(
+        "max_tokens".into(),
+        json!(effective_max_tokens(config, &thinking)),
+    );
     body.insert("stream".into(), json!(true));
     body.insert("messages".into(), Value::Array(messages));
 
-    if let Some(effort) = config.effort {
+    if let Some(effort) = config
+        .effort
+        .filter(|_| crate::models::supports_effort(&config.model))
+    {
         body.insert("output_config".into(), json!({ "effort": effort }));
     }
 
@@ -394,7 +408,10 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
     // (surfaced end-to-end as thoughts, and preserved with their signature for
     // replay). Newer models (Sonnet 5 / Opus 4.7+) require the `adaptive` form
     // and reject `enabled`; older models use the legacy `budget_tokens` form.
-    match &config.thinking {
+    match &thinking {
+        ThinkingConfig::Auto { .. } => {
+            unreachable!("automatic thinking must be resolved before rendering")
+        }
         ThinkingConfig::Disabled => {
             body.insert("thinking".into(), json!({ "type": "disabled" }));
         }
@@ -461,22 +478,41 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
     Value::Object(body)
 }
 
+/// Resolve model-aware thinking against the model selected for this request.
+fn resolved_thinking(config: &AnthropicConfig) -> ThinkingConfig {
+    let ThinkingConfig::Auto { display_summarized } = &config.thinking else {
+        return config.thinking.clone();
+    };
+
+    match crate::models::default_thinking_dialect(&config.model) {
+        crate::models::ThinkingDialect::Adaptive => ThinkingConfig::Adaptive {
+            display_summarized: *display_summarized,
+        },
+        crate::models::ThinkingDialect::Budget => ThinkingConfig::Budget {
+            budget_tokens: AnthropicConfig::DEFAULT_THINKING_BUDGET,
+        },
+        crate::models::ThinkingDialect::Disabled => ThinkingConfig::Disabled,
+    }
+}
+
 /// The `max_tokens` actually sent. In legacy [`ThinkingConfig::Budget`] mode it
 /// is guaranteed to stay strictly greater than the thinking `budget_tokens` (an
 /// Anthropic API requirement); other modes send `max_tokens` unchanged.
-fn effective_max_tokens(config: &AnthropicConfig) -> u32 {
+fn effective_max_tokens(config: &AnthropicConfig, thinking: &ThinkingConfig) -> u32 {
     // Resolve the base budget: an explicit override, otherwise the per-model
     // default derived from the model catalog.
     let base = config
         .max_tokens
         .unwrap_or_else(|| crate::models::default_max_output_tokens(&config.model));
-    match &config.thinking {
+    match thinking {
         ThinkingConfig::Budget { budget_tokens } => {
             let budget = (*budget_tokens).max(AnthropicConfig::MIN_THINKING_BUDGET);
             // Leave room for the visible answer on top of the thinking budget.
             base.max(budget.saturating_add(4096))
         }
-        ThinkingConfig::Disabled | ThinkingConfig::Adaptive { .. } => base,
+        ThinkingConfig::Auto { .. }
+        | ThinkingConfig::Disabled
+        | ThinkingConfig::Adaptive { .. } => base,
     }
 }
 
@@ -540,11 +576,7 @@ fn system_text(msg: &LlmMessage) -> String {
     msg.content
         .iter()
         .filter_map(|b| serde_json::to_value(b).ok())
-        .filter_map(|v| {
-            v.get("text")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .filter_map(|v| v.get("text").and_then(Value::as_str).map(str::to_string))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -709,7 +741,7 @@ mod tests {
 
     #[test]
     fn builds_body_with_effort() {
-        let mut cfg = cfg();
+        let mut cfg = AnthropicConfig::new("sk-test", "claude-sonnet-5");
         cfg.effort = Some(Effort::High);
         let req = DefaultCompiler
             .compile(&SessionState::new("s1").turn_context())
@@ -785,9 +817,40 @@ mod tests {
             .compile(&SessionState::new("s1").turn_context())
             .unwrap();
         // The default config enables adaptive thinking with visible reasoning.
-        let body = build_body(&req, &cfg());
+        let config = AnthropicConfig::new("sk-test", "claude-sonnet-5");
+        let body = build_body(&req, &config);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
+    }
+
+    #[test]
+    fn haiku_uses_budget_thinking_by_default() {
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        // ACP loads a base config first and applies the session's selected model
+        // later, so resolution must use the current model at request time.
+        let mut cfg = AnthropicConfig::new("sk-test", "claude-sonnet-5");
+        cfg.model = "claude-haiku-4-5".into();
+        let body = build_body(&req, &cfg);
+
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(
+            body["thinking"]["budget_tokens"],
+            AnthropicConfig::DEFAULT_THINKING_BUDGET
+        );
+    }
+
+    #[test]
+    fn haiku_omits_unsupported_effort() {
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let mut cfg = AnthropicConfig::new("sk-test", "claude-haiku-4-5");
+        cfg.effort = Some(Effort::High);
+        let body = build_body(&req, &cfg);
+
+        assert!(body.get("output_config").is_none());
     }
 
     #[test]

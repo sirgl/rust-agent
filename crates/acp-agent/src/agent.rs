@@ -27,7 +27,6 @@
 //! the whole session.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_client_protocol::schema::v1::{
@@ -42,24 +41,25 @@ use agent_client_protocol::schema::v1::{
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
-    Agent, Client, ConnectTo, JsonRpcRequest, JsonRpcResponse, MetaCapability, MetaCapabilityExt,
-    on_receive_notification, on_receive_request,
+    on_receive_notification, on_receive_request, Agent, Client, ConnectTo, JsonRpcRequest,
+    JsonRpcResponse,
 };
 use agent_core::{
-    CancellationToken, HistoryEntry, InMemorySessionStore, NextTurnService, SessionRecord,
-    SessionState, SessionStore, StopReason, ToolDescriptor, ToolRegistry, TurnEngine, TurnInbox,
+    EngineOutput, HistoryEntry, InMemorySessionStore, NextTurnService, SessionRecord, SessionState,
+    SessionStore, StopReason, ToolDescriptor, ToolRegistry, TurnEngine, TurnInbox, UpdateSink,
 };
-use serde::{Deserialize, Serialize};
 use mcp_client::stdio::StdioMcpConnection;
 use mcp_client::{register_mcp_tools, McpConnection};
+use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
+use crate::commands::{parse_command, run_command};
 use crate::config::AgentConfig;
 use crate::local_client::LocalClientAccess;
 use crate::selection::ModelSelection;
-use crate::sink::AcpUpdateSink;
-use crate::commands::{parse_command, run_command};
+use crate::sink::{AcpUpdateSink, GenerationScopedSink};
+use crate::turn_coordinator::TurnCoordinator;
 use crate::usage::USAGE_COMMAND;
 
 /// The mode id for the default plain-chat session mode.
@@ -110,6 +110,40 @@ pub struct AgentDeps {
     /// construction helpers; the binary swaps in a disk-backed store when a
     /// persistence directory is configured.
     pub store: Arc<dyn SessionStore>,
+    /// Optional provider-neutral observer attached to every turn engine so the
+    /// LLM inspector captures the typed request snapshot of every decision
+    /// round, for any backend. `None` disables typed capture.
+    pub turn_observer: Option<Arc<dyn agent_core::TurnObserver>>,
+    /// Optional base URL of the running LLM-inspector UI (e.g.
+    /// `http://127.0.0.1:7878`). When set, `session/new` greets each session
+    /// with a per-session inspector link as its first message. `None` disables
+    /// the greeting.
+    pub inspector_base_url: Option<String>,
+}
+
+impl AgentDeps {
+    /// Build dependencies with observability seams disabled (`turn_observer` and
+    /// `inspector_base_url` both `None`).
+    ///
+    /// A convenience for tests and callers that do not run the inspector, so
+    /// adding observability fields does not force every construction site to
+    /// mention them.
+    #[must_use]
+    pub fn new(
+        next_turn_factory: NextTurnFactory,
+        tools: ToolRegistry,
+        config: AgentConfig,
+        store: Arc<dyn SessionStore>,
+    ) -> Self {
+        Self {
+            next_turn_factory,
+            tools,
+            config,
+            store,
+            turn_observer: None,
+            inspector_base_url: None,
+        }
+    }
 }
 
 /// Build the default [`SessionStore`]: a non-durable [`InMemorySessionStore`].
@@ -132,25 +166,34 @@ async fn persist_record(store: &Arc<dyn SessionStore>, session_id: &str, record:
     }
 }
 
-/// Wire method name for the steering extension request.
+/// Publish a snapshot of the current session state to the observability seam
+/// (the LLM inspector), so the debug UI can show the live per-session state.
 ///
-/// ACP extension methods must start with `_`.
-const INJECT_METHOD: &str = "_session/inject";
-
-/// The `inject` meta capability advertised in `initialize`, signalling that
-/// this agent supports the custom [`INJECT_METHOD`] steering request.
-struct InjectCapability;
-
-impl MetaCapability for InjectCapability {
-    fn key(&self) -> &'static str {
-        "inject"
+/// A no-op when no observer is attached. Must be called whenever a session's
+/// persisted state changes (creation, after a turn, or on load).
+fn publish_session_state(
+    observer: &Option<Arc<dyn agent_core::TurnObserver>>,
+    state: &SessionState,
+    mode: Option<&str>,
+) {
+    if let Some(observer) = observer {
+        let mut snapshot = agent_core::SessionStateSnapshot::from_state(state);
+        if let Some(mode) = mode {
+            snapshot = snapshot.with_mode(mode);
+        }
+        observer.on_session_state(&snapshot);
     }
 }
 
-/// Parameters for the `_session/inject` steering request.
+/// Wire method name for the steering extension request.
+///
+/// ACP extension methods must start with `_`.
+const STEERING_METHOD: &str = "_session/steering";
+
+/// Parameters for the `_session/steering` request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
-#[request(method = "_session/inject", response = InjectResponse)]
-struct InjectRequest {
+#[request(method = "_session/steering", response = SteeringResponse)]
+struct SteeringRequest {
     /// The session to steer.
     #[serde(rename = "sessionId")]
     session_id: SessionId,
@@ -159,23 +202,26 @@ struct InjectRequest {
     prompt: Vec<ContentBlock>,
 }
 
-/// Response acknowledging a `_session/inject` steering request.
+/// Result of a `_session/steering` request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum SteeringOutcome {
+    Injected,
+    StartedNewTurn,
+}
+
+/// Response acknowledging a `_session/steering` request.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcResponse)]
-struct InjectResponse {
-    /// Whether the injected message was accepted into the session.
-    received: bool,
-    /// Whether the injection started a fresh prompt turn (because no turn was
-    /// running at the time), as opposed to steering an in-flight turn.
-    #[serde(rename = "startedNewTurn")]
-    started_new_turn: bool,
+struct SteeringResponse {
+    outcome: SteeringOutcome,
 }
 
 /// Per-session runtime state shared between handlers.
 struct SessionEntry {
     /// The typed session state, guarded for exclusive access during a turn.
     state: Arc<AsyncMutex<SessionState>>,
-    /// The cancellation token for the currently-running (or next) turn.
-    cancel: StdMutex<CancellationToken>,
+    /// Single source of truth for active-turn ownership and cancellation.
+    turns: Arc<TurnCoordinator>,
     /// This session's tool registry: the base tools plus any tools
     /// discovered from the session's `mcp_servers` at `session/new` time.
     tools: ToolRegistry,
@@ -184,11 +230,19 @@ struct SessionEntry {
     mode: StdMutex<SessionModeId>,
     /// Current model and effort selection for this session.
     selection: StdMutex<ModelSelection>,
-    /// Steering inbox: user messages injected via [`INJECT_METHOD`] and drained
+    /// Steering inbox: user messages injected via [`STEERING_METHOD`] and drained
     /// by the running turn between decision rounds.
     inbox: TurnInbox,
-    /// Whether a prompt turn is currently running for this session.
-    running: Arc<AtomicBool>,
+    /// A one-shot greeting (e.g. the per-session LLM-inspector link) to be
+    /// flushed as the first agent message *inside the first prompt turn*.
+    ///
+    /// Clients (notably JetBrains) render `session/update` notifications only
+    /// while a prompt turn is active, so a greeting sent during `session/new`
+    /// is dropped. Deferring it to the first turn makes it actually visible.
+    pending_welcome: StdMutex<Option<String>>,
+    /// Long-lived orchestrator history and step context, initialized lazily on
+    /// the first prompt in orchestrate mode and retained across mode switches.
+    orchestration: AsyncMutex<Option<orchestrated::PipelineSession>>,
 }
 
 /// Shared registry of active sessions, keyed by session id string.
@@ -217,6 +271,11 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
     let config_sessions = sessions.clone();
     let inject_sessions = sessions.clone();
     let inject_factory = deps.next_turn_factory.clone();
+    let prompt_observer = deps.turn_observer.clone();
+    let inject_observer = deps.turn_observer.clone();
+    let new_session_observer = deps.turn_observer.clone();
+    let load_session_observer = deps.turn_observer.clone();
+    let new_session_inspector_url = deps.inspector_base_url.clone();
     let new_store = deps.store.clone();
     let prompt_store = deps.store.clone();
     let inject_store = deps.store.clone();
@@ -252,9 +311,10 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                         init_config.name.clone(),
                         init_config.version.clone(),
                     ))
-                    // Advertise steering support so clients know they may call
-                    // the custom `_session/inject` method.
-                    .add_meta_capability(InjectCapability);
+                    .meta(serde_json::Map::from_iter([(
+                        "steering".to_string(),
+                        serde_json::json!({ "supported": true }),
+                    )]));
                 responder.respond(response)
             },
             on_receive_request!(),
@@ -274,14 +334,23 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
             async move |req: NewSessionRequest, responder, cx| {
                 let session_id = format!("session-{}", uuid_like());
 
+                if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
+                    warn!(session_id, cwd = %req.cwd.display(), %err, "session/new invalid cwd");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(err.to_string()),
+                    );
+                }
+
                 let mut tools = new_session_tools.clone();
                 connect_session_mcp_servers(&session_id, &req.mcp_servers, &mut tools).await;
 
                 let mut state = SessionState::new(session_id.clone());
-                state.workspace_roots = std::iter::once(req.cwd.clone())
-                    .chain(req.additional_directories.iter().cloned())
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .collect();
+                state.set_workspace(
+                    req.cwd.to_string_lossy().into_owned(),
+                    req.additional_directories
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                );
                 state.system_prompt = new_session_config.system_prompt.clone();
                 state.available_tools = tool_descriptors(&tools);
 
@@ -293,28 +362,50 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let record = state.to_record();
                 persist_record(&new_store, &session_id, &record).await;
 
+                // Publish the initial session state to the debug UI.
+                publish_session_state(&new_session_observer, &state, Some(initial_mode_id));
+
+                // Prepare the per-session LLM-inspector greeting (when the
+                // inspector is running) and defer it to the first prompt turn,
+                // where clients actually render `session/update` messages.
+                let pending_welcome = new_session_inspector_url
+                    .as_ref()
+                    .map(|base_url| inspector_welcome_text(base_url, &session_id));
+
                 let entry = Arc::new(SessionEntry {
                     state: Arc::new(AsyncMutex::new(state)),
-                    cancel: StdMutex::new(CancellationToken::new()),
+                    turns: TurnCoordinator::new(session_id.clone()),
                     tools,
                     mode: StdMutex::new(SessionModeId::new(initial_mode_id)),
                     selection: StdMutex::new(selection),
                     inbox: Arc::new(StdMutex::new(Vec::new())),
-                    running: Arc::new(AtomicBool::new(false)),
+                    pending_welcome: StdMutex::new(pending_welcome),
+                    orchestration: AsyncMutex::new(None),
                 });
                 new_sessions
                     .lock()
                     .expect("sessions mutex poisoned")
                     .insert(session_id.clone(), entry);
 
-                info!(session_id, initial_mode = initial_mode_id, "session/new");
+                info!(
+                    session_id,
+                    cwd = %req.cwd.display(),
+                    initial_mode = initial_mode_id,
+                    "session/new"
+                );
 
                 // Advertise the built-in slash commands this agent supports, so
                 // clients can surface them (e.g. `/usage`) and route them back as
                 // prompts.
-                if let Err(err) = cx.send_notification(available_commands_notification(&session_id)) {
+                if let Err(err) = cx.send_notification(available_commands_notification(&session_id))
+                {
                     warn!(session_id, %err, "failed to advertise available commands");
                 }
+
+                // The per-session LLM-inspector greeting is deferred to the
+                // first prompt turn (see `SessionEntry::pending_welcome`),
+                // because clients render `session/update` messages only while a
+                // turn is active.
                 responder.respond(
                     NewSessionResponse::new(SessionId::new(session_id))
                         .modes(session_mode_state(initial_mode_id))
@@ -358,35 +449,70 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 let available_tools = tool_descriptors(&tools);
                 let history = record.history.clone();
-                let state = SessionState::from_record(record, available_tools);
+                if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
+                    warn!(session_id, cwd = %req.cwd.display(), %err, "session/load invalid cwd");
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params().data(err.to_string()),
+                    );
+                }
+                let mut state = SessionState::from_record(record, available_tools);
+                state.set_workspace(
+                    req.cwd.to_string_lossy().into_owned(),
+                    req.additional_directories
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned()),
+                );
+                let restored_plan =
+                    (!state.todo_list.items.is_empty()).then(|| state.todo_list.to_plan_update());
+
+                // The current ACP request is authoritative for execution
+                // context; persist it before exposing the loaded session.
+                persist_record(&load_store, &session_id, &state.to_record()).await;
+
+                // Publish the rehydrated session state to the debug UI.
+                publish_session_state(&load_session_observer, &state, Some(CHAT_MODE_ID));
 
                 let selection = ModelSelection::for_config(&load_session_config);
                 let config_options = selection.config_options();
 
                 let entry = Arc::new(SessionEntry {
                     state: Arc::new(AsyncMutex::new(state)),
-                    cancel: StdMutex::new(CancellationToken::new()),
+                    turns: TurnCoordinator::new(session_id.clone()),
                     tools,
                     mode: StdMutex::new(SessionModeId::new(CHAT_MODE_ID)),
                     selection: StdMutex::new(selection),
                     inbox: Arc::new(StdMutex::new(Vec::new())),
-                    running: Arc::new(AtomicBool::new(false)),
+                    pending_welcome: StdMutex::new(None),
+                    orchestration: AsyncMutex::new(None),
                 });
                 load_sessions
                     .lock()
                     .expect("sessions mutex poisoned")
                     .insert(session_id.clone(), entry);
 
-                info!(session_id, entries = history.len(), "session/load");
+                info!(
+                    session_id,
+                    cwd = %req.cwd.display(),
+                    entries = history.len(),
+                    "session/load"
+                );
 
                 // Replay the stored conversation to the client in order, as
                 // `session/update` notifications. Unknown/ingested entries are
                 // skipped (best-effort) rather than failing the load.
                 let acp_session_id = SessionId::new(session_id.clone());
+                if let Some(plan) = restored_plan {
+                    let notification = SessionNotification::new(
+                        acp_session_id.clone(),
+                        SessionUpdate::Plan(crate::sink::map_plan(&plan)),
+                    );
+                    if let Err(err) = cx.send_notification(notification) {
+                        warn!(session_id, %err, "failed to restore todo plan");
+                    }
+                }
                 for entry in &history.entries {
                     if let Some(update) = history_entry_to_update(entry) {
-                        let notification =
-                            SessionNotification::new(acp_session_id.clone(), update);
+                        let notification = SessionNotification::new(acp_session_id.clone(), update);
                         if let Err(err) = cx.send_notification(notification) {
                             warn!(session_id, %err, "failed to replay history entry");
                         }
@@ -395,7 +521,8 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 // Re-advertise the built-in slash commands so the reloaded
                 // session exposes the same commands as a fresh one.
-                if let Err(err) = cx.send_notification(available_commands_notification(&session_id)) {
+                if let Err(err) = cx.send_notification(available_commands_notification(&session_id))
+                {
                     warn!(session_id, %err, "failed to advertise available commands");
                 }
 
@@ -421,42 +548,86 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 };
 
                 let user_text = prompt_text(&req.prompt);
+                // Establish output ownership before any turn-scoped greeting,
+                // command response, model output, or permission request.
+                let lease = entry.turns.begin_turn().await;
+                let cancel = lease.cancellation_token();
+                let selection = entry
+                    .selection
+                    .lock()
+                    .expect("selection mutex poisoned")
+                    .clone();
+                let working_directory = {
+                    entry
+                        .state
+                        .lock()
+                        .await
+                        .working_directory()
+                        .map(str::to_owned)
+                };
+                let Some(working_directory) = working_directory else {
+                    lease.finalize_if_current(|| async {}).await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("session {session_id} has no working directory")),
+                    );
+                };
+                let client = match LocalClientAccess::with_elicitation_and_cwd(
+                    cx.clone(),
+                    req.session_id.clone(),
+                    &working_directory,
+                ) {
+                    Ok(client) => Arc::new(client),
+                    Err(err) => {
+                        lease.finalize_if_current(|| async {}).await;
+                        warn!(session_id, cwd = working_directory, %err, "session/prompt invalid cwd");
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(err.to_string()),
+                        );
+                    }
+                };
+                let acp_sink = AcpUpdateSink::new(cx.clone(), req.session_id.clone())
+                    .with_yolo(selection.permission.is_yolo());
+                let mut sink = GenerationScopedSink::new(acp_sink, lease.clone());
+
+                // Flush any deferred one-shot greeting (e.g. the per-session
+                // LLM-inspector link) as the first agent message of this turn.
+                // Sent here, inside an active prompt turn, it is actually
+                // rendered by clients (unlike a `session/new`-time message).
+                let pending_welcome = {
+                    entry
+                        .pending_welcome
+                        .lock()
+                        .expect("welcome mutex poisoned")
+                        .take()
+                };
+                if let Some(welcome) = pending_welcome {
+                    if let Err(err) = sink.send(EngineOutput::MessageChunk(welcome)).await {
+                        warn!(session_id, %err, "failed to send inspector welcome message");
+                    }
+                }
 
                 // Intercept built-in slash commands (e.g. `/usage`): produce the
                 // command's display text as a plain agent message, without
                 // running a model turn.
                 if let Some(command) = parse_command(&user_text) {
-                    let model = entry
-                        .selection
-                        .lock()
-                        .expect("selection mutex poisoned")
-                        .model
-                        .clone();
+                    let model = selection.model.clone();
                     let summary = {
                         let guard = entry.state.lock().await;
                         run_command(command, &guard, &model)
                     };
-                    let notification = SessionNotification::new(
-                        req.session_id.clone(),
-                        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
-                            TextContent::new(summary),
-                        ))),
-                    );
-                    if let Err(err) = cx.send_notification(notification) {
+                    if let Err(err) = sink.send(EngineOutput::MessageChunk(summary)).await {
                         warn!(session_id, %err, "failed to send /usage summary");
                     }
+                    lease.finalize_if_current(|| async {}).await;
                     return responder.respond(PromptResponse::new(AcpStopReason::EndTurn));
                 }
 
-                // Fresh cancellation token for this turn; stored so session/cancel
-                // can reach both the decision stream and running tools.
-                let cancel = CancellationToken::new();
-                *entry.cancel.lock().expect("cancel mutex poisoned") = cancel.clone();
                 let factory = prompt_factory.clone();
                 let require_submit_result = prompt_require_submit_result;
                 let thought_interval = prompt_thought_interval;
+                let observer = prompt_observer.clone();
                 let tools = entry.tools.clone();
-                let acp_session_id = req.session_id.clone();
 
                 // Snapshot the session's current mode so we can branch the turn.
                 let orchestrate = {
@@ -464,28 +635,14 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     mode.0.as_ref() == ORCHESTRATE_MODE_ID
                 };
 
-                // Mark the session as running so concurrent `_session/inject`
-                // requests are steered into this turn instead of starting a new
-                // one. The chat path seeds the inbox with the prompt below.
-                entry.running.store(true, Ordering::SeqCst);
                 let inbox = entry.inbox.clone();
-                let running = entry.running.clone();
                 let store = prompt_store.clone();
 
                 // The turn must run off the event loop so the sink's blocking
                 // permission requests do not deadlock the connection.
                 cx.spawn({
-                    let cx = cx.clone();
-                    let selection = entry.selection.lock().expect("selection mutex poisoned").clone();
                     async move {
-                        let client = Arc::new(LocalClientAccess::with_elicitation(
-                            cx.clone(),
-                            acp_session_id.clone(),
-                        ));
-                        let mut sink = AcpUpdateSink::new(cx, acp_session_id)
-                            .with_yolo(selection.permission.is_yolo());
-
-                        let result = if orchestrate {
+                        let (result, record, final_state, final_mode) = if orchestrate {
                             // Orchestrate mode: the prompt text is the goal; run
                             // the shared orchestration pipeline, streaming through
                             // the same sink and sharing the turn's cancel token.
@@ -496,25 +653,52 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                             let sel_factory = factory.clone();
                             let backend_factory: orchestrated::BackendFactory =
                                 Arc::new(move || sel_factory(&sel));
-                            let backend = (backend_factory)();
-                            let resolver = orchestrated::uniform_resolver(backend_factory.clone());
-                            orchestrated::run_pipeline(
-                                &user_text,
-                                backend,
-                                resolver,
-                                tools,
-                                &mut sink,
-                                &cancel,
+                            let prior_state = entry.state.lock().await.clone();
+                            let mut runtime_guard = entry.orchestration.lock().await;
+                            if runtime_guard.is_none() {
+                                let backend = (backend_factory)();
+                                let resolver =
+                                    orchestrated::uniform_resolver(backend_factory.clone());
+                                let mut pipeline =
+                                    orchestrated::PipelineSession::new_observed_with_inbox(
+                                        &user_text,
+                                        backend,
+                                        resolver,
+                                        tools,
+                                        observer.clone(),
+                                        agent_core::AgentPath::root().child("orchestrator"),
+                                        Some(session_id.clone()),
+                                        inbox.clone(),
+                                        Some(client),
+                                    );
+                                pipeline.inherit_state(&prior_state);
+                                *runtime_guard = Some(pipeline);
+                            }
+                            let pipeline = runtime_guard
+                                .as_mut()
+                                .expect("orchestration runtime initialized");
+                            let result = pipeline.run_prompt(&user_text, &mut sink, &cancel).await;
+                            let orchestrated_state = pipeline.session().clone();
+                            drop(runtime_guard);
+                            {
+                                let mut shared_state = entry.state.lock().await;
+                                shared_state.workspace_roots =
+                                    orchestrated_state.workspace_roots.clone();
+                                shared_state.history = orchestrated_state.history.clone();
+                                shared_state.usage = orchestrated_state.usage;
+                                shared_state.todo_list = orchestrated_state.todo_list.clone();
+                            }
+                            (
+                                result,
+                                orchestrated_state.to_record(),
+                                orchestrated_state,
+                                ORCHESTRATE_MODE_ID,
                             )
-                            .await
                         } else {
                             // Chat mode: seed the turn's inbox with the user's
                             // prompt; the engine drains it (together with any later
                             // steering injections) each round.
-                            inbox
-                                .lock()
-                                .expect("inbox mutex poisoned")
-                                .push(user_text);
+                            inbox.lock().expect("inbox mutex poisoned").push(user_text);
                             let next_turn = factory(&selection);
                             let mut engine = TurnEngine::new(next_turn, tools)
                                 .with_client(client)
@@ -525,24 +709,22 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                             if thought_interval > 0 {
                                 engine = engine.with_thought_interval(thought_interval);
                             }
+                            if let Some(observer) = &observer {
+                                engine = engine.with_observer(observer.clone());
+                            }
                             let mut guard = entry.state.lock().await;
-                            let result =
-                                engine.run_prompt(&mut guard, &mut sink, &cancel).await;
-                            drop(guard);
-                            result
+                            let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
+                            let record = guard.to_record();
+                            let final_state = guard.clone();
+                            (result, record, final_state, CHAT_MODE_ID)
                         };
 
-                        // Snapshot the core state for best-effort persistence
-                        // after the turn (no lock held across the store `.await`).
-                        let record = {
-                            let guard = entry.state.lock().await;
-                            guard.to_record()
-                        };
-                        running.store(false, Ordering::SeqCst);
-
-                        // Persist the updated history + usage after the turn
-                        // (best-effort; failures are logged, not fatal).
-                        persist_record(&store, &session_id, &record).await;
+                        lease
+                            .finalize_if_current(|| async {
+                                publish_session_state(&observer, &final_state, Some(final_mode));
+                                persist_record(&store, &session_id, &record).await;
+                            })
+                            .await;
 
                         match result {
                             Ok(stop) => {
@@ -597,10 +779,10 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
             },
             on_receive_request!(),
         )
-        // _session/inject: steering — inject a user message into the running
+        // _session/steering: inject a user message into the running
         // turn, or start a fresh turn if none is running.
         .on_receive_request(
-            async move |req: InjectRequest, responder, cx| {
+            async move |req: SteeringRequest, responder, cx| {
                 let session_id = req.session_id.0.to_string();
                 let Some(entry) = inject_sessions
                     .lock()
@@ -608,7 +790,11 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     .get(&session_id)
                     .cloned()
                 else {
-                    warn!(session_id, method = INJECT_METHOD, "inject for unknown session");
+                    warn!(
+                        session_id,
+                        method = STEERING_METHOD,
+                        "steering for unknown session"
+                    );
                     return responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params()
                             .data(format!("unknown session: {session_id}")),
@@ -616,73 +802,166 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                 };
 
                 let text = prompt_text(&req.prompt);
-                entry
-                    .inbox
-                    .lock()
-                    .expect("inbox mutex poisoned")
-                    .push(text);
 
                 // If a turn is already running, the engine will drain the inbox
                 // on its next round: the message is steered into the current
                 // prompt turn.
-                if entry.running.load(Ordering::SeqCst) {
-                    info!(session_id, method = INJECT_METHOD, "steering: injected into running turn");
-                    return responder.respond(InjectResponse {
-                        received: true,
-                        started_new_turn: false,
+                if entry.turns.with_current_turn(|| {
+                    entry
+                        .inbox
+                        .lock()
+                        .expect("inbox mutex poisoned")
+                        .push(text.clone());
+                }) {
+                    info!(
+                        session_id,
+                        method = STEERING_METHOD,
+                        "steering: injected into running turn"
+                    );
+                    return responder.respond(SteeringResponse {
+                        outcome: SteeringOutcome::Injected,
                     });
                 }
 
                 // Otherwise the previous turn already stopped; start a fresh turn
                 // so the user perceives a new prompt turn beginning.
-                info!(session_id, method = INJECT_METHOD, "steering: starting new turn");
-                let cancel = CancellationToken::new();
-                *entry.cancel.lock().expect("cancel mutex poisoned") = cancel.clone();
-                entry.running.store(true, Ordering::SeqCst);
+                info!(
+                    session_id,
+                    method = STEERING_METHOD,
+                    "steering: starting new turn"
+                );
+                let lease = entry.turns.begin_turn().await;
+                let cancel = lease.cancellation_token();
+
+                let selection = entry
+                    .selection
+                    .lock()
+                    .expect("selection mutex poisoned")
+                    .clone();
+                let working_directory = {
+                    entry
+                        .state
+                        .lock()
+                        .await
+                        .working_directory()
+                        .map(str::to_owned)
+                };
+                let Some(working_directory) = working_directory else {
+                    lease.finalize_if_current(|| async {}).await;
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("session {session_id} has no working directory")),
+                    );
+                };
+                let client = match LocalClientAccess::with_elicitation_and_cwd(
+                    cx.clone(),
+                    req.session_id.clone(),
+                    &working_directory,
+                ) {
+                    Ok(client) => Arc::new(client),
+                    Err(err) => {
+                        lease.finalize_if_current(|| async {}).await;
+                        warn!(session_id, cwd = working_directory, %err, "_session/steering invalid cwd");
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(err.to_string()),
+                        );
+                    }
+                };
 
                 let factory = inject_factory.clone();
                 let require_submit_result = inject_require_submit_result;
                 let thought_interval = inject_thought_interval;
+                let observer = inject_observer.clone();
                 let tools = entry.tools.clone();
                 let inbox = entry.inbox.clone();
-                let running = entry.running.clone();
                 let acp_session_id = req.session_id.clone();
                 let turn_entry = entry.clone();
                 let store = inject_store.clone();
+                let orchestrate = {
+                    let mode = entry.mode.lock().expect("mode mutex poisoned");
+                    mode.0.as_ref() == ORCHESTRATE_MODE_ID
+                };
 
                 cx.spawn({
                     let cx = cx.clone();
-                    let selection =
-                        entry.selection.lock().expect("selection mutex poisoned").clone();
                     async move {
                         let next_turn = factory(&selection);
-                        let client = Arc::new(LocalClientAccess::with_elicitation(
-                            cx.clone(),
-                            acp_session_id.clone(),
-                        ));
-                        let mut engine = TurnEngine::new(next_turn, tools)
-                            .with_client(client)
-                            .with_inbox(inbox);
-                        if require_submit_result {
-                            engine = engine.require_terminal_tool();
-                        }
-                        if thought_interval > 0 {
-                            engine = engine.with_thought_interval(thought_interval);
-                        }
-                        let mut sink = AcpUpdateSink::new(cx, acp_session_id)
+                        let acp_sink = AcpUpdateSink::new(cx, acp_session_id)
                             .with_yolo(selection.permission.is_yolo());
+                        let mut sink = GenerationScopedSink::new(acp_sink, lease.clone());
 
-                        let mut guard = turn_entry.state.lock().await;
-                        let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
-                        // Snapshot core state under the guard, then drop before
-                        // the awaiting persist so no lock is held across `.await`.
-                        let record = guard.to_record();
-                        drop(guard);
-                        running.store(false, Ordering::SeqCst);
+                        let (result, record, final_state, final_mode) = if orchestrate {
+                            let sel = selection.clone();
+                            let sel_factory = factory.clone();
+                            let backend_factory: orchestrated::BackendFactory =
+                                Arc::new(move || sel_factory(&sel));
+                            let prior_state = turn_entry.state.lock().await.clone();
+                            let mut runtime_guard = turn_entry.orchestration.lock().await;
+                            if runtime_guard.is_none() {
+                                let resolver =
+                                    orchestrated::uniform_resolver(backend_factory.clone());
+                                let mut pipeline =
+                                    orchestrated::PipelineSession::new_observed_with_inbox(
+                                        &text,
+                                        next_turn,
+                                        resolver,
+                                        tools,
+                                        observer.clone(),
+                                        agent_core::AgentPath::root().child("orchestrator"),
+                                        Some(session_id.clone()),
+                                        inbox.clone(),
+                                        Some(client),
+                                    );
+                                pipeline.inherit_state(&prior_state);
+                                *runtime_guard = Some(pipeline);
+                            }
+                            let pipeline = runtime_guard
+                                .as_mut()
+                                .expect("orchestration runtime initialized");
+                            let result = pipeline.run_prompt(&text, &mut sink, &cancel).await;
+                            let orchestrated_state = pipeline.session().clone();
+                            drop(runtime_guard);
+                            {
+                                let mut shared_state = turn_entry.state.lock().await;
+                                shared_state.workspace_roots =
+                                    orchestrated_state.workspace_roots.clone();
+                                shared_state.history = orchestrated_state.history.clone();
+                                shared_state.usage = orchestrated_state.usage;
+                                shared_state.todo_list = orchestrated_state.todo_list.clone();
+                            }
+                            (
+                                result,
+                                orchestrated_state.to_record(),
+                                orchestrated_state,
+                                ORCHESTRATE_MODE_ID,
+                            )
+                        } else {
+                            inbox.lock().expect("inbox mutex poisoned").push(text);
+                            let mut engine = TurnEngine::new(next_turn, tools)
+                                .with_client(client)
+                                .with_inbox(inbox);
+                            if require_submit_result {
+                                engine = engine.require_terminal_tool();
+                            }
+                            if thought_interval > 0 {
+                                engine = engine.with_thought_interval(thought_interval);
+                            }
+                            if let Some(observer) = &observer {
+                                engine = engine.with_observer(observer.clone());
+                            }
+                            let mut guard = turn_entry.state.lock().await;
+                            let result = engine.run_prompt(&mut guard, &mut sink, &cancel).await;
+                            let record = guard.to_record();
+                            let final_state = guard.clone();
+                            (result, record, final_state, CHAT_MODE_ID)
+                        };
 
-                        // Persist the updated history + usage after the steering
-                        // turn (best-effort).
-                        persist_record(&store, &session_id, &record).await;
+                        lease
+                            .finalize_if_current(|| async {
+                                publish_session_state(&observer, &final_state, Some(final_mode));
+                                persist_record(&store, &session_id, &record).await;
+                            })
+                            .await;
 
                         if let Err(err) = result {
                             warn!(session_id, %err, "steering turn failed");
@@ -693,9 +972,8 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     }
                 })?;
 
-                responder.respond(InjectResponse {
-                    received: true,
-                    started_new_turn: true,
+                responder.respond(SteeringResponse {
+                    outcome: SteeringOutcome::StartedNewTurn,
                 })
             },
             on_receive_request!(),
@@ -711,11 +989,7 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
                     .cloned()
                 {
                     info!(session_id, "session/cancel");
-                    entry
-                        .cancel
-                        .lock()
-                        .expect("cancel mutex poisoned")
-                        .cancel();
+                    entry.turns.cancel_active();
                 } else {
                     warn!(session_id, "session/cancel for unknown session");
                 }
@@ -758,6 +1032,20 @@ pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
         )
 }
 
+/// Build the first-message text greeting a new session with its per-session
+/// LLM-inspector link.
+///
+/// The link carries a `?session=<id>` filter so the UI opens straight to this
+/// session's captured requests. `base_url` is the inspector's origin (e.g.
+/// `http://127.0.0.1:7878`).
+fn inspector_welcome_text(base_url: &str, session_id: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    format!(
+        "🔎 LLM Inspector for this session: {base}/?session={session_id}\n\
+         Live view of every request this session sends to the model (typed history + provider body).\n\n"
+    )
+}
+
 /// Build the `AvailableCommandsUpdate` notification advertising this agent's
 /// built-in slash commands (currently just `/usage`).
 ///
@@ -797,11 +1085,11 @@ fn history_entry_to_update(entry: &HistoryEntry) -> Option<SessionUpdate> {
         HistoryEntry::User(message) => Some(SessionUpdate::UserMessageChunk(ContentChunk::new(
             ContentBlock::Text(TextContent::new(blocks_text(&message.content))),
         ))),
-        HistoryEntry::Assistant(message) => Some(SessionUpdate::AgentMessageChunk(
-            ContentChunk::new(ContentBlock::Text(TextContent::new(blocks_text(
-                &message.content,
-            )))),
-        )),
+        HistoryEntry::Assistant(message) => {
+            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
+                ContentBlock::Text(TextContent::new(blocks_text(&message.content))),
+            )))
+        }
         HistoryEntry::ToolCall(record) => {
             let tool_call = ToolCall::new(record.id.0.clone(), record.tool.name().to_string())
                 .status(AcpToolCallStatus::Completed);

@@ -35,12 +35,32 @@ credential): it gives the user a proper form and returns typed data. When a \
 tool is not suitable, just ask in plain text (the user sees it live and can \
 reply mid-turn) or pose the question in your `submit_result` summary and hand \
 control back. Ask early and specifically rather than late and vaguely.\n\n\
+Nail down scope explicitly. Before committing to non-trivial work, state in \
+plain terms what you consider in scope and what you consider out of scope, and \
+get the user to confirm it. For every meaningful decision, propose a sensible \
+default and lay out a few reasonable alternatives with their trade-offs, so the \
+user can choose deliberately rather than rubber-stamp. The bigger the project, \
+the larger and vaguer the scope: for large or open-ended tasks, clarify a lot \
+\u{2014} do not be shy about asking many questions, in batches, until the scope, \
+constraints, and success criteria are genuinely clear. Actively point out \
+inconsistencies, gaps, and conflicting requirements instead of papering over \
+them.\n\n\
 Fix knowledge in documents. Record decisions, designs, assumptions, and \
 trade-offs in the appropriate files so the picture stays consistent and \
 nothing important lives only in the conversation.\n\n\
+For non-trivial work, create and maintain the canonical todo list with the \
+provided todo tools. Treat it as a live model of the work, not a promise made \
+once: revise it when evidence changes scope or sequencing, preserve stable item \
+IDs where the work is the same, and mark an item completed only after its \
+outcome has been verified. Keep the list aligned with actual progress; do not \
+claim completion merely because an action was attempted.\n\n\
 Be succinct, but full: communicate as briefly as possible while staying \
 complete. State every fact that matters and omit everything that does not. No \
 filler, no hedging, no restating the question back \u{2014} just the substance.\n\n\
+Your messages are rendered as Markdown, so use it to make answers clear: \
+headings, bold/italic, bullet and numbered lists, tables, links, and fenced \
+code blocks with a language tag for code. Keep formatting purposeful \u{2014} it \
+should aid readability, not add noise.\n\n\
 Ending a turn is an explicit act. Your plain text never ends the turn: control \
 returns to the user only when you call the `submit_result` tool with a concise \
 summary of what you did. So keep working \u{2014} think, call tools, make progress \
@@ -101,6 +121,34 @@ pub struct AgentConfig {
     /// `None` (the default), a non-durable
     /// [`InMemorySessionStore`](agent_core::InMemorySessionStore) is used.
     pub session_persistence_dir: Option<PathBuf>,
+    /// Whether to start the LLM-inspector HTTP server at process startup.
+    ///
+    /// When enabled (the default), the binary launches a small web UI that shows
+    /// the real requests sent to the LLM, grouped by session. Disable it with
+    /// `ACP_INSPECTOR=0`.
+    pub inspector_enabled: bool,
+    /// Address the inspector HTTP server binds to (see [`inspector_enabled`]).
+    ///
+    /// Defaults to `127.0.0.1:7878`; override via `ACP_INSPECTOR_ADDR`.
+    ///
+    /// [`inspector_enabled`]: AgentConfig::inspector_enabled
+    pub inspector_addr: String,
+    /// Directory under which the inspector writes per-session JSONL logs of
+    /// every captured LLM request (typed + provider).
+    ///
+    /// When `Some`, the inspector attaches a file recorder so requests are
+    /// durably logged to `<dir>/<session_id>.jsonl` in addition to the
+    /// in-memory UI buffer. Defaults to `<temp>/rust-acp-agent/llm-logs`;
+    /// override via `ACP_INSPECTOR_LOG_DIR`, or set it to `off`/empty to
+    /// disable file logging.
+    pub inspector_log_dir: Option<PathBuf>,
+}
+
+/// The default directory for the inspector's per-session JSONL request logs:
+/// `<system temp dir>/rust-acp-agent/llm-logs`.
+#[must_use]
+pub fn default_inspector_log_dir() -> PathBuf {
+    std::env::temp_dir().join("rust-acp-agent").join("llm-logs")
 }
 
 impl Default for AgentConfig {
@@ -114,10 +162,13 @@ impl Default for AgentConfig {
             mcp_servers: Vec::new(),
             enable_orchestrated: false,
             enable_orchestrate_tool: false,
-            default_model: "claude-sonnet-5".to_string(),
+            default_model: "claude-haiku-4-5".to_string(),
             require_submit_result: true,
             thought_interval: 5,
             session_persistence_dir: None,
+            inspector_enabled: true,
+            inspector_addr: "127.0.0.1:7878".to_string(),
+            inspector_log_dir: Some(default_inspector_log_dir()),
         }
     }
 }
@@ -172,6 +223,23 @@ impl AgentConfig {
                 config.session_persistence_dir = Some(PathBuf::from(dir));
             }
         }
+        if let Ok(v) = std::env::var("ACP_INSPECTOR") {
+            config.inspector_enabled = !matches!(v.trim(), "0" | "false" | "no" | "off");
+        }
+        if let Ok(addr) = std::env::var("ACP_INSPECTOR_ADDR") {
+            if !addr.trim().is_empty() {
+                config.inspector_addr = addr.trim().to_string();
+            }
+        }
+        if let Ok(dir) = std::env::var("ACP_INSPECTOR_LOG_DIR") {
+            let trimmed = dir.trim();
+            config.inspector_log_dir =
+                if trimmed.is_empty() || matches!(trimmed, "0" | "off" | "no" | "false") {
+                    None
+                } else {
+                    Some(PathBuf::from(trimmed))
+                };
+        }
         config
     }
 }
@@ -192,12 +260,16 @@ mod tests {
     fn default_seeds_system_prompt() {
         let config = AgentConfig::default();
         assert_eq!(config.system_prompt.as_deref(), Some(DEFAULT_SYSTEM_PROMPT));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("canonical todo list"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("revise it when evidence changes"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("completed only after"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("verified"));
     }
 
     #[test]
-    fn default_model_is_sonnet() {
+    fn default_model_is_haiku() {
         let config = AgentConfig::default();
-        assert_eq!(config.default_model, "claude-sonnet-5");
+        assert_eq!(config.default_model, "claude-haiku-4-5");
     }
 
     #[test]

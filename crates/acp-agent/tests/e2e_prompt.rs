@@ -12,19 +12,117 @@ use std::sync::{Arc, Mutex};
 use agent_client_protocol::schema::v1::{
     ContentBlock, InitializeRequest, NewSessionRequest, PermissionOptionId, PromptRequest,
     RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, ToolCallStatus,
+    SelectedPermissionOutcome, SessionConfigId, SessionConfigValueId, SessionNotification,
+    SessionUpdate, SetSessionConfigOptionRequest, StopReason, ToolCallStatus,
 };
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Client, on_receive_notification, on_receive_request};
+use agent_client_protocol::{on_receive_notification, on_receive_request, Client};
 use agent_core::{
     NextTurnService, Result as CoreResult, StopReason as CoreStopReason, Tool, ToolContext,
-    ToolEvent, ToolRegistry, TurnEvent,
+    ToolEvent, ToolRegistry, TurnContext, TurnEvent,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use serde_json::json;
 
 use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
+
+#[derive(Default)]
+struct WorkspaceToolBackend {
+    contexts: Mutex<Vec<TurnContext>>,
+}
+
+#[async_trait]
+impl NextTurnService for WorkspaceToolBackend {
+    async fn get_next_turn_streaming(
+        &self,
+        ctx: &TurnContext,
+    ) -> CoreResult<BoxStream<'static, TurnEvent>> {
+        let round = {
+            let mut contexts = self.contexts.lock().unwrap();
+            contexts.push(ctx.clone());
+            contexts.len()
+        };
+        let events = if round == 1 {
+            vec![
+                TurnEvent::ToolCallRequested {
+                    id: agent_core::ToolCallId::new("find-project"),
+                    name: "terminal_run".to_string(),
+                    arguments: json!({
+                        "command": "find . -maxdepth 1 -type f | head -30"
+                    }),
+                },
+                TurnEvent::TurnFinished {
+                    stop_reason: CoreStopReason::ToolUse,
+                },
+            ]
+        } else {
+            vec![
+                TurnEvent::TextDelta("project inspected".to_string()),
+                TurnEvent::TurnFinished {
+                    stop_reason: CoreStopReason::EndTurn,
+                },
+            ]
+        };
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+#[tokio::test]
+async fn terminal_shell_command_runs_in_session_workspace_and_reaches_next_round() {
+    let root =
+        std::env::temp_dir().join(format!("rust-acp-bundle-workspace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("marker.txt"), "workspace marker").unwrap();
+
+    let backend = Arc::new(WorkspaceToolBackend::default());
+    let factory_backend = backend.clone();
+    let factory: NextTurnFactory = Arc::new(move |_selection| factory_backend.clone());
+    let deps = AgentDeps {
+        next_turn_factory: factory,
+        tools: tools_builtin::builtin_registry(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
+    };
+
+    let request_root = root.clone();
+    Client
+        .builder()
+        .name("workspace-tool-client")
+        .connect_with(build_agent(deps), async move |cx| {
+            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .block_task()
+                .await?;
+            let session = cx
+                .send_request(NewSessionRequest::new(request_root))
+                .block_task()
+                .await?;
+            cx.send_request(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("inspect this project")],
+            ))
+            .block_task()
+            .await?;
+            Ok(())
+        })
+        .await
+        .expect("connection completed");
+
+    let contexts = backend.contexts.lock().unwrap();
+    assert_eq!(contexts.len(), 2);
+    assert_eq!(contexts[0].workspace_roots, vec![root.to_string_lossy()]);
+    let second_history = serde_json::to_string(&contexts[1].history).unwrap();
+    assert!(
+        second_history.contains("marker.txt"),
+        "terminal output must reach the next typed round: {second_history}"
+    );
+}
 
 /// Build [`AgentDeps`] whose decision layer replays the given scripted rounds.
 fn deps_with_script(script: Vec<Vec<TurnEvent>>, tools: ToolRegistry) -> AgentDeps {
@@ -44,6 +142,8 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>, tools: ToolRegistry) -> AgentDe
             ..AgentConfig::default()
         },
         store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     }
 }
 
@@ -77,6 +177,8 @@ async fn prompt_turn_persists_core_state_to_store() {
             ..AgentConfig::default()
         },
         store: store.clone(),
+        turn_observer: None,
+        inspector_base_url: None,
     };
     let agent = build_agent(deps);
 
@@ -297,6 +399,15 @@ async fn run_tool_turn(option_id: &'static str) -> (StopReason, Vec<SessionUpdat
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
                 .await?;
+            // Permission-flow tests explicitly opt into Normal because the
+            // product default is YOLO and therefore bypasses client prompts.
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                new_session.session_id.clone(),
+                SessionConfigId::new("permissions"),
+                SessionConfigValueId::new("normal"),
+            ))
+            .block_task()
+            .await?;
             let response = cx
                 .send_request(PromptRequest::new(
                     new_session.session_id,

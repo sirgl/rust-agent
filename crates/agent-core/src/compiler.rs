@@ -166,6 +166,34 @@ fn block_text(block: &crate::history::ContentBlock) -> &str {
     }
 }
 
+fn compile_system_prompt(ctx: &TurnContext) -> Option<String> {
+    let Some(working_directory) = ctx.workspace_roots.first() else {
+        return ctx.system_prompt.clone();
+    };
+
+    let mut workspace = String::from("<workspace_environment>\nWorking directory: ");
+    workspace.push_str(working_directory);
+    workspace.push('\n');
+    if ctx.workspace_roots.len() > 1 {
+        workspace.push_str("Additional workspace roots:\n");
+        for root in &ctx.workspace_roots[1..] {
+            workspace.push_str("- ");
+            workspace.push_str(root);
+            workspace.push('\n');
+        }
+    }
+    workspace.push_str(
+        "Relative filesystem paths and shell commands are resolved from the working directory.\n</workspace_environment>",
+    );
+
+    match &ctx.system_prompt {
+        Some(system_prompt) if !system_prompt.is_empty() => {
+            Some(format!("{system_prompt}\n\n{workspace}"))
+        }
+        _ => Some(workspace),
+    }
+}
+
 impl LlmCompiler for DefaultCompiler {
     fn compile(&self, ctx: &TurnContext) -> Result<LlmRequest> {
         let mut messages = Vec::with_capacity(ctx.history.len());
@@ -258,7 +286,7 @@ impl LlmCompiler for DefaultCompiler {
         }
 
         Ok(LlmRequest {
-            system: ctx.system_prompt.clone(),
+            system: compile_system_prompt(ctx),
             messages,
             tools: ctx
                 .available_tools
@@ -292,6 +320,32 @@ mod tests {
         assert_eq!(req.messages.len(), 2);
         assert_eq!(req.messages[0].role, LlmRole::User);
         assert_eq!(req.messages[1].role, LlmRole::Assistant);
+    }
+
+    #[test]
+    fn default_compiler_appends_stable_workspace_environment() {
+        let mut session = SessionState::new("s1");
+        session.system_prompt = Some("be helpful".into());
+        session.set_workspace("/workspace/project", ["/workspace/shared"]);
+
+        let req = DefaultCompiler.compile(&session.turn_context()).unwrap();
+
+        assert_eq!(
+            req.system.as_deref(),
+            Some(
+                "be helpful\n\n<workspace_environment>\nWorking directory: /workspace/project\nAdditional workspace roots:\n- /workspace/shared\nRelative filesystem paths and shell commands are resolved from the working directory.\n</workspace_environment>"
+            )
+        );
+    }
+
+    #[test]
+    fn default_compiler_leaves_system_prompt_unchanged_without_workspace() {
+        let mut session = SessionState::new("s1");
+        session.system_prompt = Some("be helpful".into());
+
+        let req = DefaultCompiler.compile(&session.turn_context()).unwrap();
+
+        assert_eq!(req.system.as_deref(), Some("be helpful"));
     }
 
     #[test]

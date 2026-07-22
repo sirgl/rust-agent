@@ -4,7 +4,9 @@
 
 use std::sync::Arc;
 
-use acp_agent::{register_configured_mcp_tools, AgentConfig, McpConnectionTrait, McpToolDescriptor};
+use acp_agent::{
+    register_configured_mcp_tools, AgentConfig, McpConnectionTrait, McpToolDescriptor,
+};
 use agent_core::{Result, ToolRegistry};
 use async_trait::async_trait;
 

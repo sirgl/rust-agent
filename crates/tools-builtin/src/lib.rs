@@ -15,6 +15,10 @@
 //!   **requires permission** (enforced by the engine before `Tool::call`).
 //! - [`TerminalRunTool`] (`terminal_run`) — run a shell command. Destructive, so
 //!   it **requires permission**.
+//! - [`UpdateTodoListTool`] (`update_todo_list`) — atomically replace the
+//!   session's canonical todo list.
+//! - [`MarkTodoCompletedTool`] (`mark_todo_completed`) — complete one item by
+//!   stable id without changing its order or content.
 //! - [`SubmitResultTool`] (`submit_result`) — end the current turn and hand
 //!   control back to the user. Non-destructive; recognized by the engine as the
 //!   terminal tool (see [`agent_core::TurnEngine::with_terminal_tool`]).
@@ -31,8 +35,9 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentError, ClientAccess, ElicitationOutcome, Result, TerminalChunk, Tool, ToolCallLocation,
-    ToolContext, ToolEvent, ToolKind, ToolRegistry,
+    AgentError, ClientAccess, ElicitationOutcome, MarkTodoCompletedToolCall, PlanStepStatus,
+    Result, TerminalChunk, Tool, ToolCallLocation, ToolContext, ToolEvent, ToolKind, ToolRegistry,
+    UpdateTodoListToolCall,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -46,6 +51,8 @@ pub fn register_builtin_tools(registry: &mut ToolRegistry) {
     registry.register(Arc::new(FsWriteTool));
     registry.register(Arc::new(TerminalRunTool));
     registry.register(Arc::new(ElicitationTool));
+    registry.register(Arc::new(UpdateTodoListTool));
+    registry.register(Arc::new(MarkTodoCompletedTool));
     registry.register(Arc::new(SubmitResultTool));
 }
 
@@ -64,6 +71,16 @@ pub fn builtin_registry() -> ToolRegistry {
 /// then replayed to the engine, which forwards status transitions to the sink.
 fn events(events: Vec<ToolEvent>) -> BoxStream<'static, ToolEvent> {
     Box::pin(stream::iter(events))
+}
+
+fn todo_updated_events(todo_list: agent_core::TodoList) -> Result<BoxStream<'static, ToolEvent>> {
+    let result = serde_json::to_value(&todo_list)
+        .map_err(|err| AgentError::Other(format!("failed to serialize todo list: {err}")))?;
+    Ok(events(vec![
+        ToolEvent::Started,
+        ToolEvent::TodoListUpdated(todo_list),
+        ToolEvent::Completed(result),
+    ]))
 }
 
 /// Deserialize tool arguments, mapping failures to a structured
@@ -138,7 +155,11 @@ impl Tool for SubmitResultTool {
             "properties": {
                 "summary": {
                     "type": "string",
-                    "description": "A concise, user-facing summary of what was done this turn."
+                    "description": "A concise, user-facing summary of what was done this turn. \
+        Keep in mind the user has already seen every plain-text message you streamed earlier this \
+        turn, so this summary should read as a smooth continuation of that text, not repeat it. \
+        If you already fully answered in plain text just before submitting, prefer an empty summary \
+        so no redundant closing message is shown."
                 }
             },
             "required": ["summary"]
@@ -329,12 +350,7 @@ impl Tool for TerminalRunTool {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The command to execute."
-                },
-                "args": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Optional command-line arguments."
+                    "description": "A complete shell command to execute. Supports flags, quoting, pipes, redirects, and command chaining. Relative paths resolve from the session working directory."
                 }
             },
             "required": ["command"]
@@ -373,7 +389,16 @@ impl Tool for TerminalRunTool {
         // Stream output incrementally: each chunk of stdout/stderr becomes an
         // `OutputDelta`, giving the client a "live log" as the command runs, and
         // the final `Finished` chunk maps to `Completed`/`Failed`.
-        let term_stream = match client.run_terminal_streaming(&args.command, &args.args).await {
+        let term_stream = match if args.args.is_empty() {
+            client.run_shell_command_streaming(&args.command).await
+        } else {
+            // Backward compatibility for typed history or callers using the
+            // legacy executable-plus-args payload. New schemas expose only the
+            // full shell-command form above.
+            client
+                .run_terminal_streaming(&args.command, &args.args)
+                .await
+        } {
             Ok(stream) => stream,
             Err(err) => {
                 return Ok(events(vec![
@@ -419,6 +444,128 @@ impl Tool for TerminalRunTool {
 /// Schema describing the form fields; the client renders it and returns the
 /// user's response.
 pub struct ElicitationTool;
+
+/// Replace the complete canonical todo list for the current session.
+pub struct UpdateTodoListTool;
+
+#[async_trait]
+impl Tool for UpdateTodoListTool {
+    fn name(&self) -> &str {
+        "update_todo_list"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "description": "The complete replacement todo list. Omitted prior items are removed; an empty array clears the list.",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "id": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Stable unique identifier chosen by the caller."
+                            },
+                            "content": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Non-empty description of the work item."
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["pending", "in_progress", "completed"]
+                            }
+                        },
+                        "required": ["id", "content", "status"]
+                    }
+                }
+            },
+            "required": ["items"]
+        })
+    }
+
+    fn requires_permission(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Think
+    }
+
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        let count = args.get("items")?.as_array()?.len();
+        Some(format!("Update todo list ({count} items)"))
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        _ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        let args: UpdateTodoListToolCall = parse_args(self.name(), args)?;
+        todo_updated_events(args.0)
+    }
+}
+
+/// Mark one canonical todo item completed by its stable identifier.
+pub struct MarkTodoCompletedTool;
+
+#[async_trait]
+impl Tool for MarkTodoCompletedTool {
+    fn name(&self) -> &str {
+        "mark_todo_completed"
+    }
+
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Stable identifier of the todo item to mark completed."
+                }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn requires_permission(&self) -> bool {
+        false
+    }
+
+    fn kind(&self) -> ToolKind {
+        ToolKind::Think
+    }
+
+    fn title(&self, args: &serde_json::Value) -> Option<String> {
+        Some(format!("Complete todo item {}", args.get("id")?.as_str()?))
+    }
+
+    async fn call(
+        &self,
+        args: serde_json::Value,
+        ctx: &ToolContext,
+    ) -> Result<BoxStream<'static, ToolEvent>> {
+        let args: MarkTodoCompletedToolCall = parse_args(self.name(), args)?;
+        let mut todo_list = ctx.todo_list.clone();
+        let Some(item) = todo_list.items.iter_mut().find(|item| item.id == args.id) else {
+            return Err(AgentError::InvalidArguments(format!(
+                "{}: unknown todo item id '{}'",
+                self.name(),
+                args.id
+            )));
+        };
+        item.status = PlanStepStatus::Completed;
+        todo_updated_events(todo_list)
+    }
+}
 
 #[async_trait]
 impl Tool for ElicitationTool {
@@ -611,7 +758,9 @@ mod tests {
         let ctx = ctx_with(client);
         let tool = FsWriteTool;
         // Missing required `content`.
-        let result = tool.call(serde_json::json!({ "path": "/tmp/x" }), &ctx).await;
+        let result = tool
+            .call(serde_json::json!({ "path": "/tmp/x" }), &ctx)
+            .await;
         assert!(matches!(
             result.err(),
             Some(AgentError::InvalidArguments(_))
@@ -622,7 +771,9 @@ mod tests {
     async fn missing_client_yields_error() {
         let ctx = ToolContext::new("sess-test", CancellationToken::new());
         let tool = FsReadTool;
-        let result = tool.call(serde_json::json!({ "path": "/tmp/a" }), &ctx).await;
+        let result = tool
+            .call(serde_json::json!({ "path": "/tmp/a" }), &ctx)
+            .await;
         assert!(matches!(result.err(), Some(AgentError::Other(_))));
     }
 
@@ -727,6 +878,111 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn update_todo_list_replaces_and_clears_the_full_list() {
+        let ctx = ToolContext::new("sess-test", CancellationToken::new());
+        let tool = UpdateTodoListTool;
+        let stream = tool
+            .call(
+                serde_json::json!({
+                    "items": [
+                        {"id": "b", "content": "Second", "status": "in_progress"},
+                        {"id": "a", "content": "First", "status": "pending"}
+                    ]
+                }),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let evts = collect(stream).await;
+        let ToolEvent::TodoListUpdated(list) = &evts[1] else {
+            panic!("expected todo update, got {:?}", evts[1]);
+        };
+        assert_eq!(list.items[0].id.as_str(), "b");
+        assert_eq!(list.items[1].id.as_str(), "a");
+        assert!(matches!(evts[2], ToolEvent::Completed(_)));
+
+        let cleared = collect(
+            tool.call(serde_json::json!({"items": []}), &ctx)
+                .await
+                .unwrap(),
+        )
+        .await;
+        let ToolEvent::TodoListUpdated(list) = &cleared[1] else {
+            panic!("expected todo update");
+        };
+        assert!(list.items.is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_todo_list_rejects_duplicate_or_empty_items() {
+        let ctx = ToolContext::new("sess-test", CancellationToken::new());
+        let tool = UpdateTodoListTool;
+        for invalid in [
+            serde_json::json!({
+                "items": [
+                    {"id": "a", "content": "One", "status": "pending"},
+                    {"id": "a", "content": "Two", "status": "pending"}
+                ]
+            }),
+            serde_json::json!({
+                "items": [{"id": "a", "content": " ", "status": "pending"}]
+            }),
+        ] {
+            assert!(matches!(
+                tool.call(invalid, &ctx).await,
+                Err(AgentError::InvalidArguments(_))
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_todo_completed_preserves_order_and_is_idempotent() {
+        let mut ctx = ToolContext::new("sess-test", CancellationToken::new());
+        ctx.todo_list = serde_json::from_value(serde_json::json!({
+            "items": [
+                {"id": "a", "content": "First", "status": "pending"},
+                {"id": "b", "content": "Second", "status": "in_progress"}
+            ]
+        }))
+        .unwrap();
+        let tool = MarkTodoCompletedTool;
+
+        for _ in 0..2 {
+            let evts = collect(
+                tool.call(serde_json::json!({"id": "b"}), &ctx)
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            let ToolEvent::TodoListUpdated(list) = &evts[1] else {
+                panic!("expected todo update");
+            };
+            assert_eq!(list.items[0].id.as_str(), "a");
+            assert_eq!(list.items[0].status, PlanStepStatus::Pending);
+            assert_eq!(list.items[1].id.as_str(), "b");
+            assert_eq!(list.items[1].content, "Second");
+            assert_eq!(list.items[1].status, PlanStepStatus::Completed);
+            ctx.todo_list = list.clone();
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_todo_completed_rejects_unknown_id_without_mutation() {
+        let mut ctx = ToolContext::new("sess-test", CancellationToken::new());
+        ctx.todo_list = serde_json::from_value(serde_json::json!({
+            "items": [{"id": "known", "content": "Known", "status": "pending"}]
+        }))
+        .unwrap();
+        let before = ctx.todo_list.clone();
+        let result = MarkTodoCompletedTool
+            .call(serde_json::json!({"id": "missing"}), &ctx)
+            .await;
+
+        assert!(matches!(result, Err(AgentError::InvalidArguments(_))));
+        assert_eq!(ctx.todo_list, before);
+    }
+
     #[test]
     fn registry_registers_all_builtins() {
         let registry = builtin_registry();
@@ -734,6 +990,8 @@ mod tests {
         assert!(registry.contains("fs_write"));
         assert!(registry.contains("terminal_run"));
         assert!(registry.contains("elicitation"));
+        assert!(registry.contains("update_todo_list"));
+        assert!(registry.contains("mark_todo_completed"));
         assert!(registry.contains("submit_result"));
     }
 
@@ -741,7 +999,10 @@ mod tests {
     fn tools_expose_rich_metadata() {
         let read_args = serde_json::json!({ "path": "/tmp/a.txt" });
         assert_eq!(FsReadTool.kind(), ToolKind::Read);
-        assert_eq!(FsReadTool.title(&read_args).as_deref(), Some("Read /tmp/a.txt"));
+        assert_eq!(
+            FsReadTool.title(&read_args).as_deref(),
+            Some("Read /tmp/a.txt")
+        );
         let read_locs = FsReadTool.locations(&read_args);
         assert_eq!(read_locs.len(), 1);
         assert_eq!(read_locs[0].path, "/tmp/a.txt");
@@ -756,8 +1017,29 @@ mod tests {
 
         let run_args = serde_json::json!({ "command": "ls", "args": ["-la"] });
         assert_eq!(TerminalRunTool.kind(), ToolKind::Execute);
-        assert_eq!(TerminalRunTool.title(&run_args).as_deref(), Some("Run ls -la"));
+        assert_eq!(
+            TerminalRunTool.title(&run_args).as_deref(),
+            Some("Run ls -la")
+        );
         assert!(TerminalRunTool.locations(&run_args).is_empty());
+
+        let todo_args = serde_json::json!({"items": []});
+        assert_eq!(UpdateTodoListTool.kind(), ToolKind::Think);
+        assert_eq!(
+            UpdateTodoListTool.title(&todo_args).as_deref(),
+            Some("Update todo list (0 items)")
+        );
+        assert_eq!(MarkTodoCompletedTool.kind(), ToolKind::Think);
+    }
+
+    #[test]
+    fn terminal_run_schema_exposes_one_full_shell_command() {
+        let schema = TerminalRunTool.schema();
+        assert!(schema["properties"].get("args").is_none());
+        assert!(schema["properties"]["command"]["description"]
+            .as_str()
+            .unwrap()
+            .contains("pipes"));
     }
 
     /// A fake client that streams several output chunks before finishing.

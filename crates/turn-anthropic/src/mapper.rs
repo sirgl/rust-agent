@@ -575,7 +575,9 @@ mod tests {
     #[test]
     fn error_event_maps_to_error() {
         let mut m = StreamMapper::new();
-        let out = m.push(&json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}));
+        let out = m.push(
+            &json!({"type":"error","error":{"type":"overloaded_error","message":"overloaded"}}),
+        );
         assert_eq!(out.len(), 1);
         match &out[0] {
             TurnEvent::Error(e) => assert_eq!(e.message, "overloaded"),

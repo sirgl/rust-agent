@@ -14,8 +14,8 @@ use turn_anthropic::AnthropicTurnService;
 #[tokio::test]
 #[ignore = "requires ANTHROPIC_API_KEY and network access"]
 async fn live_prompt_streams_text() {
-    let service = AnthropicTurnService::from_env()
-        .expect("ANTHROPIC_API_KEY must be set for the live test");
+    let service =
+        AnthropicTurnService::from_env().expect("ANTHROPIC_API_KEY must be set for the live test");
 
     let mut session = SessionState::new("live-session");
     session.system_prompt = Some("You are a terse assistant. Reply with a single word.".into());

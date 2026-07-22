@@ -12,6 +12,7 @@
 //! is inherently a client capability — so it is still routed to the connected
 //! ACP client via `elicitation/create` when a connection is available.
 
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use agent_client_protocol::schema::v1::{
@@ -40,6 +41,8 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// `elicitation` connection handle is present.
 #[derive(Clone)]
 pub struct LocalClientAccess {
+    /// Immutable working directory captured for this ACP session.
+    cwd: PathBuf,
     /// Optional ACP connection used only to serve elicitation requests.
     elicitation: Option<(ConnectionTo<Client>, SessionId)>,
 }
@@ -54,17 +57,66 @@ impl LocalClientAccess {
     /// Create a local client access handle with no elicitation support.
     #[must_use]
     pub fn new() -> Self {
-        Self { elicitation: None }
+        let cwd = std::env::current_dir().expect("process working directory must be available");
+        Self {
+            cwd,
+            elicitation: None,
+        }
+    }
+
+    /// Create a local client bound to an explicit, validated working directory.
+    pub fn with_cwd(cwd: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            cwd: validate_cwd(cwd.into())?,
+            elicitation: None,
+        })
     }
 
     /// Create a local client access handle that routes elicitation requests to
     /// the given ACP connection/session.
     #[must_use]
     pub fn with_elicitation(cx: ConnectionTo<Client>, session_id: SessionId) -> Self {
+        let cwd = std::env::current_dir().expect("process working directory must be available");
         Self {
+            cwd,
             elicitation: Some((cx, session_id)),
         }
     }
+
+    /// Create an elicitation-capable client bound to a validated session cwd.
+    pub fn with_elicitation_and_cwd(
+        cx: ConnectionTo<Client>,
+        session_id: SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            cwd: validate_cwd(cwd.into())?,
+            elicitation: Some((cx, session_id)),
+        })
+    }
+
+    fn resolve_path(&self, path: &str) -> PathBuf {
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.cwd.join(path)
+        }
+    }
+}
+
+fn validate_cwd(cwd: PathBuf) -> Result<PathBuf> {
+    let requested = cwd.display().to_string();
+    let metadata = std::fs::metadata(&cwd).map_err(|err| {
+        AgentError::Other(format!("invalid working directory `{requested}`: {err}"))
+    })?;
+    if !metadata.is_dir() {
+        return Err(AgentError::Other(format!(
+            "invalid working directory `{requested}`: path is not a directory"
+        )));
+    }
+    std::fs::canonicalize(&cwd)
+        .map_err(|err| AgentError::Other(format!("invalid working directory `{requested}`: {err}")))
 }
 
 /// Truncate `output` to at most [`MAX_OUTPUT_BYTES`], returning the (possibly
@@ -91,9 +143,11 @@ fn truncate_output(mut output: String) -> (String, bool) {
 fn spawn_streaming_terminal(
     command: String,
     args: Vec<String>,
+    cwd: PathBuf,
 ) -> Result<BoxStream<'static, TerminalChunk>> {
     let mut child = TokioCommand::new(&command)
         .args(&args)
+        .current_dir(&cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -164,8 +218,8 @@ async fn stream_lines<R: AsyncRead + Unpin>(
 #[async_trait]
 impl ClientAccess for LocalClientAccess {
     async fn read_text_file(&self, path: &str) -> Result<String> {
-        debug!(path, "local fs read");
-        let path = path.to_string();
+        let path = self.resolve_path(path);
+        debug!(path = %path.display(), cwd = %self.cwd.display(), "local fs read");
         tokio::task::spawn_blocking(move || std::fs::read_to_string(&path))
             .await
             .map_err(|err| AgentError::Other(format!("read task join error: {err}")))?
@@ -173,11 +227,11 @@ impl ClientAccess for LocalClientAccess {
     }
 
     async fn write_text_file(&self, path: &str, content: &str) -> Result<()> {
-        debug!(path, "local fs write");
-        let path = path.to_string();
+        let path = self.resolve_path(path);
+        debug!(path = %path.display(), cwd = %self.cwd.display(), "local fs write");
         let content = content.to_string();
         tokio::task::spawn_blocking(move || {
-            if let Some(parent) = std::path::Path::new(&path).parent() {
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, content)
@@ -188,13 +242,16 @@ impl ClientAccess for LocalClientAccess {
     }
 
     async fn run_terminal(&self, command: &str, args: &[String]) -> Result<TerminalOutcome> {
-        debug!(command, "local terminal run");
+        debug!(command, cwd = %self.cwd.display(), "local terminal run");
         let command = command.to_string();
         let args = args.to_vec();
-        let output = tokio::task::spawn_blocking(move || Command::new(&command).args(&args).output())
-            .await
-            .map_err(|err| AgentError::Other(format!("terminal task join error: {err}")))?
-            .map_err(|err| AgentError::Other(format!("run_terminal failed: {err}")))?;
+        let cwd = self.cwd.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            Command::new(&command).args(&args).current_dir(cwd).output()
+        })
+        .await
+        .map_err(|err| AgentError::Other(format!("terminal task join error: {err}")))?
+        .map_err(|err| AgentError::Other(format!("run_terminal failed: {err}")))?;
 
         let mut combined = String::new();
         combined.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -217,8 +274,8 @@ impl ClientAccess for LocalClientAccess {
         command: &str,
         args: &[String],
     ) -> Result<BoxStream<'static, TerminalChunk>> {
-        debug!(command, "local terminal run (streaming)");
-        spawn_streaming_terminal(command.to_string(), args.to_vec())
+        debug!(command, cwd = %self.cwd.display(), "local terminal run (streaming)");
+        spawn_streaming_terminal(command.to_string(), args.to_vec(), self.cwd.clone())
     }
 
     async fn request_elicitation(
@@ -278,6 +335,94 @@ fn signal_of(_status: &std::process::ExitStatus) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn test_dir(label: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("rust-acp-agent-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn relative_files_and_shell_commands_use_captured_cwd() {
+        let root = test_dir("captured-cwd");
+        let process_cwd = std::env::current_dir().unwrap();
+        let client = LocalClientAccess::with_cwd(&root).unwrap();
+
+        client
+            .write_text_file("nested/value.txt", "from workspace")
+            .await
+            .unwrap();
+        assert_eq!(
+            client.read_text_file("nested/value.txt").await.unwrap(),
+            "from workspace"
+        );
+
+        let outcome = client
+            .run_shell_command("printf 'alpha\\nbeta\\n' | tail -n 1 > shell.txt; pwd")
+            .await
+            .unwrap();
+        assert!(outcome.is_success());
+        assert_eq!(
+            outcome.output.trim(),
+            std::fs::canonicalize(&root).unwrap().to_string_lossy()
+        );
+        assert_eq!(client.read_text_file("shell.txt").await.unwrap(), "beta\n");
+        assert_eq!(std::env::current_dir().unwrap(), process_cwd);
+    }
+
+    #[tokio::test]
+    async fn absolute_paths_are_not_rebased() {
+        let root = test_dir("absolute-root");
+        let outside = test_dir("absolute-outside").join("value.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        let client = LocalClientAccess::with_cwd(root).unwrap();
+
+        assert_eq!(
+            client
+                .read_text_file(outside.to_str().unwrap())
+                .await
+                .unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn invalid_cwd_error_names_requested_path() {
+        let missing =
+            std::env::temp_dir().join(format!("rust-acp-agent-missing-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+
+        let error = LocalClientAccess::with_cwd(&missing)
+            .err()
+            .expect("missing cwd must fail validation");
+        assert!(error
+            .to_string()
+            .contains(&missing.to_string_lossy().to_string()));
+    }
+
+    #[tokio::test]
+    async fn concurrent_clients_keep_workspaces_isolated() {
+        let first = test_dir("isolation-first");
+        let second = test_dir("isolation-second");
+        std::fs::write(first.join("same.txt"), "first").unwrap();
+        std::fs::write(second.join("same.txt"), "second").unwrap();
+        let first_client = LocalClientAccess::with_cwd(&first).unwrap();
+        let second_client = LocalClientAccess::with_cwd(&second).unwrap();
+
+        let (first_read, second_read, first_shell, second_shell) = tokio::join!(
+            first_client.read_text_file("same.txt"),
+            second_client.read_text_file("same.txt"),
+            first_client.run_shell_command("cat same.txt"),
+            second_client.run_shell_command("cat same.txt")
+        );
+
+        assert_eq!(first_read.unwrap(), "first");
+        assert_eq!(second_read.unwrap(), "second");
+        assert_eq!(first_shell.unwrap().output, "first");
+        assert_eq!(second_shell.unwrap().output, "second");
+    }
+
     #[tokio::test]
     async fn file_round_trip() {
         let dir = std::env::temp_dir();
@@ -316,16 +461,16 @@ mod tests {
 
         let client = LocalClientAccess::new();
         let stream = client
-            .run_terminal_streaming(
-                "printf",
-                &["line1\\nline2\\nline3\\n".to_string()],
-            )
+            .run_terminal_streaming("printf", &["line1\\nline2\\nline3\\n".to_string()])
             .await
             .expect("command should start");
         let chunks: Vec<TerminalChunk> = stream.collect().await;
 
         // At least one output chunk plus a final Finished.
-        assert!(chunks.len() >= 2, "expected output + finished, got {chunks:?}");
+        assert!(
+            chunks.len() >= 2,
+            "expected output + finished, got {chunks:?}"
+        );
         let outputs: Vec<&String> = chunks
             .iter()
             .filter_map(|c| match c {

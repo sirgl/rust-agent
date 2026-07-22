@@ -59,7 +59,7 @@ load time (logged / surfaced as an error rather than silently trusted).
   rooted at that directory, so sessions survive restarts;
 - unset → `InMemorySessionStore`.
 
-`session/new`, `session/prompt`, and `_session/inject` all route through the
+`session/new`, `session/prompt`, and `_session/steering` all route through the
 store: state is loaded-or-created and saved back after each completed turn.
 
 ## `session/load` flow

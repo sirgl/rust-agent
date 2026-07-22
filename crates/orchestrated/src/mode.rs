@@ -129,11 +129,8 @@ pub trait SubAgentMode: Send + Sync {
     fn tool_capabilities(&self, base: &ToolRegistry) -> ToolRegistry;
 
     /// Build the issue/task description handed to the sub-agent.
-    fn build_issue_description(
-        &self,
-        req: &SubAgentRequest,
-        step: Option<&PlanStepSpec>,
-    ) -> String;
+    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>)
+        -> String;
 
     /// Build pre-chat observations (plan, prior results, verdicts) for context.
     fn build_pre_chat_observations(
@@ -191,7 +188,12 @@ impl ExecutorBehavior {
         base.clone()
     }
 
-    fn system_prompt(&self, prefix: &str, ctx: &OrchestratedStepContext, step_index: usize) -> String {
+    fn system_prompt(
+        &self,
+        prefix: &str,
+        ctx: &OrchestratedStepContext,
+        step_index: usize,
+    ) -> String {
         let mut p = format!(
             "{prefix}\nYou are an executor sub-agent. Do the work for the current plan step, \
              then call `submit` with a concise summary of what you changed."
@@ -202,7 +204,11 @@ impl ExecutorBehavior {
         p
     }
 
-    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        step: Option<&PlanStepSpec>,
+    ) -> String {
         let mut d = String::new();
         if let Some(step) = step {
             d.push_str(&format!("Step: {}\n{}\n", step.name, step.description));
@@ -216,7 +222,11 @@ impl ExecutorBehavior {
         d
     }
 
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        step_index: usize,
+    ) -> String {
         let mut obs = String::new();
         if let Some(proposal) = ctx.proposal() {
             obs.push_str(&proposal.render());
@@ -292,7 +302,11 @@ impl ReviewerBehavior {
         )
     }
 
-    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        step: Option<&PlanStepSpec>,
+    ) -> String {
         let mut d = String::from("Review the work for this step.\n");
         if let Some(step) = step {
             d.push_str(&format!("Step: {}\n{}\n", step.name, step.description));
@@ -303,11 +317,18 @@ impl ReviewerBehavior {
         d
     }
 
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        step_index: usize,
+    ) -> String {
         let mut obs = String::new();
         for r in ctx.results_for_step(step_index) {
             if EXECUTOR_MODE_IDS.contains(&r.mode_id.as_str()) {
-                obs.push_str(&format!("\nExecutor ({}) result:\n{}\n", r.mode_id, r.output));
+                obs.push_str(&format!(
+                    "\nExecutor ({}) result:\n{}\n",
+                    r.mode_id, r.output
+                ));
             }
         }
         obs
@@ -420,15 +441,24 @@ impl SubAgentMode for ExecutorMode {
         self.behavior.submit_kind()
     }
     fn system_prompt(&self, ctx: &OrchestratedStepContext, step_index: usize) -> String {
-        self.behavior.system_prompt(self.prompt_prefix, ctx, step_index)
+        self.behavior
+            .system_prompt(self.prompt_prefix, ctx, step_index)
     }
     fn tool_capabilities(&self, base: &ToolRegistry) -> ToolRegistry {
         self.behavior.tool_capabilities(base)
     }
-    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        step: Option<&PlanStepSpec>,
+    ) -> String {
         self.behavior.build_issue_description(req, step)
     }
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        step_index: usize,
+    ) -> String {
         self.behavior.build_pre_chat_observations(ctx, step_index)
     }
     fn check_preconditions(
@@ -451,11 +481,7 @@ impl SubAgentMode for ExecutorMode {
 
 /// The `code` executor mode: general implementation work.
 pub fn code_mode(behavior: Arc<ExecutorBehavior>) -> ExecutorMode {
-    ExecutorMode::new(
-        "code",
-        "Implement the requested code changes.",
-        behavior,
-    )
+    ExecutorMode::new("code", "Implement the requested code changes.", behavior)
 }
 
 /// The `setup` executor mode: environment/build/configuration work.
@@ -518,15 +544,24 @@ impl SubAgentMode for ReviewMode {
         self.behavior.submit_kind()
     }
     fn system_prompt(&self, _ctx: &OrchestratedStepContext, _step_index: usize) -> String {
-        self.behavior.system_prompt("Review the implementation for correctness.")
+        self.behavior
+            .system_prompt("Review the implementation for correctness.")
     }
     fn tool_capabilities(&self, base: &ToolRegistry) -> ToolRegistry {
         self.behavior.tool_capabilities(base)
     }
-    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        step: Option<&PlanStepSpec>,
+    ) -> String {
         self.behavior.build_issue_description(req, step)
     }
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        step_index: usize,
+    ) -> String {
         self.behavior.build_pre_chat_observations(ctx, step_index)
     }
     fn check_preconditions(
@@ -592,15 +627,24 @@ impl SubAgentMode for ReviewPlanMode {
         self.behavior.submit_kind()
     }
     fn system_prompt(&self, _ctx: &OrchestratedStepContext, _step_index: usize) -> String {
-        self.behavior.system_prompt("Review the proposed plan for completeness and feasibility.")
+        self.behavior
+            .system_prompt("Review the proposed plan for completeness and feasibility.")
     }
     fn tool_capabilities(&self, base: &ToolRegistry) -> ToolRegistry {
         self.behavior.tool_capabilities(base)
     }
-    fn build_issue_description(&self, req: &SubAgentRequest, step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        step: Option<&PlanStepSpec>,
+    ) -> String {
         self.behavior.build_issue_description(req, step)
     }
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, _step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        _step_index: usize,
+    ) -> String {
         match ctx.proposal() {
             Some(p) => p.render(),
             None => String::new(),
@@ -679,14 +723,22 @@ impl SubAgentMode for PlanMode {
     fn tool_capabilities(&self, base: &ToolRegistry) -> ToolRegistry {
         self.behavior.tool_capabilities(base)
     }
-    fn build_issue_description(&self, req: &SubAgentRequest, _step: Option<&PlanStepSpec>) -> String {
+    fn build_issue_description(
+        &self,
+        req: &SubAgentRequest,
+        _step: Option<&PlanStepSpec>,
+    ) -> String {
         let mut d = String::from("Create a plan for the goal.\n");
         if let Some(instr) = &req.instructions {
             d.push_str(&format!("\nGuidance: {instr}\n"));
         }
         d
     }
-    fn build_pre_chat_observations(&self, ctx: &OrchestratedStepContext, _step_index: usize) -> String {
+    fn build_pre_chat_observations(
+        &self,
+        ctx: &OrchestratedStepContext,
+        _step_index: usize,
+    ) -> String {
         match ctx.proposal() {
             Some(p) => format!("Existing plan to refine:\n{}", p.render()),
             None => String::new(),
@@ -709,7 +761,6 @@ impl SubAgentMode for PlanMode {
         self.behavior.display_text(output)
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -770,7 +821,9 @@ mod tests {
         assert!(!m.supports_retry());
         assert_eq!(m.submit_kind(), SubmitKind::Plain);
         // No plan required to run the planner.
-        assert!(m.check_preconditions(&OrchestratedStepContext::new(), 0).is_ok());
+        assert!(m
+            .check_preconditions(&OrchestratedStepContext::new(), 0)
+            .is_ok());
     }
 
     #[test]
@@ -795,7 +848,9 @@ mod tests {
     fn review_plan_precondition_requires_proposal() {
         let m = review_plan();
         // Empty context (no proposal) -> fails.
-        assert!(m.check_preconditions(&OrchestratedStepContext::new(), 0).is_err());
+        assert!(m
+            .check_preconditions(&OrchestratedStepContext::new(), 0)
+            .is_err());
         // With a proposal -> passes.
         assert!(m.check_preconditions(&ctx_with_step(), 0).is_ok());
     }

@@ -13,6 +13,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::event::ToolCallId;
+use crate::todo::{TodoItemId, TodoList};
 
 /// A block of content within a user or assistant message.
 ///
@@ -112,6 +113,21 @@ pub struct TerminalRunToolCall {
     pub args: Vec<String>,
 }
 
+/// Typed arguments for the built-in `update_todo_list` tool.
+///
+/// Transparent serialization preserves the tool's `{ "items": [...] }`
+/// argument shape while reusing [`TodoList`]'s validation on deserialization.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct UpdateTodoListToolCall(pub TodoList);
+
+/// Typed arguments for the built-in `mark_todo_completed` tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MarkTodoCompletedToolCall {
+    /// Stable identifier of the item to complete.
+    pub id: TodoItemId,
+}
+
 /// A typed view of a tool invocation.
 ///
 /// Built-in tools known to `agent-core` are represented with dedicated variants;
@@ -127,6 +143,10 @@ pub enum KnownTool {
     FsWrite(FsWriteToolCall),
     /// The built-in `terminal_run` tool.
     TerminalRun(TerminalRunToolCall),
+    /// The built-in `update_todo_list` tool.
+    UpdateTodoList(UpdateTodoListToolCall),
+    /// The built-in `mark_todo_completed` tool.
+    MarkTodoCompleted(MarkTodoCompletedToolCall),
     /// Any tool not known to the core (MCP tools, subagents, etc.).
     Other {
         /// The tool name as advertised by the registry.
@@ -144,6 +164,8 @@ impl KnownTool {
             KnownTool::FsRead(_) => "fs_read",
             KnownTool::FsWrite(_) => "fs_write",
             KnownTool::TerminalRun(_) => "terminal_run",
+            KnownTool::UpdateTodoList(_) => "update_todo_list",
+            KnownTool::MarkTodoCompleted(_) => "mark_todo_completed",
             KnownTool::Other { name, .. } => name,
         }
     }
@@ -160,6 +182,12 @@ impl KnownTool {
             KnownTool::FsRead(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
             KnownTool::FsWrite(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
             KnownTool::TerminalRun(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+            KnownTool::UpdateTodoList(v) => {
+                serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+            }
+            KnownTool::MarkTodoCompleted(v) => {
+                serde_json::to_value(v).unwrap_or(serde_json::Value::Null)
+            }
             KnownTool::Other { arguments, .. } => arguments.clone(),
         }
     }
@@ -193,6 +221,18 @@ impl KnownTool {
                     name: name.to_string(),
                     arguments,
                 }),
+            "update_todo_list" => serde_json::from_value(arguments.clone())
+                .map(KnownTool::UpdateTodoList)
+                .unwrap_or(KnownTool::Other {
+                    name: name.to_string(),
+                    arguments,
+                }),
+            "mark_todo_completed" => serde_json::from_value(arguments.clone())
+                .map(KnownTool::MarkTodoCompleted)
+                .unwrap_or(KnownTool::Other {
+                    name: name.to_string(),
+                    arguments,
+                }),
             _ => KnownTool::Other {
                 name: name.to_string(),
                 arguments,
@@ -214,6 +254,32 @@ mod tests {
 
         let tool = KnownTool::classify("terminal_run", input.clone());
         assert_eq!(tool.arguments(), input);
+    }
+
+    #[test]
+    fn known_todo_tools_classify_and_roundtrip_typed_arguments() {
+        let update_args = serde_json::json!({
+            "items": [
+                {"id": "inspect", "content": "Inspect state", "status": "in_progress"},
+                {"id": "verify", "content": "Verify behavior", "status": "pending"}
+            ]
+        });
+        let update = KnownTool::classify("update_todo_list", update_args.clone());
+        assert!(matches!(update, KnownTool::UpdateTodoList(_)));
+        assert_eq!(update.arguments(), update_args);
+
+        let complete_args = serde_json::json!({"id": "inspect"});
+        let complete = KnownTool::classify("mark_todo_completed", complete_args.clone());
+        assert!(matches!(complete, KnownTool::MarkTodoCompleted(_)));
+        assert_eq!(complete.arguments(), complete_args);
+
+        let invalid = serde_json::json!({
+            "items": [{"id": "", "content": "bad", "status": "pending"}]
+        });
+        assert!(matches!(
+            KnownTool::classify("update_todo_list", invalid,),
+            KnownTool::Other { .. }
+        ));
     }
 }
 

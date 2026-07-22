@@ -9,7 +9,7 @@
 
 use std::sync::Arc;
 
-use agent_core::{Result, Tool, ToolContext, ToolEvent};
+use agent_core::{AgentRunMetadata, Result, Tool, ToolContext, ToolEvent, ToolOutputPresentation};
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use tracing::{info_span, warn, Instrument};
@@ -139,6 +139,10 @@ impl Tool for RunSubAgentTool {
         false
     }
 
+    fn output_presentation(&self) -> ToolOutputPresentation {
+        ToolOutputPresentation::AccumulatedMessage
+    }
+
     async fn call(
         &self,
         args: serde_json::Value,
@@ -191,6 +195,10 @@ impl Tool for RunSubAgentTool {
             attempt,
             tier = ?tier
         );
+        // Give the sub-agent a distinct, human-readable agent path segment
+        // (e.g. `code#1`) so its captured requests/responses are viewable
+        // separately in the LLM inspector, grouped under the parent session.
+        let agent_label = format!("{}#{}", mode.id(), req.step_index + 1);
         let outcome = worker
             .run(SubAgentRunParams {
                 req: &req,
@@ -200,7 +208,20 @@ impl Tool for RunSubAgentTool {
                 max_steps,
                 depth: ctx.depth + 1,
                 client: ctx.client.clone(),
+                workspace_roots: ctx.workspace_roots.clone(),
                 cancel: &ctx.cancel,
+                session_id: ctx.session_id.clone(),
+                agent_path: ctx.agent_path.child(agent_label),
+                observer: ctx.observer.clone(),
+                parent_trace: ctx.trace.clone(),
+                parent_tool_call_id: ctx.tool_call_id.clone(),
+                trace_metadata: AgentRunMetadata {
+                    kind: Some(format!("{:?}", mode.orchestrator_kind()).to_lowercase()),
+                    mode: Some(mode.id().to_string()),
+                    step_index: Some(req.step_index),
+                    attempt: Some(attempt),
+                    model_tier: Some(format!("{tier:?}").to_lowercase()),
+                },
             })
             .instrument(span)
             .await?;

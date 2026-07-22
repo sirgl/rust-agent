@@ -29,7 +29,7 @@ use async_trait::async_trait;
 
 use crate::error::Result;
 use crate::event::ToolCallId;
-use crate::history::{Conversation, ContentBlock, HistoryEntry, KnownTool, ToolResultRecord};
+use crate::history::{ContentBlock, Conversation, HistoryEntry, KnownTool, ToolResultRecord};
 
 /// Number of most-recent entries always preserved verbatim (the "tail").
 ///
@@ -67,13 +67,7 @@ errors and their reasons. Be concise and factual; do not add interpretations.";
 /// whose names contain any of these fragments are also treated as noisy (see
 /// [`is_noisy_tool`]).
 pub const DEFAULT_NOISY_TOOLS: &[&str] = &[
-    "fs_read",
-    "search",
-    "grep",
-    "glob",
-    "list",
-    "open",
-    "scroll",
+    "fs_read", "search", "grep", "glob", "list", "open", "scroll",
 ];
 
 /// Provider-agnostic single-shot text summarization seam used by
@@ -295,7 +289,11 @@ impl<S: TextSummarizer> LlmCompactor<S> {
     /// On failure or empty output, the original record is returned unchanged.
     async fn summarize_result(&self, result: &ToolResultRecord) -> ToolResultRecord {
         let original = tool_result_text(result);
-        match self.summarizer.summarize(SUMMARIZER_SYSTEM_PROMPT, &original).await {
+        match self
+            .summarizer
+            .summarize(SUMMARIZER_SYSTEM_PROMPT, &original)
+            .await
+        {
             // Guard against unhelpful summaries: empty, or not actually shorter.
             Ok(summary) if !summary.trim().is_empty() && summary.len() < original.len() => {
                 ToolResultRecord {
@@ -368,7 +366,12 @@ mod tests {
         conv.push_user_text("do the task with a fairly long instruction ".repeat(200));
         for i in 0..pairs {
             let id = ToolCallId::new(format!("call-{i}"));
-            conv.push_tool_call(id.clone(), KnownTool::FsRead(FsReadToolCall { path: format!("/f{i}") }));
+            conv.push_tool_call(
+                id.clone(),
+                KnownTool::FsRead(FsReadToolCall {
+                    path: format!("/f{i}"),
+                }),
+            );
             conv.push_tool_result(id, true, "file contents that are quite long ".repeat(50));
         }
         conv
@@ -378,7 +381,9 @@ mod tests {
     async fn heuristic_drops_noisy_prefix_pairs_but_keeps_tail() {
         let conv = noisy_conv(20);
         let before = conv.entries.len();
-        let compactor = HeuristicCompactor::new().with_keep_tail(4).with_min_chars(0);
+        let compactor = HeuristicCompactor::new()
+            .with_keep_tail(4)
+            .with_min_chars(0);
         let out = compactor.compact(conv).await.unwrap();
         assert!(out.entries.len() < before);
         // Tail (last 4 = 2 noisy pairs) is preserved verbatim.
@@ -407,10 +412,17 @@ mod tests {
         // pad tail with noisy pairs
         for i in 0..12 {
             let id = ToolCallId::new(format!("r-{i}"));
-            conv.push_tool_call(id.clone(), KnownTool::FsRead(FsReadToolCall { path: "/f".into() }));
+            conv.push_tool_call(
+                id.clone(),
+                KnownTool::FsRead(FsReadToolCall { path: "/f".into() }),
+            );
             conv.push_tool_result(id, true, "y".repeat(1000));
         }
-        let out = HeuristicCompactor::new().with_keep_tail(2).compact(conv).await.unwrap();
+        let out = HeuristicCompactor::new()
+            .with_keep_tail(2)
+            .compact(conv)
+            .await
+            .unwrap();
         let edits = out
             .entries
             .iter()
@@ -424,7 +436,10 @@ mod tests {
         let mut conv = Conversation::new();
         conv.push_user_text("hi");
         conv.push_assistant_text("hello");
-        let out = HeuristicCompactor::new().compact(conv.clone()).await.unwrap();
+        let out = HeuristicCompactor::new()
+            .compact(conv.clone())
+            .await
+            .unwrap();
         assert_eq!(out, conv);
     }
 
@@ -451,10 +466,16 @@ mod tests {
         let mut conv = Conversation::new();
         conv.push_user_text("z".repeat(30_000));
         let long = ToolCallId::new("long");
-        conv.push_tool_call(long.clone(), KnownTool::FsRead(FsReadToolCall { path: "/f".into() }));
+        conv.push_tool_call(
+            long.clone(),
+            KnownTool::FsRead(FsReadToolCall { path: "/f".into() }),
+        );
         conv.push_tool_result(long, true, "verbose output line\n".repeat(50));
         let short = ToolCallId::new("short");
-        conv.push_tool_call(short.clone(), KnownTool::FsRead(FsReadToolCall { path: "/g".into() }));
+        conv.push_tool_call(
+            short.clone(),
+            KnownTool::FsRead(FsReadToolCall { path: "/g".into() }),
+        );
         conv.push_tool_result(short, true, "ok");
         // pad tail
         for i in 0..12 {
@@ -465,12 +486,14 @@ mod tests {
             .compact(conv)
             .await
             .unwrap();
-        let summarized = out.entries.iter().any(|e| {
-            matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == "SUMMARY")
-        });
-        let kept_short = out.entries.iter().any(|e| {
-            matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == "ok")
-        });
+        let summarized = out
+            .entries
+            .iter()
+            .any(|e| matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == "SUMMARY"));
+        let kept_short = out
+            .entries
+            .iter()
+            .any(|e| matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == "ok"));
         assert!(summarized, "long output should be summarized");
         assert!(kept_short, "short output should be kept verbatim");
     }
@@ -480,7 +503,10 @@ mod tests {
         let mut conv = Conversation::new();
         conv.push_user_text("z".repeat(30_000));
         let id = ToolCallId::new("long");
-        conv.push_tool_call(id.clone(), KnownTool::FsRead(FsReadToolCall { path: "/f".into() }));
+        conv.push_tool_call(
+            id.clone(),
+            KnownTool::FsRead(FsReadToolCall { path: "/f".into() }),
+        );
         let original = "verbose output line\n".repeat(50);
         conv.push_tool_result(id, true, original.clone());
         for i in 0..12 {
@@ -491,9 +517,10 @@ mod tests {
             .compact(conv)
             .await
             .unwrap();
-        let kept = out.entries.iter().any(|e| {
-            matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == original)
-        });
+        let kept = out
+            .entries
+            .iter()
+            .any(|e| matches!(e, HistoryEntry::ToolResult(r) if tool_result_text(r) == original));
         assert!(kept, "on failure the original output is preserved");
     }
 
@@ -502,8 +529,16 @@ mod tests {
         let conv = noisy_conv(20);
         let before = conv.entries.len();
         let chain = ChainedCompactor::new(vec![
-            Box::new(HeuristicCompactor::new().with_keep_tail(4).with_min_chars(0)),
-            Box::new(LlmCompactor::new(StubSummarizer).with_keep_tail(4).with_min_chars(0)),
+            Box::new(
+                HeuristicCompactor::new()
+                    .with_keep_tail(4)
+                    .with_min_chars(0),
+            ),
+            Box::new(
+                LlmCompactor::new(StubSummarizer)
+                    .with_keep_tail(4)
+                    .with_min_chars(0),
+            ),
         ]);
         let out = chain.compact(conv).await.unwrap();
         assert!(out.entries.len() < before);

@@ -26,6 +26,8 @@ use agent_core::{
 use async_trait::async_trait;
 use tracing::debug;
 
+use crate::turn_coordinator::TurnLease;
+
 /// Permission option id used to signal the user granted the tool call.
 const ALLOW_OPTION_ID: &str = "allow-once";
 /// Permission option id used to signal the user denied the tool call.
@@ -66,20 +68,74 @@ impl AcpUpdateSink {
     }
 }
 
+/// An output fence that only forwards events while its turn generation is current.
+pub struct GenerationScopedSink<S> {
+    inner: S,
+    lease: TurnLease,
+}
+
+impl<S> GenerationScopedSink<S> {
+    /// Bind `inner` to the lifecycle ownership represented by `lease`.
+    #[must_use]
+    pub fn new(inner: S, lease: TurnLease) -> Self {
+        Self { inner, lease }
+    }
+}
+
+#[async_trait]
+impl<S: UpdateSink> UpdateSink for GenerationScopedSink<S> {
+    async fn send(&mut self, output: EngineOutput) -> Result<()> {
+        if !self.lease.is_current() {
+            debug!(
+                session_id = self.lease.session_id(),
+                generation = self.lease.generation(),
+                event_kind = engine_output_kind(&output),
+                "dropped output from retired turn generation"
+            );
+            return Ok(());
+        }
+        self.inner.send(output).await
+    }
+
+    async fn request_permission(&mut self, id: &ToolCallId, tool_name: &str) -> Result<bool> {
+        if !self.lease.is_current() {
+            debug!(
+                session_id = self.lease.session_id(),
+                generation = self.lease.generation(),
+                tool = tool_name,
+                "denied permission locally for retired turn generation"
+            );
+            return Ok(false);
+        }
+        let cancel = self.lease.cancellation_token();
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Ok(false),
+            result = self.inner.request_permission(id, tool_name) => result,
+        }
+    }
+}
+
+fn engine_output_kind(output: &EngineOutput) -> &'static str {
+    match output {
+        EngineOutput::MessageChunk(_) => "message",
+        EngineOutput::ThinkingChunk(_) => "thinking",
+        EngineOutput::Plan(_) => "plan",
+        EngineOutput::ToolCall { .. } => "tool_call",
+        EngineOutput::ToolCallUpdate { .. } => "tool_call_update",
+    }
+}
+
 #[async_trait]
 impl UpdateSink for AcpUpdateSink {
     async fn send(&mut self, output: EngineOutput) -> Result<()> {
         match output {
-            EngineOutput::MessageChunk(text) => {
-                self.notify(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                    text_block(text),
-                )))
-            }
-            EngineOutput::ThinkingChunk(text) => {
-                self.notify(SessionUpdate::AgentThoughtChunk(ContentChunk::new(
-                    text_block(text),
-                )))
-            }
+            EngineOutput::MessageChunk(text) => self.notify(SessionUpdate::AgentMessageChunk(
+                ContentChunk::new(text_block(text)),
+            )),
+            EngineOutput::ThinkingChunk(text) => self.notify(SessionUpdate::AgentThoughtChunk(
+                ContentChunk::new(text_block(text)),
+            )),
             EngineOutput::Plan(plan) => self.notify(SessionUpdate::Plan(map_plan(&plan))),
             EngineOutput::ToolCall {
                 id,
@@ -118,7 +174,9 @@ impl UpdateSink for AcpUpdateSink {
                 if let Some(out) = raw_output {
                     fields = fields.raw_output(out);
                 }
-                self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(id.0, fields)))
+                self.notify(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
+                    id.0, fields,
+                )))
             }
         }
     }
@@ -202,7 +260,7 @@ fn map_status(status: ToolCallStatus) -> AcpToolCallStatus {
 }
 
 /// Map a provider-agnostic [`PlanUpdate`] to an ACP [`Plan`].
-fn map_plan(plan: &PlanUpdate) -> Plan {
+pub(crate) fn map_plan(plan: &PlanUpdate) -> Plan {
     let entries = plan
         .steps
         .iter()
@@ -223,5 +281,107 @@ fn map_plan_status(status: PlanStepStatus) -> PlanEntryStatus {
         PlanStepStatus::Pending => PlanEntryStatus::Pending,
         PlanStepStatus::InProgress => PlanEntryStatus::InProgress,
         PlanStepStatus::Completed => PlanEntryStatus::Completed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use agent_core::{PlanStep, ToolCallLocation};
+
+    use super::*;
+    use crate::turn_coordinator::TurnCoordinator;
+
+    #[derive(Clone, Default)]
+    struct CollectingSink {
+        outputs: Arc<Mutex<Vec<EngineOutput>>>,
+        permission_requests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl UpdateSink for CollectingSink {
+        async fn send(&mut self, output: EngineOutput) -> Result<()> {
+            self.outputs.lock().unwrap().push(output);
+            Ok(())
+        }
+
+        async fn request_permission(&mut self, _id: &ToolCallId, _tool_name: &str) -> Result<bool> {
+            self.permission_requests.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        }
+    }
+
+    fn every_output_kind() -> Vec<EngineOutput> {
+        vec![
+            EngineOutput::MessageChunk("message".to_string()),
+            EngineOutput::ThinkingChunk("thought".to_string()),
+            EngineOutput::Plan(PlanUpdate {
+                steps: vec![PlanStep {
+                    content: "step".to_string(),
+                    status: PlanStepStatus::InProgress,
+                }],
+            }),
+            EngineOutput::ToolCall {
+                id: ToolCallId("call".to_string()),
+                name: "fs_write".to_string(),
+                title: "Write file".to_string(),
+                kind: ToolKind::Edit,
+                status: ToolCallStatus::Pending,
+                locations: vec![ToolCallLocation::new("/tmp/file")],
+                raw_input: Some(serde_json::json!({"path": "/tmp/file"})),
+            },
+            EngineOutput::ToolCallUpdate {
+                id: ToolCallId("call".to_string()),
+                status: ToolCallStatus::Completed,
+                output: Some("done".to_string()),
+                raw_output: Some(serde_json::json!({"ok": true})),
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn current_generation_forwards_every_output_kind_and_permission() {
+        let coordinator = TurnCoordinator::with_retirement_grace("s", Duration::ZERO);
+        let lease = coordinator.begin_turn().await;
+        let inner = CollectingSink::default();
+        let outputs = inner.outputs.clone();
+        let permissions = inner.permission_requests.clone();
+        let mut sink = GenerationScopedSink::new(inner, lease);
+
+        for output in every_output_kind() {
+            sink.send(output).await.unwrap();
+        }
+        assert!(sink
+            .request_permission(&ToolCallId("call".to_string()), "fs_write")
+            .await
+            .unwrap());
+
+        assert_eq!(outputs.lock().unwrap().len(), 5);
+        assert_eq!(permissions.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retired_generation_drops_every_output_kind_and_denies_permission() {
+        let coordinator = TurnCoordinator::with_retirement_grace("s", Duration::ZERO);
+        let retired = coordinator.begin_turn().await;
+        let inner = CollectingSink::default();
+        let outputs = inner.outputs.clone();
+        let permissions = inner.permission_requests.clone();
+        let mut sink = GenerationScopedSink::new(inner, retired);
+        let _current = coordinator.begin_turn().await;
+
+        for output in every_output_kind() {
+            sink.send(output).await.unwrap();
+        }
+        assert!(!sink
+            .request_permission(&ToolCallId("call".to_string()), "fs_write")
+            .await
+            .unwrap());
+
+        assert!(outputs.lock().unwrap().is_empty());
+        assert_eq!(permissions.load(Ordering::SeqCst), 0);
     }
 }

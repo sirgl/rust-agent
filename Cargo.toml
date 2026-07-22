@@ -8,6 +8,7 @@ members = [
     "crates/mcp-client",
     "crates/subagents",
     "crates/orchestrated",
+    "crates/llm-inspector",
     "crates/acp-agent",
     "crates/cli-agent",
 ]
@@ -37,4 +38,5 @@ tools-builtin = { path = "crates/tools-builtin" }
 mcp-client = { path = "crates/mcp-client" }
 subagents = { path = "crates/subagents" }
 orchestrated = { path = "crates/orchestrated" }
+llm-inspector = { path = "crates/llm-inspector" }
 acp-agent = { path = "crates/acp-agent" }

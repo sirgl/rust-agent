@@ -61,22 +61,31 @@ faithful replay:
   (`HistoryEntry::Thinking`), and the compiler renders it back as an Anthropic
   `thinking` / `redacted_thinking` content block.
 
-`build_body` emits the right thinking dialect based on
-`AnthropicConfig.thinking` (`ThinkingConfig`):
+`build_body` emits the right thinking dialect based on the selected model's
+`ModelSpec::thinking_dialect`. `AnthropicConfig.thinking` defaults to
+`ThinkingConfig::Auto`, so changing the model through ACP session configuration
+is resolved safely at request time rather than retaining the dialect of the
+startup model:
 
 - **Adaptive** (default; Claude Sonnet 5 / Opus 4.7+): `thinking: {type:
   "adaptive", display: "summarized"}`. Newer models **reject** the legacy
   `{type: "enabled"}` form (HTTP 400), and default thinking display to
   *omitted*, so `display: "summarized"` is requested to surface visible
   reasoning. Depth is steered by `output_config.effort` (default high).
-- **Budget** (legacy; Opus 4.6 and earlier): `thinking: {type: "enabled",
-  budget_tokens: N}`, guaranteeing `max_tokens > budget_tokens`.
+- **Budget** (Haiku 4.5 and legacy Claude 4 models): `thinking: {type:
+  "enabled", budget_tokens: N}`, guaranteeing `max_tokens > budget_tokens`.
 - **Disabled**: `thinking: {type: "disabled"}`.
 
-**Default: on** (adaptive with visible summarized reasoning). Env overrides:
+The same model metadata records whether `output_config.effort` is supported.
+ACP can keep a uniform effort selector, but the Anthropic adapter omits that
+optional field for Haiku 4.5 (which rejects it) and for unknown models.
+
+**Default: on**, using the model-compatible dialect (adaptive for Sonnet 5 and
+Opus 4.8; budget-based for Haiku 4.5). Env overrides:
 `ANTHROPIC_THINKING=0`/`false` disables; `ANTHROPIC_THINKING=1`/`true` forces
-adaptive; `ANTHROPIC_THINKING_BUDGET=<n>` (or `ANTHROPIC_THINKING=<n>`) selects
-legacy budget mode for older models.
+the model-aware enabled mode; `ANTHROPIC_THINKING_BUDGET=<n>` (or
+`ANTHROPIC_THINKING=<n>`) explicitly selects legacy budget mode for older
+models.
 
 ### Why it is now safe with tool use
 

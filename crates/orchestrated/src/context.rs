@@ -161,7 +161,10 @@ impl OrchestratedStepContext {
     /// for the same `(mode_id, step_index)`.
     pub fn store_result(&self, result: StepResult) {
         let key = (result.mode_id.clone(), result.step_index);
-        self.results.lock().expect("results lock").insert(key, result);
+        self.results
+            .lock()
+            .expect("results lock")
+            .insert(key, result);
     }
 
     /// Fetch a previously stored result for `(mode_id, step_index)`.
@@ -209,7 +212,9 @@ impl OrchestratedStepContext {
     /// attempt number (first attempt returns `1`).
     pub fn next_attempt(&self, mode_id: &str, step_index: usize) -> usize {
         let mut attempts = self.attempts.lock().expect("attempts lock");
-        let entry = attempts.entry((mode_id.to_string(), step_index)).or_insert(0);
+        let entry = attempts
+            .entry((mode_id.to_string(), step_index))
+            .or_insert(0);
         *entry += 1;
         *entry
     }
@@ -258,7 +263,10 @@ mod tests {
         assert!(ctx.has_result("code", 0));
         assert_eq!(ctx.result("code", 0).unwrap().output, "done");
 
-        ctx.set_proposal(PlanProposal::new("goal", vec![PlanStepSpec::new("s1", "do s1")]));
+        ctx.set_proposal(PlanProposal::new(
+            "goal",
+            vec![PlanStepSpec::new("s1", "do s1")],
+        ));
         assert_eq!(ctx.proposal().unwrap().steps.len(), 1);
     }
 

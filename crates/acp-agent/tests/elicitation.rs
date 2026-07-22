@@ -37,6 +37,8 @@ fn deps_with_script(script: Vec<Vec<TurnEvent>>) -> AgentDeps {
             ..AgentConfig::default()
         },
         store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
     }
 }
 

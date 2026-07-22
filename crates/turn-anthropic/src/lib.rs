@@ -39,9 +39,31 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 
 pub use mapper::StreamMapper;
-pub use models::{default_max_output_tokens, model_spec, ModelSpec, MODELS};
+pub use models::{
+    default_max_output_tokens, default_thinking_dialect, model_spec, supports_effort, ModelSpec,
+    ThinkingDialect, MODELS,
+};
 pub use request::{build_body, load_default_api_key, AnthropicConfig, Effort, ThinkingConfig};
 pub use sse::SseDecoder;
+
+/// Observer notified with the *real* request body just before it is sent to the
+/// Anthropic Messages API.
+///
+/// This is the observability seam behind the LLM-request inspector: each
+/// streaming turn fires [`on_request`](RequestObserver::on_request) with the
+/// session id (when known), the model, and the exact JSON body that goes over
+/// the wire. Implementations must be cheap and non-blocking — they run inline on
+/// the turn path — and must never panic.
+pub trait RequestObserver: Send + Sync {
+    /// Called once per streaming request with the exact outgoing body.
+    fn on_request(
+        &self,
+        session_id: Option<&str>,
+        model: &str,
+        body: &serde_json::Value,
+        trace: Option<&agent_core::TraceContext>,
+    );
+}
 
 /// A real [`NextTurnService`] that answers turns via the Anthropic Messages API.
 ///
@@ -54,6 +76,7 @@ pub struct AnthropicTurnService {
     config: AnthropicConfig,
     client: reqwest::Client,
     compiler: Arc<dyn LlmCompiler>,
+    observer: Option<Arc<dyn RequestObserver>>,
 }
 
 impl std::fmt::Debug for AnthropicTurnService {
@@ -77,7 +100,16 @@ impl AnthropicTurnService {
             config,
             client: reqwest::Client::new(),
             compiler,
+            observer: None,
         }
+    }
+
+    /// Attach a [`RequestObserver`] that is notified with the exact request body
+    /// of every streaming turn just before it is sent.
+    #[must_use]
+    pub fn with_observer(mut self, observer: Arc<dyn RequestObserver>) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Build a service from environment variables (see [`AnthropicConfig::from_env`]).
@@ -102,6 +134,17 @@ impl NextTurnService for AnthropicTurnService {
         // is reported synchronously (via `Result`) rather than mid-stream.
         let req = self.compiler.compile(ctx)?;
         let body = build_body(&req, &self.config);
+
+        // Notify the observer (e.g. the inspector server) with the exact body
+        // going over the wire, attributed to this session when known.
+        if let Some(observer) = &self.observer {
+            observer.on_request(
+                ctx.session_id.as_deref(),
+                &self.config.model,
+                &body,
+                ctx.trace.as_ref(),
+            );
+        }
 
         tracing::debug!(
             model = %self.config.model,

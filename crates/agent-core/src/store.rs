@@ -230,8 +230,8 @@ mod tests {
 
     #[tokio::test]
     async fn json_file_missing_returns_none() {
-        let dir = std::env::temp_dir()
-            .join(format!("agent-core-store-missing-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-core-store-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = JsonFileSessionStore::new(&dir);
 
@@ -248,8 +248,8 @@ mod tests {
 
     #[tokio::test]
     async fn json_file_corrupt_returns_error() {
-        let dir = std::env::temp_dir()
-            .join(format!("agent-core-store-corrupt-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-core-store-corrupt-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("broken.json"), "{ not valid json").unwrap();
@@ -265,8 +265,8 @@ mod tests {
     async fn json_file_unknown_version_still_deserializes() {
         // A record with an unexpected version still deserializes; the handler
         // layer is responsible for deciding how to treat unsupported versions.
-        let dir = std::env::temp_dir()
-            .join(format!("agent-core-store-version-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("agent-core-store-version-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let store = JsonFileSessionStore::new(&dir);
 

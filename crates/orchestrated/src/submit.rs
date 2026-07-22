@@ -80,7 +80,10 @@ impl Tool for SubmitTool {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let success = args.get("success").and_then(|v| v.as_bool()).unwrap_or(true);
+        let success = args
+            .get("success")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
 
         let outcome = SubmitOutcome {
             success,
@@ -167,9 +170,7 @@ impl Tool for SubmitReviewTool {
 
         Ok(events(vec![
             ToolEvent::Started,
-            ToolEvent::Completed(
-                serde_json::json!({ "approved": approved, "reasons": reasons }),
-            ),
+            ToolEvent::Completed(serde_json::json!({ "approved": approved, "reasons": reasons })),
         ]))
     }
 }

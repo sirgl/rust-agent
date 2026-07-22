@@ -115,5 +115,5 @@ async fn tool_and_direct_pipeline_produce_identical_output() {
     assert_eq!(direct_text, tool_text);
     assert_eq!(direct_stop, StopReason::EndTurn);
     assert_eq!(tool_stop, "end_turn");
-    assert_eq!(direct_text, "orchestration complete");
+    assert_eq!(direct_text, "implemented goalorchestration complete");
 }

@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use agent_core::{
     EngineOutput, NextTurnService, Result, SessionState, Tool, ToolContext, ToolEvent,
-    ToolRegistry, TurnEngine, UpdateSink,
+    ToolOutputPresentation, ToolRegistry, TurnEngine, UpdateSink,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -110,6 +110,10 @@ impl Tool for SubagentTool {
         false
     }
 
+    fn output_presentation(&self) -> ToolOutputPresentation {
+        ToolOutputPresentation::AccumulatedMessage
+    }
+
     async fn call(
         &self,
         args: serde_json::Value,
@@ -134,20 +138,36 @@ impl Tool for SubagentTool {
         };
         debug!(depth = ctx.depth, "delegating sub-task to nested engine");
 
-        // Build the nested session seeded with the delegated task.
-        let mut session = SessionState::new(format!("{}::sub", ctx.session_id));
+        // Build the nested session seeded with the delegated task. It reuses the
+        // parent's session id so every agent of a user session groups together
+        // in the LLM inspector; the distinct `AgentPath` (below) tells them
+        // apart, letting each sub-agent's output be viewed separately.
+        let mut session = SessionState::new(ctx.session_id.clone());
         session.system_prompt = self.system_prompt.clone();
+        session.available_tools = self.tools.descriptors();
+        session.workspace_roots = ctx.workspace_roots.clone();
         session.push_user_text(task);
 
         // The nested engine runs at ctx.depth + 1 so the limit propagates.
         let mut engine = TurnEngine::new(self.next_turn.clone(), self.tools.clone())
-            .with_depth(ctx.depth + 1);
+            .with_depth(ctx.depth + 1)
+            .with_agent_path(ctx.agent_path.child(self.name.clone()));
+        if let (Some(trace), Some(tool_call_id)) = (ctx.trace.clone(), ctx.tool_call_id.clone()) {
+            engine = engine.with_trace_parent(trace, tool_call_id.0);
+        }
         if let Some(client) = ctx.client.clone() {
             engine = engine.with_client(client);
         }
+        // Propagate the parent's observer so the nested agent's requests and
+        // responses are captured too, attributed to its child `AgentPath`.
+        if let Some(observer) = ctx.observer.clone() {
+            engine = engine.with_observer(observer);
+        }
 
         let mut sink = CapturingSink::default();
-        let outcome = engine.run_prompt(&mut session, &mut sink, &ctx.cancel).await;
+        let outcome = engine
+            .run_prompt(&mut session, &mut sink, &ctx.cancel)
+            .await;
 
         match outcome {
             Ok(stop_reason) => {
@@ -169,7 +189,6 @@ impl Tool for SubagentTool {
         }
     }
 }
-
 
 /// An [`UpdateSink`] that captures assistant-visible text from the nested turn
 /// so it can be streamed back to the parent as tool output.
@@ -198,8 +217,12 @@ fn events(events: Vec<ToolEvent>) -> BoxStream<'static, ToolEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{CancellationToken, StopReason, ToolCallId, TurnEvent};
+    use agent_core::{
+        CancellationToken, NextTurnService, StopReason, ToolCallId, TurnContext, TurnEvent,
+    };
+    use async_trait::async_trait;
     use futures::StreamExt;
+    use std::sync::Mutex;
     use turn_replay::ReplayTurnService;
 
     fn ctx_at_depth(depth: usize) -> ToolContext {
@@ -210,6 +233,101 @@ mod tests {
 
     async fn collect(stream: BoxStream<'static, ToolEvent>) -> Vec<ToolEvent> {
         stream.collect().await
+    }
+
+    struct WorkspaceRecorder(Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl NextTurnService for WorkspaceRecorder {
+        async fn get_next_turn_streaming(
+            &self,
+            ctx: &TurnContext,
+        ) -> agent_core::Result<futures::stream::BoxStream<'static, TurnEvent>> {
+            *self.0.lock().unwrap() = ctx.workspace_roots.clone();
+            Ok(Box::pin(futures::stream::iter(vec![
+                TurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_agent_inherits_workspace_roots() {
+        let backend = Arc::new(WorkspaceRecorder(Mutex::new(Vec::new())));
+        let tool = SubagentTool::new(backend.clone(), ToolRegistry::new());
+        let mut ctx = ctx_at_depth(0);
+        ctx.workspace_roots = vec!["/workspace/project".into(), "/workspace/shared".into()];
+
+        collect(
+            tool.call(serde_json::json!({ "task": "inspect" }), &ctx)
+                .await
+                .unwrap(),
+        )
+        .await;
+
+        assert_eq!(*backend.0.lock().unwrap(), ctx.workspace_roots);
+    }
+
+    #[tokio::test]
+    async fn propagates_observer_and_child_agent_path_to_nested_engine() {
+        use agent_core::{
+            AgentPath, AgentRunMetadata, SharedTurnObserver, ToolCallId, TraceContext,
+            TurnObservation, TurnObserver,
+        };
+        use std::sync::Mutex;
+
+        // An observer that records the agent path of every captured request.
+        #[derive(Default)]
+        struct RecordingObserver {
+            observations: Mutex<Vec<TurnObservation>>,
+        }
+        impl TurnObserver for RecordingObserver {
+            fn on_turn_request(&self, obs: &TurnObservation) {
+                self.observations.lock().unwrap().push(obs.clone());
+            }
+        }
+
+        let replay = Arc::new(ReplayTurnService::single(vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }]));
+        let tool = SubagentTool::new(replay, ToolRegistry::new());
+
+        let observer = Arc::new(RecordingObserver::default());
+        // The parent engine dispatched from `root`, so the tool context carries
+        // that identity and the shared observer.
+        let mut ctx = ctx_at_depth(0);
+        ctx.observer = Some(observer.clone() as SharedTurnObserver);
+        ctx.agent_path = AgentPath::root();
+        ctx.trace = Some(TraceContext {
+            turn_id: "turn-parent".into(),
+            agent_run_id: "agent-parent".into(),
+            parent_agent_run_id: None,
+            spawned_by_tool_call_id: None,
+            round_id: Some("round-parent".into()),
+            agent_path: "root".into(),
+            metadata: AgentRunMetadata::default(),
+        });
+        ctx.tool_call_id = Some(ToolCallId("delegate-call".to_string()));
+
+        let stream = tool
+            .call(serde_json::json!({ "task": "do a thing" }), &ctx)
+            .await
+            .unwrap();
+        let _ = collect(stream).await;
+
+        // The nested engine issued its request under a child path of `root`.
+        let observations = observer.observations.lock().unwrap();
+        assert_eq!(observations[0].agent_path, "root › delegate");
+        assert_eq!(observations[0].trace.turn_id, "turn-parent");
+        assert_eq!(
+            observations[0].trace.parent_agent_run_id.as_deref(),
+            Some("agent-parent")
+        );
+        assert_eq!(
+            observations[0].trace.spawned_by_tool_call_id.as_deref(),
+            Some("delegate-call")
+        );
     }
 
     #[tokio::test]
@@ -225,7 +343,10 @@ mod tests {
         let tool = SubagentTool::new(replay, ToolRegistry::new());
 
         let stream = tool
-            .call(serde_json::json!({ "task": "do a thing" }), &ctx_at_depth(0))
+            .call(
+                serde_json::json!({ "task": "do a thing" }),
+                &ctx_at_depth(0),
+            )
             .await
             .unwrap();
         let evts = collect(stream).await;

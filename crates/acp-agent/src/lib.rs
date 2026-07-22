@@ -20,6 +20,7 @@ pub mod config;
 pub mod local_client;
 pub mod selection;
 pub mod sink;
+pub mod turn_coordinator;
 pub mod usage;
 
 use std::sync::Arc;
@@ -37,6 +38,7 @@ pub use config::{AgentConfig, DEFAULT_SYSTEM_PROMPT};
 pub use local_client::LocalClientAccess;
 pub use selection::ModelSelection;
 pub use sink::AcpUpdateSink;
+pub use turn_coordinator::{TurnCoordinator, TurnLease};
 pub use usage::{format_usage, USAGE_COMMAND};
 // Re-export the model catalog helpers so downstream tools (e.g. the CLI
 // `/usage` command) can price token usage without depending on the backend
@@ -77,13 +79,27 @@ pub fn canned_replay_factory() -> NextTurnFactory {
 /// when no key can be resolved from either source.
 #[must_use]
 pub fn anthropic_factory() -> Option<NextTurnFactory> {
+    anthropic_factory_with_observer(None)
+}
+
+/// Like [`anthropic_factory`], but attaches an optional
+/// [`turn_anthropic::RequestObserver`] to every constructed backend so an
+/// observability seam (e.g. the LLM inspector) can capture the exact request
+/// body of each turn, attributed to its session.
+#[must_use]
+pub fn anthropic_factory_with_observer(
+    observer: Option<Arc<dyn turn_anthropic::RequestObserver>>,
+) -> Option<NextTurnFactory> {
     let config = turn_anthropic::AnthropicConfig::from_env()?;
     Some(Arc::new(move |selection| {
         let mut turn_config = config.clone();
         turn_config.model = selection.model.clone();
         turn_config.effort = Some(selection.effort);
-        let service: Arc<dyn NextTurnService> =
-            Arc::new(turn_anthropic::AnthropicTurnService::new(turn_config));
+        let mut service = turn_anthropic::AnthropicTurnService::new(turn_config);
+        if let Some(observer) = &observer {
+            service = service.with_observer(observer.clone());
+        }
+        let service: Arc<dyn NextTurnService> = Arc::new(service);
         service
     }))
 }
@@ -160,8 +176,35 @@ pub async fn register_configured_mcp_tools(
 /// the subagent tool, and environment-derived configuration.
 #[must_use]
 pub fn default_deps() -> AgentDeps {
+    default_deps_with_observer(None)
+}
+
+/// Like [`default_deps`], but attaches an optional
+/// [`turn_anthropic::RequestObserver`] to the Anthropic backend (when selected),
+/// so the LLM inspector can capture the real outgoing requests.
+///
+/// The observer is only wired into the real Anthropic backend; the deterministic
+/// replay fallback makes no network calls, so there is nothing to observe there.
+#[must_use]
+pub fn default_deps_with_observer(
+    observer: Option<Arc<dyn turn_anthropic::RequestObserver>>,
+) -> AgentDeps {
+    default_deps_with_observers(observer, None, None)
+}
+
+/// Like [`default_deps_with_observer`], but also attaches a provider-neutral
+/// [`agent_core::TurnObserver`] to every turn engine (capturing the typed
+/// request snapshot for *any* backend, including replay) and records the
+/// inspector's base URL so the ACP layer can greet each new session with a
+/// per-session inspector link.
+#[must_use]
+pub fn default_deps_with_observers(
+    request_observer: Option<Arc<dyn turn_anthropic::RequestObserver>>,
+    turn_observer: Option<Arc<dyn agent_core::TurnObserver>>,
+    inspector_base_url: Option<String>,
+) -> AgentDeps {
     let config = AgentConfig::from_env();
-    let (next_turn_factory, backend) = match anthropic_factory() {
+    let (next_turn_factory, backend) = match anthropic_factory_with_observer(request_observer) {
         Some(factory) => (factory, "anthropic"),
         None => (canned_replay_factory(), "replay"),
     };
@@ -181,6 +224,8 @@ pub fn default_deps() -> AgentDeps {
         tools,
         config,
         store,
+        turn_observer,
+        inspector_base_url,
     }
 }
 

@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>LLM Inspector</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #16181d;
+    color: #d7dae0;
+  }
+  header {
+    padding: 10px 16px;
+    background: #1f2229;
+    border-bottom: 1px solid #2c303a;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    position: sticky;
+    top: 0;
+    z-index: 2;
+  }
+  header h1 { font-size: 15px; margin: 0; font-weight: 600; }
+  header .stat { font-size: 12px; color: #8b93a1; }
+  header label { font-size: 12px; color: #8b93a1; }
+  main { display: grid; grid-template-columns: 240px minmax(360px, 42%) 1fr; height: calc(100vh - 45px); }
+  #sessions, #tree { overflow-y: auto; border-right: 1px solid #2c303a; }
+  #detail { flex: 1; overflow-y: auto; padding: 12px 16px; }
+  .pane-title { padding: 8px 12px; color: #8b93a1; background: #1b1e25; border-bottom: 1px solid #2c303a; font-size: 11px; text-transform: uppercase; position: sticky; top: 0; z-index: 1; }
+  .session-card { padding: 10px 12px; border-bottom: 1px solid #23262e; cursor: pointer; font-size: 12px; }
+  .session-card:hover, .session-card.active { background: #2a3140; }
+  .tree-row { padding: 5px 8px; border-bottom: 1px solid #20232a; cursor: pointer; font-size: 12px; }
+  .tree-row:hover, .tree-row.active { background: #2a3140; }
+  .tree-row .sub { color: #8b93a1; font-size: 10px; margin-top: 2px; }
+  .status { display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:7px; background:#8b93a1; }
+  .status.running { background:#6fb1ff; box-shadow:0 0 6px #6fb1ff; }
+  .status.completed { background:#70d08d; }
+  .status.failed, .status.interrupted { background:#ff7979; }
+  .status.cancelled { background:#e0b070; }
+  .tabs { display:flex; gap:4px; border-bottom:1px solid #2c303a; margin-bottom:12px; flex-wrap:wrap; }
+  .tab { padding:6px 9px; cursor:pointer; color:#8b93a1; font-size:11px; }
+  .tab.active { color:#d7dae0; border-bottom:2px solid #6fb1ff; }
+  .session-group { border-bottom: 1px solid #2c303a; }
+  .session-title {
+    padding: 8px 12px;
+    font-size: 12px;
+    color: #6fb1ff;
+    background: #1b1e25;
+    position: sticky;
+    top: 0;
+  }
+  .item {
+    padding: 8px 12px 8px 20px;
+    cursor: pointer;
+    border-bottom: 1px solid #23262e;
+    font-size: 12px;
+  }
+  .item:hover { background: #21252d; }
+  .item.active { background: #2a3140; }
+  .item .row1 { display: flex; justify-content: space-between; }
+  .item .model { color: #c8a3ff; }
+  .item .meta { color: #8b93a1; margin-top: 2px; }
+  pre {
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-size: 12px;
+    line-height: 1.45;
+    margin: 0;
+  }
+  .empty { padding: 24px; color: #8b93a1; }
+  .badge {
+    display: inline-block;
+    background: #2c303a;
+    color: #a9b2c0;
+    border-radius: 4px;
+    padding: 1px 6px;
+    font-size: 11px;
+    margin-left: 6px;
+  }
+  .kind { border-radius: 4px; padding: 1px 6px; font-size: 10px; text-transform: uppercase; }
+  .kind.typed { background: #223a2a; color: #7fdca0; }
+  .kind.provider { background: #2a2740; color: #b6a3ff; }
+  .kind.response { background: #24303f; color: #6fb1ff; }
+  .kind.log { background: #33291b; color: #e0b070; }
+  .kind.state { background: #2b2440; color: #d0a3ff; }
+  .item.state .model { color: #d0a3ff; }
+  .agent-title {
+    padding: 5px 12px 5px 18px;
+    font-size: 11px;
+    color: #c8a3ff;
+    background: #15171c;
+    border-top: 1px solid #23262e;
+  }
+  .agent-title .badge { background: #262a34; }
+  .item { padding-left: 26px; }
+  .sess-summary { padding: 4px 12px 8px; font-size: 11px; color: #8b93a1; background: #1b1e25; }
+  .usage-grid { display: grid; grid-template-columns: max-content 1fr; gap: 2px 14px; font-size: 12px; }
+  .usage-grid .k { color: #8b93a1; }
+  .usage-grid .v { color: #d7dae0; }
+  .lvl { border-radius: 4px; padding: 1px 6px; font-size: 10px; }
+  .lvl.ERROR { background: #3a2020; color: #ff8f8f; }
+  .lvl.WARN { background: #33291b; color: #e0b070; }
+  .lvl.INFO { background: #1f2c22; color: #7fdca0; }
+  .lvl.DEBUG, .lvl.TRACE { background: #23262e; color: #8b93a1; }
+  .item.log .model { color: #e0b070; }
+  .item.response .model { color: #6fb1ff; }
+  .msg { border: 1px solid #2c303a; border-radius: 6px; margin-bottom: 10px; overflow: hidden; }
+  .msg > .role { padding: 4px 10px; font-size: 11px; background: #1b1e25; color: #8b93a1; }
+  .msg.user > .role { color: #6fb1ff; }
+  .msg.assistant > .role { color: #7fdca0; }
+  .msg.tool_call > .role, .msg.tool_result > .role { color: #d6b26b; }
+  .msg.thinking > .role { color: #b6a3ff; }
+  .msg > pre { padding: 8px 10px; }
+  .section-title { font-size: 12px; color: #8b93a1; margin: 14px 0 6px; }
+  .sys { border-left: 3px solid #3a4050; padding: 6px 10px; color: #c8cdd6; background: #1b1e25; }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: #8b93a1; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LLM Inspector</h1>
+  <span class="stat" id="stat">loading…</span>
+  <span style="flex:1"></span>
+  <label><input type="checkbox" id="auto" checked /> auto-refresh</label>
+</header>
+<main>
+  <div id="sessions"><div class="pane-title">Sessions</div></div>
+  <div id="tree"><div class="pane-title">Execution</div><div class="empty">Select a session.</div></div>
+  <div id="detail"><div class="empty">Select a turn, agent, round, or tool.</div></div>
+</main>
+<script>
+let sends = [];
+// Latest persisted state per session (session_id -> CapturedSessionState).
+let statesBySession = {};
+// The selected record id: a number for a captured request, or the string
+// 'state:<session_id>' when the session-state panel is selected.
+let selectedId = null;
+let selectedSession = null;
+let selectedTab = 'summary';
+let nodeIndex = new Map();
+// Optional per-session filter, taken from the page URL (?session=<id>).
+const sessionFilter = new URLSearchParams(location.search).get('session');
+if (sessionFilter) {
+  selectedSession = sessionFilter;
+  document.querySelector('header h1').textContent = 'LLM Inspector · ' + sessionFilter;
+}
+
+function fmtTime(ms) {
+  const d = new Date(ms);
+  return d.toLocaleTimeString() + '.' + String(ms % 1000).padStart(3, '0');
+}
+function fmtBytes(n) {
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1024 / 1024).toFixed(2) + ' MB';
+}
+
+// Sum the token usage across a set of response records.
+function sumUsage(items) {
+  const u = { input_tokens: 0, output_tokens: 0,
+              cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  for (const s of items) {
+    if (s.kind === 'response' && s.usage) {
+      u.input_tokens += s.usage.input_tokens || 0;
+      u.output_tokens += s.usage.output_tokens || 0;
+      u.cache_read_input_tokens += s.usage.cache_read_input_tokens || 0;
+      u.cache_creation_input_tokens += s.usage.cache_creation_input_tokens || 0;
+    }
+  }
+  return u;
+}
+// Percentage of input tokens served from the prompt cache (token reuse).
+function reusePct(u) {
+  const totalIn = u.input_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens;
+  return totalIn ? Math.round(100 * u.cache_read_input_tokens / totalIn) : 0;
+}
+
+// A short one-line summary of a record, depending on its kind.
+function metaLine(s) {
+  if (s.kind === 'typed') {
+    return (s.num_entries || 0) + ' entries · ' + (s.tools ? s.tools.length : 0) +
+           ' tools · depth ' + (s.depth || 0);
+  }
+  if (s.kind === 'response') {
+    const u = s.usage || {};
+    const toks = (u.output_tokens || 0) + ' out · ' + (u.input_tokens || 0) + ' in';
+    const cache = u.cache_read_input_tokens ? ' · ' + u.cache_read_input_tokens + ' cached' : '';
+    const dur = s.duration_ms != null ? ' · ' + s.duration_ms + 'ms' : '';
+    return (s.stop_reason || (s.error ? 'error' : 'response')) + ' · ' + toks + cache + dur;
+  }
+  if (s.kind === 'log') {
+    return escapeHtml(s.target || '') + (s.message ? ' · ' + escapeHtml(s.message).slice(0, 80) : '');
+  }
+  return (s.num_messages || 0) + ' msg · ' + (s.num_tools || 0) + ' tools · ' +
+         fmtBytes(s.size_bytes || 0);
+}
+
+// A short label for a record's title column.
+function titleFor(s) {
+  if (s.kind === 'response') return 'response';
+  if (s.kind === 'log') return (s.level || 'LOG');
+  return s.model || (s.kind === 'typed' ? 'typed request' : '(model?)');
+}
+
+function buildTree(sid) {
+  const records = sends.filter(s => s.session_id === sid).slice().sort((a,b) => a.id-b.id);
+  const turns = new Map(), runs = new Map(), rounds = new Map(), tools = new Map();
+  const ensureTurn = id => turns.get(id) || (turns.set(id,{type:'turn',id,status:'running',runs:[],records:[]}),turns.get(id));
+  const ensureRun = t => runs.get(t.agent_run_id) || (runs.set(t.agent_run_id,{type:'run',id:t.agent_run_id,trace:t,status:'running',rounds:[],children:[],records:[]}),runs.get(t.agent_run_id));
+  for (const r of records) {
+    const t = r.trace;
+    if (t) {
+      const turn = ensureTurn(t.turn_id), run = ensureRun(t);
+      if (!turn.runs.includes(run)) turn.runs.push(run);
+      run.records.push(r); turn.records.push(r);
+      if (t.round_id) {
+        const key=t.agent_run_id+'|'+t.round_id;
+        if (!rounds.has(key)) rounds.set(key,{type:'round',id:key,trace:t,status:'running',records:[],tools:[]});
+        const round=rounds.get(key); round.records.push(r);
+        if (!run.rounds.includes(round)) run.rounds.push(round);
+      }
+    }
+    if (r.kind !== 'trace' || !r.event) continue;
+    const e=r.event, eventTrace=e.trace, run=ensureRun(eventTrace), turn=ensureTurn(eventTrace.turn_id);
+    if (e.type==='turn_finished') { turn.status=e.status; turn.stop_reason=e.stop_reason; turn.duration_ms=e.duration_ms; }
+    if (e.type==='agent_run_finished') { run.status=e.status; run.stop_reason=e.stop_reason; run.duration_ms=e.duration_ms; }
+    if (e.type==='round_finished') {
+      const round=rounds.get(eventTrace.agent_run_id+'|'+eventTrace.round_id); if(round){round.status=e.status;round.stop_reason=e.stop_reason;round.duration_ms=e.duration_ms;round.usage=e.usage;}
+    }
+    if (e.type==='tool_call_started') {
+      const key=eventTrace.agent_run_id+'|'+e.tool_call_id;
+      const tool={type:'tool',id:key,trace:eventTrace,tool_call_id:e.tool_call_id,name:e.name,arguments:e.arguments,status:'running',records:[r],children:[]};
+      tools.set(key,tool); const round=rounds.get(eventTrace.agent_run_id+'|'+eventTrace.round_id); if(round)round.tools.push(tool);
+    }
+    if (e.type==='tool_call_finished') {
+      const tool=tools.get(eventTrace.agent_run_id+'|'+e.tool_call_id); if(tool){tool.status=e.status;tool.output=e.output;tool.duration_ms=e.duration_ms;tool.records.push(r);}
+    }
+  }
+  for (const run of runs.values()) {
+    if (run.trace.parent_agent_run_id) {
+      const parent=runs.get(run.trace.parent_agent_run_id);
+      const tool=tools.get(run.trace.parent_agent_run_id+'|'+run.trace.spawned_by_tool_call_id);
+      if (tool) tool.children.push(run); else if (parent) parent.children.push(run);
+    }
+  }
+  // If a containing lifecycle finished while a descendant never produced its
+  // matching finish event, expose the gap as interrupted rather than leaving a
+  // stale live indicator forever.
+  const interruptOpen = run => {
+    if(run.status==='running')run.status='interrupted';
+    for(const round of run.rounds){
+      if(round.status==='running')round.status='interrupted';
+      for(const tool of round.tools){
+        if(tool.status==='running')tool.status='interrupted';
+        for(const child of tool.children)interruptOpen(child);
+      }
+    }
+    for(const child of run.children)interruptOpen(child);
+  };
+  for(const turn of turns.values()) {
+    if(turn.status!=='running')for(const run of turn.runs)interruptOpen(run);
+    else for(const run of turn.runs)if(run.status!=='running')for(const round of run.rounds)if(round.status==='running')round.status='interrupted';
+  }
+  return [...turns.values()];
+}
+
+function statusDot(status) { return '<span class="status '+escapeHtml(status||'running')+'"></span>'; }
+function usageLine(items) { const u=sumUsage(items); return u.output_tokens+' out · '+u.input_tokens+' in · '+reusePct(u)+'% reused'; }
+function nodeLabel(node) {
+  if(node.type==='turn') return 'Prompt turn · '+node.id;
+  if(node.type==='run') { const m=node.trace.metadata||{}; return (m.mode||m.kind||node.trace.agent_path||'Agent')+(m.step_index!=null?' · step '+(m.step_index+1):'')+(m.attempt!=null?' · attempt '+m.attempt:''); }
+  if(node.type==='round') return 'LLM round · '+(node.trace.round_id||'');
+  return prettyTool(node.name,node.arguments).title;
+}
+function addNodeHtml(node,depth) {
+  nodeIndex.set(node.type+':'+node.id,node);
+  const key=node.type+':'+node.id, active=selectedId===key?' active':'';
+  let html='<div class="tree-row'+active+'" data-node="'+escapeHtml(key)+'" style="padding-left:'+(10+depth*16)+'px">'+statusDot(node.status)+'<strong>'+escapeHtml(nodeLabel(node))+'</strong>';
+  html+='<div class="sub">'+(node.duration_ms!=null?node.duration_ms+' ms · ':'')+(node.records?usageLine(node.records):'')+(node.stop_reason?' · '+escapeHtml(node.stop_reason):'')+'</div></div>';
+  if(node.type==='turn') for(const run of node.runs.filter(r=>!r.trace.parent_agent_run_id)) html+=addNodeHtml(run,depth+1);
+  if(node.type==='run') { for(const round of node.rounds) html+=addNodeHtml(round,depth+1); for(const child of node.children) html+=addNodeHtml(child,depth+1); }
+  if(node.type==='round') for(const tool of node.tools) html+=addNodeHtml(tool,depth+1);
+  if(node.type==='tool') for(const child of node.children) html+=addNodeHtml(child,depth+1);
+  return html;
+}
+
+function render() {
+  const sessions = document.getElementById('sessions'), treeEl=document.getElementById('tree');
+  document.getElementById('stat').textContent =
+    sends.length + ' record(s) · ' +
+    new Set(sends.map(s => s.session_id)).size + ' session(s) · ' +
+    new Set(sends.map(s => (s.session_id || '') + '|' + (s.agent_path || 'root'))).size + ' agent(s)';
+  const ids=[...new Set([...sends.map(s=>s.session_id),...Object.keys(statesBySession)])];
+  if(!selectedSession&&ids.length)selectedSession=ids[0];
+  sessions.innerHTML='<div class="pane-title">Sessions</div>'+ids.map(sid=>{const items=sends.filter(s=>s.session_id===sid);const active=sid===selectedSession?' active':'';return '<div class="session-card'+active+'" data-session="'+escapeHtml(sid)+'"><strong>'+escapeHtml(sid)+'</strong><div class="meta">'+usageLine(items)+' · '+items.length+' records</div></div>';}).join('');
+  for(const el of sessions.querySelectorAll('.session-card'))el.onclick=()=>{selectedSession=el.dataset.session;selectedId=null;render();renderDetail();};
+  nodeIndex=new Map(); const turns=selectedSession?buildTree(selectedSession):[];
+  let html='<div class="pane-title">Execution</div>';
+  if(statesBySession[selectedSession])html+='<div class="tree-row" data-state="'+escapeHtml(selectedSession)+'"><strong>Session state</strong><div class="sub">live memory and tools</div></div>';
+  html+=turns.length?turns.map(t=>addNodeHtml(t,0)).join(''):'<div class="empty">No traced turns yet.</div>';
+  treeEl.innerHTML=html;
+  for(const el of treeEl.querySelectorAll('[data-node]'))el.onclick=()=>{selectedId=el.dataset.node;selectedTab='summary';render();renderDetail();};
+  for(const el of treeEl.querySelectorAll('[data-state]'))el.onclick=()=>{selectedId='state:'+el.dataset.state;renderDetail();};
+}
+
+// Extract the plain text of a typed content-block array.
+function blocksText(blocks) {
+  if (!Array.isArray(blocks)) return '';
+  return blocks.map(b => (b && b.type === 'text') ? b.text : JSON.stringify(b)).join('');
+}
+
+// Normalize a typed-history `tool` object (serde-tagged KnownTool) into a plain
+// {name, args} pair. Known tools are tagged `tool: "<name>"` with their fields
+// inline; the `other` variant carries `{name, arguments}`.
+function normalizeToolEntry(tool) {
+  if (!tool || typeof tool !== 'object') return { name: '', args: {} };
+  const tag = tool.tool;
+  if (tag === 'other' || tag === undefined) {
+    return { name: tool.name || tag || '', args: tool.arguments || {} };
+  }
+  const args = {};
+  for (const k of Object.keys(tool)) if (k !== 'tool') args[k] = tool[k];
+  return { name: tag, args };
+}
+
+// Truncate long text for a compact preview.
+function preview(text, n) {
+  text = String(text == null ? '' : text);
+  return text.length > n ? text.slice(0, n) + '\n… (' + text.length + ' chars total)' : text;
+}
+
+// Render a known tool call as a friendly {title, body}. Falls back to the raw
+// name + pretty JSON for unknown/MCP tools so nothing is ever lost.
+function prettyTool(name, args) {
+  args = args || {};
+  const a = k => args[k];
+  switch (name) {
+    case 'fs_write':
+      return { title: '📝 Write file — ' + (a('path') || '?'),
+               body: preview(a('content'), 4000) };
+    case 'fs_read':
+      return { title: '📖 Read file — ' + (a('path') || '?'), body: '' };
+    case 'edit':
+      return { title: '✏️ Edit file — ' + (a('path') || '?'),
+               body: '- old:\n' + preview(a('old_text'), 2000) +
+                     '\n\n+ new:\n' + preview(a('new_text'), 2000) };
+    case 'terminal_run': {
+      const cmd = [a('command')].concat(Array.isArray(a('args')) ? a('args') : []).join(' ');
+      return { title: '💻 Run — ' + cmd.trim(), body: '' };
+    }
+    case 'run_subagent':
+      return { title: '🤖 Sub-agent — ' + (a('mode') || '?') + ' · step ' + (a('step_index') != null ? a('step_index') : '?'),
+               body: [a('instructions') && ('instructions: ' + a('instructions')),
+                      a('scope') && ('scope: ' + a('scope')),
+                      a('model_tier') && ('model_tier: ' + a('model_tier'))].filter(Boolean).join('\n') };
+    case 'orchestrate':
+      return { title: '🧭 Orchestrate — ' + preview(a('goal'), 200), body: '' };
+    case 'delegate':
+      return { title: '🤝 Delegate', body: preview(a('task'), 2000) };
+    case 'submit_result':
+    case 'submit':
+      return { title: '✅ ' + (name === 'submit' ? 'Submit' : 'Submit result'),
+               body: a('summary') || a('output') || '' };
+    case 'submit_review':
+      return { title: '🔎 Submit review — ' + (a('approved') ? 'approved' : 'changes requested'),
+               body: a('reasons') || '' };
+    default:
+      return { title: '🔧 ' + name, body: JSON.stringify(args, null, 2) };
+  }
+}
+
+// Append a tool-call card rendered nicely from (name, args).
+function appendToolCall(detail, name, args) {
+  const p = prettyTool(name, args);
+  appendCard(detail, 'tool_call', p.title, p.body);
+}
+
+// Render one typed history entry as a labelled message card.
+function renderEntry(entry) {
+  // HistoryEntry is serde-tagged with `kind`; content blocks are tagged `type`.
+  const kind = entry.kind || 'entry';
+  let label = kind, bodyText = '';
+  if (kind === 'user' || kind === 'assistant') {
+    bodyText = blocksText(entry.content);
+  } else if (kind === 'thinking') {
+    bodyText = entry.text || entry.thinking || JSON.stringify(entry, null, 2);
+  } else if (kind === 'tool_call') {
+    // Render known built-in tools nicely instead of dumping raw JSON.
+    const nt = normalizeToolEntry(entry.tool);
+    const p = prettyTool(nt.name, nt.args);
+    label = p.title;
+    bodyText = p.body;
+  } else if (kind === 'tool_result') {
+    label = 'tool_result' + (entry.success === false ? ' (failed)' : '');
+    bodyText = blocksText(entry.content);
+  } else {
+    bodyText = JSON.stringify(entry, null, 2);
+  }
+  const pre = document.createElement('pre');
+  pre.textContent = bodyText;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + kind;
+  const role = document.createElement('div');
+  role.className = 'role';
+  role.textContent = label;
+  wrap.appendChild(role);
+  wrap.appendChild(pre);
+  return wrap;
+}
+
+function renderTyped(detail, s) {
+  if (s.system_prompt) {
+    const t = document.createElement('div');
+    t.className = 'section-title';
+    t.textContent = 'system prompt';
+    const sys = document.createElement('div');
+    sys.className = 'sys';
+    sys.textContent = s.system_prompt;
+    detail.appendChild(t);
+    detail.appendChild(sys);
+  }
+  if (s.tools && s.tools.length) {
+    const t = document.createElement('div');
+    t.className = 'section-title';
+    t.textContent = 'tools (' + s.tools.length + ')';
+    detail.appendChild(t);
+    const pre = document.createElement('pre');
+    pre.textContent = s.tools.map(x =>
+      '• ' + x.name + (x.requires_permission ? ' (needs permission)' : '')).join('\n');
+    detail.appendChild(pre);
+  }
+  const t = document.createElement('div');
+  t.className = 'section-title';
+  t.textContent = 'typed history (' + (s.num_entries || 0) + ' entries)';
+  detail.appendChild(t);
+  const entries = Array.isArray(s.history) ? s.history
+    : (s.history && Array.isArray(s.history.entries) ? s.history.entries : []);
+  for (const entry of entries) detail.appendChild(renderEntry(entry));
+}
+
+// Append a labelled message card with the given body text.
+function appendCard(detail, cls, label, bodyText) {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg ' + cls;
+  const role = document.createElement('div');
+  role.className = 'role';
+  role.textContent = label;
+  const pre = document.createElement('pre');
+  pre.textContent = bodyText;
+  wrap.appendChild(role);
+  wrap.appendChild(pre);
+  detail.appendChild(wrap);
+}
+
+// Render a typed response record: assistant text, thinking, tool calls, usage.
+function renderResponse(detail, s) {
+  const u = s.usage || {};
+  // Usage / token-reuse grid.
+  const t = document.createElement('div');
+  t.className = 'section-title';
+  t.textContent = 'usage & token reuse';
+  detail.appendChild(t);
+  const grid = document.createElement('div');
+  grid.className = 'usage-grid';
+  const rows = [
+    ['stop reason', s.stop_reason || (s.error ? 'error' : '—')],
+    ['duration', (s.duration_ms != null ? s.duration_ms + ' ms' : '—')],
+    ['output tokens', u.output_tokens || 0],
+    ['fresh input tokens', u.input_tokens || 0],
+    ['cache-read (reused)', u.cache_read_input_tokens || 0],
+    ['cache-creation', u.cache_creation_input_tokens || 0],
+    ['reuse', reusePct(u) + '%'],
+  ];
+  for (const [k, v] of rows) {
+    const kd = document.createElement('div'); kd.className = 'k'; kd.textContent = k;
+    const vd = document.createElement('div'); vd.className = 'v'; vd.textContent = v;
+    grid.appendChild(kd); grid.appendChild(vd);
+  }
+  detail.appendChild(grid);
+
+  if (s.error) appendCard(detail, 'tool_result', 'error', s.error);
+  if (s.assistant_text) appendCard(detail, 'assistant', 'assistant text', s.assistant_text);
+  if (s.thinking_chars) {
+    appendCard(detail, 'thinking', 'thinking', '(' + s.thinking_chars + ' characters streamed)');
+  }
+  const calls = Array.isArray(s.tool_calls) ? s.tool_calls : [];
+  for (const c of calls) {
+    appendToolCall(detail, c.name || '', c.arguments || {});
+  }
+}
+
+// Render the persisted session state: mode, roots, cumulative usage, system
+// prompt, canonical todo list, available tools, and typed conversation history.
+function renderState(detail, st) {
+  const u = st.usage || {};
+  const roots = Array.isArray(st.workspace_roots) ? st.workspace_roots : [];
+  const t = document.createElement('div');
+  t.className = 'section-title';
+  t.textContent = 'session state';
+  detail.appendChild(t);
+  const grid = document.createElement('div');
+  grid.className = 'usage-grid';
+  const rows = [
+    ['session', st.session_id],
+    ['mode', st.mode || '—'],
+    ['history entries', st.num_entries || 0],
+    ['working directory', roots.length ? roots[0] : '—'],
+    ['additional roots', roots.length > 1 ? roots.slice(1).join(', ') : '—'],
+    ['updated', fmtTime(st.timestamp_ms)],
+    ['output tokens', u.output_tokens || 0],
+    ['fresh input tokens', u.input_tokens || 0],
+    ['cache-read (reused)', u.cache_read_input_tokens || 0],
+    ['cache-creation', u.cache_creation_input_tokens || 0],
+    ['reuse', reusePct(u) + '%'],
+  ];
+  for (const [k, v] of rows) {
+    const kd = document.createElement('div'); kd.className = 'k'; kd.textContent = k;
+    const vd = document.createElement('div'); vd.className = 'v'; vd.textContent = v;
+    grid.appendChild(kd); grid.appendChild(vd);
+  }
+  detail.appendChild(grid);
+
+  if (st.system_prompt) {
+    const st2 = document.createElement('div');
+    st2.className = 'section-title';
+    st2.textContent = 'system prompt';
+    const sys = document.createElement('div');
+    sys.className = 'sys';
+    sys.textContent = st.system_prompt;
+    detail.appendChild(st2);
+    detail.appendChild(sys);
+  }
+  const todoItems = st.todo_list && Array.isArray(st.todo_list.items)
+    ? st.todo_list.items : [];
+  const todoTitle = document.createElement('div');
+  todoTitle.className = 'section-title';
+  todoTitle.textContent = 'todo list (' + todoItems.length + ')';
+  detail.appendChild(todoTitle);
+  if (todoItems.length === 0) {
+    const emptyTodo = document.createElement('div');
+    emptyTodo.className = 'empty';
+    emptyTodo.textContent = 'No canonical todo items.';
+    detail.appendChild(emptyTodo);
+  } else {
+    const todo = document.createElement('pre');
+    todo.textContent = todoItems.map(item =>
+      '[' + (item.status || 'pending') + '] ' + (item.id || '—') + ' · ' +
+      (item.content || '')).join('\n');
+    detail.appendChild(todo);
+  }
+  if (st.tools && st.tools.length) {
+    const tt = document.createElement('div');
+    tt.className = 'section-title';
+    tt.textContent = 'tools (' + st.tools.length + ')';
+    detail.appendChild(tt);
+    const pre = document.createElement('pre');
+    pre.textContent = st.tools.map(x =>
+      '• ' + x.name + (x.requires_permission ? ' (needs permission)' : '')).join('\n');
+    detail.appendChild(pre);
+  }
+  const ht = document.createElement('div');
+  ht.className = 'section-title';
+  ht.textContent = 'conversation history (' + (st.num_entries || 0) + ' entries)';
+  detail.appendChild(ht);
+  const entries = Array.isArray(st.history) ? st.history
+    : (st.history && Array.isArray(st.history.entries) ? st.history.entries : []);
+  if (entries.length === 0) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = 'No history yet.';
+    detail.appendChild(empty);
+  }
+  for (const entry of entries) detail.appendChild(renderEntry(entry));
+}
+
+// Render an agent log record: level, target, message, structured fields.
+function renderLog(detail, s) {
+  const wrap = document.createElement('div');
+  wrap.className = 'section-title';
+  wrap.innerHTML = '<span class="lvl ' + escapeHtml(s.level || '') + '">' +
+    escapeHtml(s.level || '') + '</span> ' + escapeHtml(s.target || '');
+  detail.appendChild(wrap);
+  appendCard(detail, 'assistant', 'message', s.message || '');
+  const fields = s.fields && Object.keys(s.fields).length ? s.fields : null;
+  if (fields) {
+    appendCard(detail, 'tool_call', 'fields', JSON.stringify(fields, null, 2));
+  }
+}
+
+function nodeRecords(node) {
+  const direct=node.records||[];
+  if(node.type==='turn') return direct;
+  if(node.type==='run') return direct;
+  if(node.type==='round') return direct;
+  return direct;
+}
+
+function renderNodeDetail(detail,node) {
+  const records=nodeRecords(node).slice().sort((a,b)=>a.id-b.id);
+  const byKind=k=>records.filter(r=>r.kind===k);
+  const tabs=['summary','conversation','request','provider','response','tools','logs','raw'];
+  const tabsEl=document.createElement('div'); tabsEl.className='tabs';
+  for(const tab of tabs){const el=document.createElement('div');el.className='tab'+(selectedTab===tab?' active':'');el.textContent=tab;el.onclick=()=>{selectedTab=tab;renderDetail();};tabsEl.appendChild(el);}
+  detail.appendChild(tabsEl);
+  if(selectedTab==='summary') {
+    const u=sumUsage(records), rows=[['node',nodeLabel(node)],['status',node.status||'running'],['duration',node.duration_ms!=null?node.duration_ms+' ms':'running'],['stop reason',node.stop_reason||'—'],['output tokens',u.output_tokens],['fresh input',u.input_tokens],['cache read',u.cache_read_input_tokens],['reuse',reusePct(u)+'%']];
+    const grid=document.createElement('div');grid.className='usage-grid';
+    for(const [k,v] of rows){const a=document.createElement('div');a.className='k';a.textContent=k;const b=document.createElement('div');b.className='v';b.textContent=v;grid.append(a,b);}detail.appendChild(grid);
+    if(node.trace){const m=node.trace.metadata||{};appendCard(detail,'assistant','identity','turn: '+node.trace.turn_id+'\nagent run: '+node.trace.agent_run_id+(node.trace.round_id?'\nround: '+node.trace.round_id:'')+(node.trace.parent_agent_run_id?'\nparent: '+node.trace.parent_agent_run_id:'')+(node.trace.spawned_by_tool_call_id?'\nspawned by: '+node.trace.spawned_by_tool_call_id:'')+'\nmetadata: '+JSON.stringify(m));}
+  } else if(selectedTab==='conversation'||selectedTab==='request') {
+    const typed=byKind('typed'); if(!typed.length) detail.innerHTML+='<div class="empty">No typed request for this node.</div>'; for(const r of typed)renderTyped(detail,r);
+  } else if(selectedTab==='provider') {
+    const provider=byKind('provider'); if(!provider.length) detail.innerHTML+='<div class="empty">No provider body for this node.</div>'; for(const r of provider)appendCard(detail,'tool_call',(r.provider||'provider')+' · '+(r.model||''),JSON.stringify(r.body,null,2));
+  } else if(selectedTab==='response') {
+    const responses=byKind('response'); if(!responses.length) detail.innerHTML+='<div class="empty">No response for this node.</div>'; for(const r of responses)renderResponse(detail,r);
+  } else if(selectedTab==='tools') {
+    if(node.type==='tool'){const p=prettyTool(node.name,node.arguments);appendCard(detail,'tool_call',p.title,p.body);if(node.output)appendCard(detail,node.status==='failed'?'tool_result':'assistant','result',node.output);}
+    const calls=[];for(const r of byKind('response'))for(const c of (r.tool_calls||[]))calls.push(c);if(node.type!=='tool'&&!calls.length)detail.innerHTML+='<div class="empty">No tool calls for this node.</div>';for(const c of calls)appendToolCall(detail,c.name,c.arguments);
+  } else if(selectedTab==='logs') {
+    const logs=byKind('log');if(!logs.length)detail.innerHTML+='<div class="empty">No logs attributed to this node.</div>';for(const r of logs)renderLog(detail,r);
+  } else {
+    const pre=document.createElement('pre');pre.textContent=JSON.stringify({node,records},null,2);detail.appendChild(pre);
+  }
+}
+
+function renderDetail() {
+  const detail = document.getElementById('detail');
+  // The session-state panel is selected via a string id 'state:<session_id>'.
+  if (typeof selectedId === 'string' && selectedId.startsWith('state:')) {
+    const sid = selectedId.slice('state:'.length);
+    const st = statesBySession[sid];
+    if (!st) {
+      detail.innerHTML = '<div class="empty">Session state is no longer available.</div>';
+      return;
+    }
+    detail.innerHTML = '';
+    const hdr = document.createElement('div');
+    hdr.className = 'section-title';
+    hdr.textContent = 'session: ' + sid;
+    detail.appendChild(hdr);
+    renderState(detail, st);
+    const details = document.createElement('details');
+    const summary = document.createElement('summary');
+    summary.textContent = 'raw state JSON';
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(st, null, 2);
+    details.appendChild(summary);
+    details.appendChild(pre);
+    detail.appendChild(details);
+    return;
+  }
+  if (typeof selectedId === 'string' && selectedId.includes(':') && !selectedId.startsWith('state:')) {
+    const node=nodeIndex.get(selectedId);
+    if(!node){detail.innerHTML='<div class="empty">Execution node is no longer available.</div>';return;}
+    detail.innerHTML='';
+    const hdr=document.createElement('div');hdr.className='section-title';hdr.textContent=nodeLabel(node)+' · session: '+selectedSession;detail.appendChild(hdr);
+    renderNodeDetail(detail,node);
+    return;
+  }
+  const s = sends.find(x => x.id === selectedId);
+  if (!s) {
+    detail.innerHTML = '<div class="empty">Select a request. Typed records show the readable history for any backend; provider records show the exact wire body.</div>';
+    return;
+  }
+  detail.innerHTML = '';
+  // Header: which agent (and session) this record belongs to.
+  const hdr = document.createElement('div');
+  hdr.className = 'section-title';
+  hdr.textContent = 'agent: ' + (s.agent_path || 'root') + '  ·  session: ' + s.session_id;
+  detail.appendChild(hdr);
+
+  if (s.kind === 'typed') {
+    renderTyped(detail, s);
+  } else if (s.kind === 'response') {
+    renderResponse(detail, s);
+  } else if (s.kind === 'log') {
+    renderLog(detail, s);
+  } else {
+    const pre = document.createElement('pre');
+    pre.textContent = JSON.stringify(s.body, null, 2);
+    detail.appendChild(pre);
+  }
+  // Always offer the full raw record for debugging.
+  const details = document.createElement('details');
+  const summary = document.createElement('summary');
+  summary.textContent = 'raw record JSON';
+  const pre = document.createElement('pre');
+  pre.textContent = JSON.stringify(s, null, 2);
+  details.appendChild(summary);
+  details.appendChild(pre);
+  detail.appendChild(details);
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+async function refresh() {
+  try {
+    const q = sessionFilter ? '?session=' + encodeURIComponent(sessionFilter) : '';
+    const [sendsResp, stateResp] = await Promise.all([
+      fetch('/api/sends' + q),
+      fetch('/api/state' + q),
+    ]);
+    sends = await sendsResp.json();
+    const states = await stateResp.json();
+    statesBySession = {};
+    for (const st of states) statesBySession[st.session_id] = st;
+    render();
+    renderDetail();
+  } catch (e) {
+    document.getElementById('stat').textContent = 'error: ' + e;
+  }
+}
+
+refresh();
+setInterval(() => {
+  if (document.getElementById('auto').checked) refresh();
+}, 2000);
+</script>
+</body>
+</html>

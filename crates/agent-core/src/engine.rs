@@ -14,18 +14,22 @@
 use std::sync::{Arc, Mutex as StdMutex};
 
 use futures::StreamExt;
-use tracing::{debug, warn};
+use tracing::{debug, info_span, warn, Instrument};
 
+use crate::agent::AgentPath;
 use crate::cancel::CancellationToken;
 use crate::client::ClientAccess;
 use crate::error::{AgentError, Result};
-use crate::event::{StopReason, ToolCallId, TurnEvent};
+use crate::event::{StopReason, TokenUsage, ToolCallId, TurnEvent};
 use crate::history::KnownTool;
+use crate::observe::{
+    SharedTurnObserver, ToolCallSummary, TurnObservation, TurnResponseObservation,
+};
 use crate::service::NextTurnService;
 use crate::session::SessionState;
 use crate::sink::{EngineOutput, ToolCallStatus, ToolKind, UpdateSink};
-use crate::tool::{ToolContext, ToolEvent};
-use crate::tool::ToolRegistry;
+use crate::tool::{ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry};
+use crate::trace::{next_trace_id, AgentRunMetadata, TraceContext, TraceEvent, TraceStatus};
 
 /// The message injected as a user turn when the backend would end the turn
 /// without dispatching a terminal tool (see
@@ -42,11 +46,14 @@ working and call the appropriate tools.";
 /// short so the streamed reply stays to one or two lines.
 pub const THOUGHT_NUDGE: &str = "\
 In one or two short lines, tell the user what you are doing or planning right \
-now. Keep it super short, then continue working.";
+now. Keep it super short. Compare the todo list with actual findings and \
+verified progress; if it is missing, stale, or incomplete, call the todo tools \
+to repair it, then continue working. If the work is actually complete right \
+now, do not narrate — call the `submit_result` tool immediately instead.";
 
 /// A shared queue of user messages injected into a running turn ("steering").
 ///
-/// Messages pushed here by the ACP layer (via `_session/inject`) are drained by
+/// Messages pushed here by the ACP layer (via `_session/steering`) are drained by
 /// the [`TurnEngine`] between decision rounds and appended to the conversation
 /// as user messages, so they take effect on the next decision call within the
 /// same turn.
@@ -72,6 +79,17 @@ pub struct TurnEngine {
     /// Optional cadence (in decision rounds) at which a [`THOUGHT_NUDGE`] is
     /// injected so the model briefly narrates its plan. `None` disables it.
     thought_interval: Option<usize>,
+    /// Optional provider-neutral observer notified with the typed request
+    /// snapshot before every decision-layer call. `None` disables it.
+    observer: Option<SharedTurnObserver>,
+    /// The hierarchical identity of this agent within its session, used to
+    /// attribute observed requests/responses to a specific (possibly nested)
+    /// agent. Defaults to [`AgentPath::root`].
+    agent_path: AgentPath,
+    /// Parent round and tool call for a nested agent run.
+    trace_parent: Option<(TraceContext, String)>,
+    /// Semantic labels used by the inspector to group modes and retries.
+    trace_metadata: AgentRunMetadata,
 }
 
 impl TurnEngine {
@@ -86,7 +104,51 @@ impl TurnEngine {
             inbox: None,
             require_terminal_tool: false,
             thought_interval: None,
+            observer: None,
+            agent_path: AgentPath::root(),
+            trace_parent: None,
+            trace_metadata: AgentRunMetadata::default(),
         }
+    }
+
+    /// Set the [`AgentPath`] identifying this engine's agent within its session.
+    ///
+    /// A nested engine (subagent) should pass a child of its parent's path so
+    /// observed requests/responses are attributed to it specifically. The
+    /// path's depth is used as the engine's nesting depth for observations.
+    #[must_use]
+    pub fn with_agent_path(mut self, agent_path: AgentPath) -> Self {
+        self.agent_path = agent_path;
+        self
+    }
+
+    /// Attach this engine as a child of the tool call that spawned it.
+    #[must_use]
+    pub fn with_trace_parent(
+        mut self,
+        parent_round: TraceContext,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        self.trace_parent = Some((parent_round, tool_call_id.into()));
+        self
+    }
+
+    /// Describe this concrete agent run for debug grouping.
+    #[must_use]
+    pub fn with_trace_metadata(mut self, metadata: AgentRunMetadata) -> Self {
+        self.trace_metadata = metadata;
+        self
+    }
+
+    /// Attach a provider-neutral [`TurnObserver`] notified with the typed
+    /// request snapshot ([`TurnObservation`]) before every decision-layer call.
+    ///
+    /// Because this fires from inside the engine, it captures every turn for any
+    /// backend (Anthropic, replay, or future providers), not just one provider.
+    #[must_use]
+    pub fn with_observer(mut self, observer: SharedTurnObserver) -> Self {
+        self.observer = Some(observer);
+        self
     }
 
     /// Cap the maximum number of loop iterations.
@@ -178,6 +240,53 @@ impl TurnEngine {
         self
     }
 
+    /// Notify the provider-neutral observer with a typed response snapshot for
+    /// a completed decision round. A no-op when no observer is attached.
+    #[allow(clippy::too_many_arguments)]
+    fn notify_response(
+        &self,
+        trace: &TraceContext,
+        session_id: Option<String>,
+        assistant_text: &str,
+        thinking_chars: usize,
+        tool_calls: &[ToolCallSummary],
+        usage: TokenUsage,
+        stop_reason: Option<StopReason>,
+        error: Option<String>,
+        round_start: std::time::Instant,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.on_turn_response(&TurnResponseObservation {
+                trace: trace.clone(),
+                session_id: session_id.clone(),
+                agent_path: self.agent_path.to_string(),
+                depth: self.depth,
+                assistant_text: assistant_text.to_string(),
+                thinking_chars,
+                tool_calls: tool_calls.to_vec(),
+                usage,
+                stop_reason,
+                error: error.clone(),
+                duration_ms: u64::try_from(round_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+            observer.on_trace_event(&TraceEvent::RoundFinished {
+                trace: trace.clone(),
+                session_id: session_id.unwrap_or_else(|| "(unknown)".to_string()),
+                status: if error.is_some() {
+                    TraceStatus::Failed
+                } else if stop_reason == Some(StopReason::Cancelled) {
+                    TraceStatus::Cancelled
+                } else {
+                    TraceStatus::Completed
+                },
+                stop_reason,
+                error,
+                usage,
+                duration_ms: u64::try_from(round_start.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        }
+    }
+
     /// Run the turn loop until a [`StopReason`] is reached.
     ///
     /// Streaming output is forwarded to `sink` as it arrives. Tool calls are
@@ -190,6 +299,91 @@ impl TurnEngine {
         session: &mut SessionState,
         sink: &mut dyn UpdateSink,
         cancel: &CancellationToken,
+    ) -> Result<StopReason> {
+        let started = std::time::Instant::now();
+        let (turn_id, parent_agent_run_id, spawned_by_tool_call_id) =
+            self.trace_parent.as_ref().map_or_else(
+                || (next_trace_id("turn"), None, None),
+                |(parent, tool_call_id)| {
+                    (
+                        parent.turn_id.clone(),
+                        Some(parent.agent_run_id.clone()),
+                        Some(tool_call_id.clone()),
+                    )
+                },
+            );
+        let run_trace = TraceContext {
+            turn_id,
+            agent_run_id: next_trace_id("agent"),
+            parent_agent_run_id,
+            spawned_by_tool_call_id,
+            round_id: None,
+            agent_path: self.agent_path.to_string(),
+            metadata: self.trace_metadata.clone(),
+        };
+        if let Some(observer) = &self.observer {
+            if self.trace_parent.is_none() {
+                observer.on_trace_event(&TraceEvent::TurnStarted {
+                    trace: run_trace.clone(),
+                    session_id: session.session_id.clone(),
+                });
+            }
+            observer.on_trace_event(&TraceEvent::AgentRunStarted {
+                trace: run_trace.clone(),
+                session_id: session.session_id.clone(),
+            });
+        }
+
+        let run_span = info_span!(
+            "agent_run",
+            session_id = %session.session_id,
+            turn_id = %run_trace.turn_id,
+            agent_run_id = %run_trace.agent_run_id,
+            parent_agent_run_id = %run_trace.parent_agent_run_id.as_deref().unwrap_or(""),
+            spawned_by_tool_call_id = %run_trace.spawned_by_tool_call_id.as_deref().unwrap_or(""),
+            agent_path = %run_trace.agent_path,
+        );
+        let result = self
+            .run_prompt_traced(session, sink, cancel, &run_trace)
+            .instrument(run_span)
+            .await;
+        let (status, stop_reason, error) = match &result {
+            Ok(StopReason::Cancelled) => {
+                (TraceStatus::Cancelled, Some(StopReason::Cancelled), None)
+            }
+            Ok(stop) => (TraceStatus::Completed, Some(*stop), None),
+            Err(err) => (TraceStatus::Failed, None, Some(err.to_string())),
+        };
+        let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Some(observer) = &self.observer {
+            observer.on_trace_event(&TraceEvent::AgentRunFinished {
+                trace: run_trace.clone(),
+                session_id: session.session_id.clone(),
+                status,
+                stop_reason,
+                error: error.clone(),
+                duration_ms,
+            });
+            if self.trace_parent.is_none() {
+                observer.on_trace_event(&TraceEvent::TurnFinished {
+                    trace: run_trace,
+                    session_id: session.session_id.clone(),
+                    status,
+                    stop_reason,
+                    error,
+                    duration_ms,
+                });
+            }
+        }
+        result
+    }
+
+    async fn run_prompt_traced(
+        &self,
+        session: &mut SessionState,
+        sink: &mut dyn UpdateSink,
+        cancel: &CancellationToken,
+        run_trace: &TraceContext,
     ) -> Result<StopReason> {
         let mut iteration = 0usize;
         loop {
@@ -217,8 +411,30 @@ impl TurnEngine {
                 }
             }
 
-            let ctx = session.turn_context();
-            let mut stream = self.next_turn.get_next_turn_streaming(&ctx).await?;
+            let round_trace = run_trace.with_round(next_trace_id("round"));
+            debug!(round_id = %round_trace.round_id.as_deref().unwrap_or_default(), "starting decision round");
+            let mut ctx = session.turn_context();
+            ctx.trace = Some(round_trace.clone());
+
+            // Notify the provider-neutral observer with the typed request
+            // snapshot before dispatching to the (possibly provider-specific)
+            // decision backend. This is what makes the LLM inspector capture
+            // *every* backend, in readable typed form.
+            if let Some(observer) = &self.observer {
+                observer.on_trace_event(&TraceEvent::RoundStarted {
+                    trace: round_trace.clone(),
+                    session_id: session.session_id.clone(),
+                });
+                observer.on_turn_request(&TurnObservation::from_context(
+                    &ctx,
+                    &self.agent_path,
+                    round_trace.clone(),
+                ));
+            }
+
+            // Session id captured once for this round's response observation.
+            let round_session_id = ctx.session_id.clone();
+            let round_start = std::time::Instant::now();
 
             // Accumulates assistant-visible text within this decision stream so we
             // can persist it as a single history entry when the stream yields a
@@ -226,6 +442,33 @@ impl TurnEngine {
             let mut assistant_text = String::new();
             // Whether this stream produced any tool calls (so we know to loop).
             let mut had_tool_call = false;
+            // Per-round response accumulators, reported to the observer (LLM
+            // inspector) when the round completes. `round_text` mirrors the
+            // assistant text but is *not* flushed on a tool call, so the
+            // response snapshot keeps the full text even when a tool call
+            // precedes the round's `TurnFinished`.
+            let mut round_text = String::new();
+            let mut thinking_chars = 0usize;
+            let mut round_tool_calls: Vec<ToolCallSummary> = Vec::new();
+            let mut round_usage = TokenUsage::default();
+
+            let mut stream = match self.next_turn.get_next_turn_streaming(&ctx).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    self.notify_response(
+                        &round_trace,
+                        round_session_id.clone(),
+                        &round_text,
+                        thinking_chars,
+                        &round_tool_calls,
+                        round_usage,
+                        None,
+                        Some(err.to_string()),
+                        round_start,
+                    );
+                    return Err(err);
+                }
+            };
 
             loop {
                 // Observe cancellation while awaiting the next decision event.
@@ -233,6 +476,17 @@ impl TurnEngine {
                     biased;
                     _ = cancel.cancelled() => {
                         debug!("cancellation observed while streaming decision events");
+                        self.notify_response(
+                            &round_trace,
+                            round_session_id.clone(),
+                            &round_text,
+                            thinking_chars,
+                            &round_tool_calls,
+                            round_usage,
+                            Some(StopReason::Cancelled),
+                            None,
+                            round_start,
+                        );
                         return Ok(StopReason::Cancelled);
                     }
                     next = stream.next() => next,
@@ -242,16 +496,29 @@ impl TurnEngine {
                     // Stream ended without an explicit TurnFinished; treat the
                     // accumulated text as a completed turn.
                     warn!("decision stream ended without TurnFinished");
+                    self.notify_response(
+                        &round_trace,
+                        round_session_id.clone(),
+                        &round_text,
+                        thinking_chars,
+                        &round_tool_calls,
+                        round_usage,
+                        Some(StopReason::EndTurn),
+                        None,
+                        round_start,
+                    );
                     flush_assistant_text(session, &mut assistant_text);
                     return Ok(StopReason::EndTurn);
                 };
 
                 match event {
                     TurnEvent::TextDelta(delta) => {
+                        round_text.push_str(&delta);
                         assistant_text.push_str(&delta);
                         sink.send(EngineOutput::MessageChunk(delta)).await?;
                     }
                     TurnEvent::Thinking(delta) => {
+                        thinking_chars += delta.chars().count();
                         sink.send(EngineOutput::ThinkingChunk(delta)).await?;
                     }
                     TurnEvent::ThinkingBlock(record) => {
@@ -270,6 +537,7 @@ impl TurnEngine {
                         sink.send(EngineOutput::Plan(plan)).await?;
                     }
                     TurnEvent::Usage(usage) => {
+                        round_usage.add(usage);
                         session.add_usage(usage);
                     }
                     TurnEvent::ToolCallRequested {
@@ -278,23 +546,82 @@ impl TurnEngine {
                         arguments,
                     } => {
                         had_tool_call = true;
+                        round_tool_calls.push(ToolCallSummary {
+                            name: name.clone(),
+                            arguments: arguments.clone(),
+                        });
                         // Persist any assistant text emitted before this tool call.
                         flush_assistant_text(session, &mut assistant_text);
                         // A tool that declares itself terminal ends the turn once
                         // it has been dispatched (only when enforcement is on).
                         let is_terminal = self.require_terminal_tool
                             && self.tools.get(&name).is_some_and(|t| t.ends_turn());
-                        self.dispatch_tool(session, sink, cancel, id, name, arguments)
-                            .await?;
+                        let presentation = self
+                            .tools
+                            .get(&name)
+                            .map_or(ToolOutputPresentation::ToolCall, |tool| {
+                                tool.output_presentation()
+                            });
+                        // Preserve the historical terminal-tool UX for custom
+                        // tools that have not chosen an explicit presentation.
+                        let presentation =
+                            if is_terminal && presentation == ToolOutputPresentation::ToolCall {
+                                ToolOutputPresentation::StreamingMessage
+                            } else {
+                                presentation
+                            };
+                        // A terminal tool (e.g. `submit_result`) is rendered to
+                        // the client as a plain agent message rather than a tool
+                        // call, so its user-facing summary reads as normal text.
+                        let tool_span = info_span!(
+                            "tool_call",
+                            round_id = %round_trace.round_id.as_deref().unwrap_or_default(),
+                            tool_call_id = %id.0,
+                            tool_name = %name,
+                        );
+                        self.dispatch_tool(
+                            session,
+                            sink,
+                            cancel,
+                            id,
+                            name,
+                            arguments,
+                            presentation,
+                            &round_trace,
+                        )
+                        .instrument(tool_span)
+                        .await?;
                         if cancel.is_cancelled() {
                             return Ok(StopReason::Cancelled);
                         }
                         if is_terminal {
                             debug!("terminal tool dispatched; ending turn");
+                            self.notify_response(
+                                &round_trace,
+                                round_session_id.clone(),
+                                &round_text,
+                                thinking_chars,
+                                &round_tool_calls,
+                                round_usage,
+                                Some(StopReason::EndTurn),
+                                None,
+                                round_start,
+                            );
                             return Ok(StopReason::EndTurn);
                         }
                     }
                     TurnEvent::TurnFinished { stop_reason } => {
+                        self.notify_response(
+                            &round_trace,
+                            round_session_id.clone(),
+                            &round_text,
+                            thinking_chars,
+                            &round_tool_calls,
+                            round_usage,
+                            Some(stop_reason),
+                            None,
+                            round_start,
+                        );
                         flush_assistant_text(session, &mut assistant_text);
                         match stop_reason {
                             // The turn paused for tool execution; loop for another
@@ -318,6 +645,17 @@ impl TurnEngine {
                         }
                     }
                     TurnEvent::Error(err) => {
+                        self.notify_response(
+                            &round_trace,
+                            round_session_id.clone(),
+                            &round_text,
+                            thinking_chars,
+                            &round_tool_calls,
+                            round_usage,
+                            None,
+                            Some(err.to_string()),
+                            round_start,
+                        );
                         flush_assistant_text(session, &mut assistant_text);
                         return Err(AgentError::Turn(err));
                     }
@@ -330,6 +668,7 @@ impl TurnEngine {
 
     /// Dispatch a single tool call: record it, request permission if required,
     /// execute it while streaming updates, and append the typed result.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool(
         &self,
         session: &mut SessionState,
@@ -338,10 +677,31 @@ impl TurnEngine {
         id: ToolCallId,
         name: String,
         arguments: serde_json::Value,
+        presentation: ToolOutputPresentation,
+        round_trace: &TraceContext,
     ) -> Result<()> {
+        let render_as_message = presentation != ToolOutputPresentation::ToolCall;
+        let tool_started = std::time::Instant::now();
+        if let Some(observer) = &self.observer {
+            observer.on_trace_event(&TraceEvent::ToolCallStarted {
+                trace: round_trace.clone(),
+                session_id: session.session_id.clone(),
+                tool_call_id: id.0.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            });
+        }
         // Record the (typed) tool call in history regardless of outcome.
         let known = KnownTool::classify(&name, arguments.clone());
         session.push_tool_call(id.clone(), known);
+
+        // For a tool rendered as a plain agent message (a terminal tool such as
+        // `submit_result`), capture its user-facing `summary` up front so we can
+        // stream it as ordinary text instead of tool-call updates.
+        let summary_text = arguments
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned);
 
         // Look up the tool up front so we can surface rich metadata (title,
         // kind, affected file locations) on the initial pending update.
@@ -355,16 +715,18 @@ impl TurnEngine {
             None => (name.clone(), ToolKind::Other, Vec::new()),
         };
 
-        sink.send(EngineOutput::ToolCall {
-            id: id.clone(),
-            name: name.clone(),
-            title,
-            kind,
-            status: ToolCallStatus::Pending,
-            locations,
-            raw_input: Some(arguments.clone()),
-        })
-        .await?;
+        if !render_as_message {
+            sink.send(EngineOutput::ToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                title,
+                kind,
+                status: ToolCallStatus::Pending,
+                locations,
+                raw_input: Some(arguments.clone()),
+            })
+            .await?;
+        }
 
         let Some(tool) = tool else {
             let msg = format!("unknown tool: {name}");
@@ -376,7 +738,15 @@ impl TurnEngine {
                 raw_output: None,
             })
             .await?;
-            session.push_tool_result(id, false, msg);
+            session.push_tool_result(id.clone(), false, msg);
+            self.notify_tool_finished(
+                round_trace,
+                session,
+                &id,
+                TraceStatus::Failed,
+                Some(format!("unknown tool: {name}")),
+                tool_started,
+            );
             return Ok(());
         };
 
@@ -393,24 +763,40 @@ impl TurnEngine {
                     raw_output: None,
                 })
                 .await?;
-                session.push_tool_result(id, false, msg);
+                session.push_tool_result(id.clone(), false, msg);
+                self.notify_tool_finished(
+                    round_trace,
+                    session,
+                    &id,
+                    TraceStatus::Failed,
+                    Some(format!("permission denied for tool: {name}")),
+                    tool_started,
+                );
                 return Ok(());
             }
         }
 
-        sink.send(EngineOutput::ToolCallUpdate {
-            id: id.clone(),
-            status: ToolCallStatus::InProgress,
-            output: None,
-            raw_output: None,
-        })
-        .await?;
+        if !render_as_message {
+            sink.send(EngineOutput::ToolCallUpdate {
+                id: id.clone(),
+                status: ToolCallStatus::InProgress,
+                output: None,
+                raw_output: None,
+            })
+            .await?;
+        }
 
         let tool_ctx = ToolContext {
             session_id: session.session_id.clone(),
             cancel: cancel.clone(),
             depth: self.depth,
+            workspace_roots: session.workspace_roots.clone(),
             client: self.client.clone(),
+            observer: self.observer.clone(),
+            agent_path: self.agent_path.clone(),
+            trace: Some(round_trace.clone()),
+            tool_call_id: Some(id.clone()),
+            todo_list: session.todo_list.clone(),
         };
 
         // Starting the tool may itself fail (e.g. argument validation).
@@ -426,21 +812,42 @@ impl TurnEngine {
                     raw_output: None,
                 })
                 .await?;
-                session.push_tool_result(id, false, msg);
+                session.push_tool_result(id.clone(), false, msg);
+                self.notify_tool_finished(
+                    round_trace,
+                    session,
+                    &id,
+                    TraceStatus::Failed,
+                    Some(format!("tool {name} failed to start")),
+                    tool_started,
+                );
                 return Ok(());
             }
         };
 
         let mut collected = String::new();
+        let mut message_output = String::new();
         let mut success = true;
         let mut final_message: Option<String> = None;
         let mut final_value: Option<serde_json::Value> = None;
+        // Whether we already streamed this tool's output as message chunks (only
+        // relevant when `render_as_message` is set), so we don't repeat it.
+        let mut streamed_as_message = false;
 
         loop {
             let event = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
                     debug!("cancellation observed while running tool {name}");
+                    session.push_tool_result(id.clone(), false, "cancelled by user");
+                    self.notify_tool_finished(
+                        round_trace,
+                        session,
+                        &id,
+                        TraceStatus::Cancelled,
+                        None,
+                        tool_started,
+                    );
                     return Ok(());
                 }
                 next = events.next() => next,
@@ -452,13 +859,19 @@ impl TurnEngine {
                 ToolEvent::Started => {}
                 ToolEvent::OutputDelta(delta) => {
                     collected.push_str(&delta);
-                    sink.send(EngineOutput::ToolCallUpdate {
-                        id: id.clone(),
-                        status: ToolCallStatus::InProgress,
-                        output: Some(delta),
-                        raw_output: None,
-                    })
-                    .await?;
+                    message_output.push_str(&delta);
+                    if presentation == ToolOutputPresentation::StreamingMessage {
+                        streamed_as_message = true;
+                        sink.send(EngineOutput::MessageChunk(delta)).await?;
+                    } else if presentation == ToolOutputPresentation::ToolCall {
+                        sink.send(EngineOutput::ToolCallUpdate {
+                            id: id.clone(),
+                            status: ToolCallStatus::InProgress,
+                            output: Some(delta),
+                            raw_output: None,
+                        })
+                        .await?;
+                    }
                 }
                 ToolEvent::Completed(value) => {
                     let rendered = render_value(&value);
@@ -474,6 +887,16 @@ impl TurnEngine {
                     success = false;
                     final_message = Some(message);
                 }
+                ToolEvent::TodoListUpdated(todo_list) => {
+                    if let Err(err) = todo_list.validate() {
+                        success = false;
+                        final_message = Some(format!("invalid todo state transition: {err}"));
+                        break;
+                    }
+                    session.todo_list = todo_list.clone();
+                    sink.send(EngineOutput::Plan(todo_list.to_plan_update()))
+                        .await?;
+                }
             }
         }
 
@@ -482,13 +905,42 @@ impl TurnEngine {
         } else {
             ToolCallStatus::Failed
         };
-        sink.send(EngineOutput::ToolCallUpdate {
-            id: id.clone(),
-            status,
-            output: final_message.clone(),
-            raw_output: final_value,
-        })
-        .await?;
+        if presentation == ToolOutputPresentation::AccumulatedMessage {
+            let text = if message_output.is_empty() {
+                summary_text
+                    .clone()
+                    .or_else(|| final_message.clone())
+                    .unwrap_or_default()
+            } else {
+                message_output
+            };
+            if !text.is_empty() {
+                sink.send(EngineOutput::MessageChunk(text)).await?;
+            }
+        } else if render_as_message {
+            // Render the terminal tool's result as a plain agent message. Prefer
+            // the captured `summary` argument; fall back to any collected output
+            // or the final rendered message. Streamed `OutputDelta`s (if any)
+            // were already emitted as message chunks above, so avoid repeating
+            // them here.
+            if !streamed_as_message {
+                let text = summary_text
+                    .clone()
+                    .or_else(|| final_message.clone())
+                    .unwrap_or_default();
+                if !text.is_empty() {
+                    sink.send(EngineOutput::MessageChunk(text)).await?;
+                }
+            }
+        } else {
+            sink.send(EngineOutput::ToolCallUpdate {
+                id: id.clone(),
+                status,
+                output: final_message.clone(),
+                raw_output: final_value,
+            })
+            .await?;
+        }
 
         let result_text = if let Some(msg) = final_message {
             if collected.is_empty() {
@@ -507,8 +959,41 @@ impl TurnEngine {
         let result_text = self
             .maybe_offload_large_output(session, &id, &name, result_text)
             .await;
+        self.notify_tool_finished(
+            round_trace,
+            session,
+            &id,
+            if success {
+                TraceStatus::Completed
+            } else {
+                TraceStatus::Failed
+            },
+            Some(result_text.clone()),
+            tool_started,
+        );
         session.push_tool_result(id, success, result_text);
         Ok(())
+    }
+
+    fn notify_tool_finished(
+        &self,
+        trace: &TraceContext,
+        session: &SessionState,
+        id: &ToolCallId,
+        status: TraceStatus,
+        output: Option<String>,
+        started: std::time::Instant,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.on_trace_event(&TraceEvent::ToolCallFinished {
+                trace: trace.clone(),
+                session_id: session.session_id.clone(),
+                tool_call_id: id.0.clone(),
+                status,
+                output,
+                duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            });
+        }
     }
 
     /// If `text` exceeds [`MAX_TOOL_RESULT_CHARS`], write the full output to a

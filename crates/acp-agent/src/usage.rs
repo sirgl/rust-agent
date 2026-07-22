@@ -21,7 +21,10 @@ pub fn format_usage(session: &SessionState, model: &str) -> String {
     let mut out = String::new();
     out.push_str(&format!("Token usage this session (model: {model}):\n"));
     out.push_str(&format!("  input (fresh):    {}\n", u.input_tokens));
-    out.push_str(&format!("  cached (reused):  {}\n", u.cache_read_input_tokens));
+    out.push_str(&format!(
+        "  cached (reused):  {}\n",
+        u.cache_read_input_tokens
+    ));
     out.push_str(&format!(
         "  cache write:      {}\n",
         u.cache_creation_input_tokens

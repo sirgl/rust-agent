@@ -27,18 +27,17 @@ pub mod registry;
 pub mod submit;
 pub mod worker;
 
-pub use context::{
-    ModelTier, OrchestratedStepContext, PlanProposal, PlanStepSpec, StepResult,
-};
+pub use action::{RunSubAgentTool, RUN_SUBAGENT_TOOL_NAME};
+pub use context::{ModelTier, OrchestratedStepContext, PlanProposal, PlanStepSpec, StepResult};
 pub use mode::{
     ExecutorBehavior, ExecutorMode, OrchestratorKind, PlanMode, PlannerBehavior, PreconditionError,
     ReviewMode, ReviewPlanMode, ReviewerBehavior, SubAgentMode, SubAgentRequest, SubmitKind,
     SubmitOutcome, EXECUTOR_MODE_IDS,
 };
-pub use action::{RunSubAgentTool, RUN_SUBAGENT_TOOL_NAME};
 pub use orchestrator::{Orchestrator, OrchestratorBuilder, ORCHESTRATOR_SYSTEM_PROMPT};
 pub use pipeline::{
-    run_pipeline, uniform_resolver, BackendFactory, OrchestrateTool, ORCHESTRATE_TOOL_NAME,
+    run_pipeline, run_pipeline_observed, uniform_resolver, BackendFactory, OrchestrateTool,
+    PipelineSession, ORCHESTRATE_TOOL_NAME,
 };
 pub use registry::{ModeRegistry, UnknownModeError};
 pub use submit::{new_slot, SubmitReviewTool, SubmitSlot, SubmitTool};

@@ -100,7 +100,10 @@ async fn full_multi_pass_flow_threads_results_and_verdicts() {
             "submit_review",
             serde_json::json!({ "approved": false, "reasons": "needs tests" }),
         ),
-        tool_then_finish("submit", serde_json::json!({ "output": "impl v2 with tests" })),
+        tool_then_finish(
+            "submit",
+            serde_json::json!({ "output": "impl v2 with tests" }),
+        ),
         tool_then_finish(
             "submit_review",
             serde_json::json!({ "approved": true, "reasons": "looks good" }),

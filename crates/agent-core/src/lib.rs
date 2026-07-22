@@ -14,6 +14,7 @@
 
 #![warn(missing_docs)]
 
+pub mod agent;
 pub mod cancel;
 pub mod client;
 pub mod compaction;
@@ -22,12 +23,16 @@ pub mod engine;
 pub mod error;
 pub mod event;
 pub mod history;
+pub mod observe;
 pub mod service;
 pub mod session;
 pub mod sink;
 pub mod store;
+pub mod todo;
 pub mod tool;
+pub mod trace;
 
+pub use agent::{AgentPath, ROOT_LABEL};
 pub use cancel::CancellationToken;
 pub use client::{ClientAccess, ElicitationOutcome, TerminalChunk, TerminalOutcome};
 pub use compaction::{
@@ -45,8 +50,12 @@ pub use event::{
 };
 pub use history::{
     AssistantMessage, ContentBlock, Conversation, EditToolCall, FsReadToolCall, FsWriteToolCall,
-    HistoryEntry, IngestedRecord, KnownTool, TerminalRunToolCall, ThinkingRecord, ToolCallRecord,
-    ToolResultRecord, UserMessage,
+    HistoryEntry, IngestedRecord, KnownTool, MarkTodoCompletedToolCall, TerminalRunToolCall,
+    ThinkingRecord, ToolCallRecord, ToolResultRecord, UpdateTodoListToolCall, UserMessage,
+};
+pub use observe::{
+    SessionStateSnapshot, SharedTurnObserver, ToolCallSummary, ToolSummary, TurnObservation,
+    TurnObserver, TurnResponseObservation,
 };
 pub use service::NextTurnService;
 pub use session::{
@@ -54,7 +63,9 @@ pub use session::{
 };
 pub use sink::{EngineOutput, ToolCallLocation, ToolCallStatus, ToolKind, UpdateSink};
 pub use store::{InMemorySessionStore, JsonFileSessionStore, SessionStore};
-pub use tool::{Tool, ToolContext, ToolEvent, ToolRegistry, ToolResult};
+pub use todo::{TodoItem, TodoItemId, TodoList, TodoValidationError};
+pub use tool::{Tool, ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry, ToolResult};
+pub use trace::{next_trace_id, AgentRunMetadata, TraceContext, TraceEvent, TraceStatus};
 
 /// Initialize a default `tracing` subscriber writing to stderr.
 ///
