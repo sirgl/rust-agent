@@ -68,15 +68,15 @@ pub fn canned_replay_factory() -> NextTurnFactory {
     })
 }
 
-/// Build a [`NextTurnFactory`] backed by the real Anthropic Messages API, if a
-/// usable [`turn_anthropic::AnthropicConfig`] can be resolved.
+/// Build a [`NextTurnFactory`] backed by the Anthropic-shaped Messages API
+/// (Claude via Anthropic and/or DeepSeek via its Anthropic-compatible endpoint),
+/// if at least one usable API key can be resolved.
 ///
-/// Configuration is resolved via [`turn_anthropic::AnthropicConfig::from_env`],
-/// which checks `ANTHROPIC_API_KEY` first and otherwise falls back to the
-/// default `token.properties` key file (see
-/// [`turn_anthropic::load_default_api_key`]) — the key itself is never logged.
+/// Keys are resolved via [`turn_anthropic::AnthropicConfig::from_env`] /
+/// [`turn_anthropic::AnthropicConfig::deepseek_from_env`] (env vars first,
+/// then `token.properties`) — the key values themselves are never logged.
 /// Returns `None` (letting callers fall back to [`canned_replay_factory`])
-/// when no key can be resolved from either source.
+/// when neither provider can be configured.
 #[must_use]
 pub fn anthropic_factory() -> Option<NextTurnFactory> {
     anthropic_factory_with_observer(None)
@@ -86,14 +86,52 @@ pub fn anthropic_factory() -> Option<NextTurnFactory> {
 /// [`turn_anthropic::RequestObserver`] to every constructed backend so an
 /// observability seam (e.g. the LLM inspector) can capture the exact request
 /// body of each turn, attributed to its session.
+///
+/// Each turn is routed by [`turn_anthropic::provider_for`] on the selected
+/// model id: DeepSeek models use the DeepSeek key + endpoint, Claude models
+/// use the Anthropic key + endpoint.
 #[must_use]
 pub fn anthropic_factory_with_observer(
     observer: Option<Arc<dyn turn_anthropic::RequestObserver>>,
 ) -> Option<NextTurnFactory> {
-    let config = turn_anthropic::AnthropicConfig::from_env()?;
+    let anthropic = turn_anthropic::AnthropicConfig::from_env();
+    let deepseek = turn_anthropic::AnthropicConfig::deepseek_from_env();
+    if anthropic.is_none() && deepseek.is_none() {
+        return None;
+    }
     Some(Arc::new(move |selection| {
-        let mut turn_config = config.clone();
-        turn_config.model = selection.model.clone();
+        let mut turn_config = match turn_anthropic::provider_for(&selection.model) {
+            turn_anthropic::Provider::DeepSeek => {
+                if let Some(cfg) = deepseek.clone() {
+                    cfg.with_model(selection.model.clone())
+                } else if let Some(cfg) = anthropic.clone() {
+                    // DeepSeek selected but only Anthropic is configured —
+                    // retarget so the failure mode is a clear upstream 401
+                    // rather than silently hitting the wrong host with a
+                    // Claude-only key.
+                    tracing::warn!(
+                        model = %selection.model,
+                        "deepseek model selected but DEEPSEEK_API_KEY is not configured"
+                    );
+                    cfg.with_model(selection.model.clone())
+                } else {
+                    unreachable!("factory requires at least one provider config")
+                }
+            }
+            turn_anthropic::Provider::Anthropic => {
+                if let Some(cfg) = anthropic.clone() {
+                    cfg.with_model(selection.model.clone())
+                } else if let Some(cfg) = deepseek.clone() {
+                    tracing::warn!(
+                        model = %selection.model,
+                        "anthropic model selected but ANTHROPIC_API_KEY is not configured"
+                    );
+                    cfg.with_model(selection.model.clone())
+                } else {
+                    unreachable!("factory requires at least one provider config")
+                }
+            }
+        };
         turn_config.effort = Some(selection.effort);
         let mut service = turn_anthropic::AnthropicTurnService::new(turn_config);
         if let Some(observer) = &observer {
@@ -169,8 +207,8 @@ pub async fn register_configured_mcp_tools(
     register_mcp_tools(registry, connection).await
 }
 
-/// Assemble the default dependencies for the binary: the real Anthropic
-/// backend when an API key can be resolved (env var or the default
+/// Assemble the default dependencies for the binary: a real LLM backend when
+/// an Anthropic and/or DeepSeek API key can be resolved (env var or the default
 /// `token.properties` file — see [`anthropic_factory`]), otherwise the
 /// deterministic replay backend, plus the built-in filesystem/terminal tools,
 /// the subagent tool, and environment-derived configuration.
@@ -180,10 +218,10 @@ pub fn default_deps() -> AgentDeps {
 }
 
 /// Like [`default_deps`], but attaches an optional
-/// [`turn_anthropic::RequestObserver`] to the Anthropic backend (when selected),
+/// [`turn_anthropic::RequestObserver`] to the LLM backend (when selected),
 /// so the LLM inspector can capture the real outgoing requests.
 ///
-/// The observer is only wired into the real Anthropic backend; the deterministic
+/// The observer is only wired into the real Messages backend; the deterministic
 /// replay fallback makes no network calls, so there is nothing to observe there.
 #[must_use]
 pub fn default_deps_with_observer(
@@ -203,9 +241,27 @@ pub fn default_deps_with_observers(
     turn_observer: Option<Arc<dyn agent_core::TurnObserver>>,
     inspector_base_url: Option<String>,
 ) -> AgentDeps {
-    let config = AgentConfig::from_env();
+    let mut config = AgentConfig::from_env();
+    let has_anthropic = turn_anthropic::AnthropicConfig::from_env().is_some();
+    let has_deepseek = turn_anthropic::AnthropicConfig::deepseek_from_env().is_some();
+    // If only DeepSeek is configured and the default model still points at a
+    // Claude id, retarget so the first turn doesn't 401 against the wrong host.
+    if !has_anthropic
+        && has_deepseek
+        && !turn_anthropic::is_deepseek_model(&config.default_model)
+    {
+        config.default_model = turn_anthropic::DEFAULT_DEEPSEEK_MODEL.to_string();
+    }
     let (next_turn_factory, backend) = match anthropic_factory_with_observer(request_observer) {
-        Some(factory) => (factory, "anthropic"),
+        Some(factory) => {
+            let backend = match (has_anthropic, has_deepseek) {
+                (true, true) => "anthropic+deepseek",
+                (true, false) => "anthropic",
+                (false, true) => "deepseek",
+                (false, false) => "llm",
+            };
+            (factory, backend)
+        }
         None => (canned_replay_factory(), "replay"),
     };
     tracing::info!(backend, "acp-agent: selected default decision backend");

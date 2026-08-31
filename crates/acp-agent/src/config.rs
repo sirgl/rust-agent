@@ -180,7 +180,8 @@ impl AgentConfig {
     /// - `ACP_AGENT_NAME` overrides the advertised implementation name.
     /// - `ACP_AGENT_SYSTEM_PROMPT` seeds a system prompt into new sessions.
     /// - `ACP_ORCHESTRATED` (`1`/`true`/`yes`/`on`) enables orchestrated mode.
-    /// - `ANTHROPIC_MODEL` overrides the default model.
+    /// - `ANTHROPIC_MODEL` / `DEEPSEEK_MODEL` / `ACP_MODEL` override the default
+    ///   model (`ACP_MODEL` wins when several are set).
     /// - `ACP_REQUIRE_SUBMIT_RESULT` (`1`/`true`/`yes`/`on`) toggles whether a
     ///   turn only ends when the model calls the `submit_result` tool.
     /// - `ACP_SESSION_DIR` selects a directory for disk-backed session
@@ -205,7 +206,18 @@ impl AgentConfig {
         if let Ok(v) = std::env::var("ACP_ORCHESTRATE_TOOL") {
             config.enable_orchestrate_tool = matches!(v.trim(), "1" | "true" | "yes" | "on");
         }
+        // Model override precedence: ACP_MODEL > DEEPSEEK_MODEL > ANTHROPIC_MODEL.
         if let Ok(model) = std::env::var("ANTHROPIC_MODEL") {
+            if !model.is_empty() {
+                config.default_model = model;
+            }
+        }
+        if let Ok(model) = std::env::var("DEEPSEEK_MODEL") {
+            if !model.is_empty() {
+                config.default_model = model;
+            }
+        }
+        if let Ok(model) = std::env::var("ACP_MODEL") {
             if !model.is_empty() {
                 config.default_model = model;
             }

@@ -114,10 +114,14 @@ pub struct AnthropicConfig {
 impl AnthropicConfig {
     /// Default Anthropic Messages endpoint.
     pub const DEFAULT_BASE_URL: &'static str = "https://api.anthropic.com/v1/messages";
+    /// DeepSeek Anthropic-compatible Messages endpoint.
+    pub const DEEPSEEK_BASE_URL: &'static str = "https://api.deepseek.com/anthropic/v1/messages";
     /// Default pinned API version.
     pub const DEFAULT_VERSION: &'static str = "2023-06-01";
     /// Default model used when none is configured.
     pub const DEFAULT_MODEL: &'static str = "claude-sonnet-5";
+    /// Default DeepSeek model used when none is configured.
+    pub const DEFAULT_DEEPSEEK_MODEL: &'static str = crate::models::DEFAULT_DEEPSEEK_MODEL;
 
     /// Minimum `budget_tokens` Anthropic accepts for extended thinking.
     pub const MIN_THINKING_BUDGET: u32 = 1024;
@@ -140,18 +144,33 @@ impl AnthropicConfig {
 
     /// Create a config with sane defaults for the given key and model.
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let base_url = if crate::models::is_deepseek_model(&model) {
+            Self::DEEPSEEK_BASE_URL.to_string()
+        } else {
+            Self::DEFAULT_BASE_URL.to_string()
+        };
         Self {
             api_key: api_key.into(),
-            model: model.into(),
+            model,
             effort: None,
             max_tokens: None,
-            base_url: Self::DEFAULT_BASE_URL.to_string(),
+            base_url,
             anthropic_version: Self::DEFAULT_VERSION.to_string(),
             thinking: ThinkingConfig::Auto {
                 display_summarized: true,
             },
             prompt_caching: true,
         }
+    }
+
+    /// Create a config pointed at DeepSeek's Anthropic-compatible endpoint.
+    pub fn deepseek(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        let mut cfg = Self::new(api_key, model);
+        cfg.base_url = Self::DEEPSEEK_BASE_URL.to_string();
+        // DeepSeek ignores Anthropic-style prompt-cache breakpoints.
+        cfg.prompt_caching = false;
+        cfg
     }
 
     /// Build a config from environment variables:
@@ -195,6 +214,70 @@ impl AnthropicConfig {
             cfg.prompt_caching = is_truthy(&flag);
         }
         Some(cfg)
+    }
+
+    /// Build a DeepSeek config from environment variables:
+    /// `DEEPSEEK_API_KEY` (optional; falls back to the `DEEPSEEK_KEY` property
+    /// in `token.properties`), `DEEPSEEK_MODEL` (optional),
+    /// `DEEPSEEK_BASE_URL` (optional), `DEEPSEEK_EFFORT` (optional),
+    /// `DEEPSEEK_MAX_TOKENS` (optional), `DEEPSEEK_THINKING` (optional).
+    /// Returns `None` if no API key can be resolved.
+    pub fn deepseek_from_env() -> Option<Self> {
+        let api_key = std::env::var("DEEPSEEK_API_KEY")
+            .ok()
+            .filter(|key| !key.is_empty())
+            .or_else(load_default_deepseek_api_key)?;
+        let model = std::env::var("DEEPSEEK_MODEL")
+            .unwrap_or_else(|_| Self::DEFAULT_DEEPSEEK_MODEL.to_string());
+        let mut cfg = Self::deepseek(api_key, model);
+        if let Ok(effort_str) = std::env::var("DEEPSEEK_EFFORT") {
+            if let Ok(effort) = effort_str.parse() {
+                cfg.effort = Some(effort);
+            }
+        }
+        if let Ok(base) = std::env::var("DEEPSEEK_BASE_URL") {
+            cfg.base_url = base;
+        }
+        if let Ok(raw) = std::env::var("DEEPSEEK_MAX_TOKENS") {
+            if let Ok(n) = raw.trim().parse::<u32>() {
+                if n > 0 {
+                    cfg.max_tokens = Some(n);
+                }
+            }
+        }
+        if let Some(thinking) = deepseek_thinking_override_from_env() {
+            cfg.thinking = thinking;
+        }
+        Some(cfg)
+    }
+
+    /// Retarget this config at a model, switching base URL when the provider
+    /// changes (Anthropic ↔ DeepSeek) unless the URL was already customized away
+    /// from both defaults.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.set_model(model);
+        self
+    }
+
+    /// See [`Self::with_model`].
+    pub fn set_model(&mut self, model: impl Into<String>) {
+        let model = model.into();
+        let previous = crate::models::provider_for(&self.model);
+        let next = crate::models::provider_for(&model);
+        if previous != next {
+            let on_default = self.base_url == Self::DEFAULT_BASE_URL
+                || self.base_url == Self::DEEPSEEK_BASE_URL;
+            if on_default {
+                self.base_url = match next {
+                    crate::models::Provider::DeepSeek => Self::DEEPSEEK_BASE_URL.to_string(),
+                    crate::models::Provider::Anthropic => Self::DEFAULT_BASE_URL.to_string(),
+                };
+            }
+            // DeepSeek ignores Anthropic cache_control breakpoints; Claude
+            // benefits from them, so flip the default with the provider.
+            self.prompt_caching = matches!(next, crate::models::Provider::Anthropic);
+        }
+        self.model = model;
     }
 }
 
@@ -252,8 +335,10 @@ fn is_truthy(value: &str) -> bool {
     )
 }
 
-/// The property name looked up in the default key file.
+/// The property name looked up in the default key file for Anthropic.
 const TOKEN_PROPERTIES_KEY_NAME: &str = "KEY";
+/// The property name looked up in the default key file for DeepSeek.
+const TOKEN_PROPERTIES_DEEPSEEK_KEY_NAME: &str = "DEEPSEEK_KEY";
 
 /// Candidate locations for the default `token.properties` file, tried in
 /// order. The first entry favors overriding the path in tests/deployments;
@@ -293,25 +378,64 @@ fn token_properties_candidates() -> Vec<std::path::PathBuf> {
 pub fn load_default_api_key() -> Option<String> {
     token_properties_candidates()
         .into_iter()
-        .find_map(|path| read_key_from_path(&path))
+        .find_map(|path| read_named_key_from_path(&path, TOKEN_PROPERTIES_KEY_NAME, "Anthropic"))
 }
 
-/// Read and parse the `KEY` property from a single `token.properties`-style
+/// Load a default DeepSeek API key from `token.properties` (`DEEPSEEK_KEY=...`)
+/// when no explicit `DEEPSEEK_API_KEY` environment variable is set.
+pub fn load_default_deepseek_api_key() -> Option<String> {
+    token_properties_candidates().into_iter().find_map(|path| {
+        read_named_key_from_path(&path, TOKEN_PROPERTIES_DEEPSEEK_KEY_NAME, "DeepSeek")
+    })
+}
+
+/// Resolve a DeepSeek thinking override from `DEEPSEEK_THINKING`.
+///
+/// DeepSeek's Anthropic-compatible API only accepts `thinking.type` of
+/// `enabled` / `disabled` (budget is ignored), so truthy values select a
+/// legacy-style enabled budget and falsy values disable thinking.
+fn deepseek_thinking_override_from_env() -> Option<ThinkingConfig> {
+    let flag = std::env::var("DEEPSEEK_THINKING").ok()?;
+    if let Ok(n) = flag.trim().parse::<u32>() {
+        Some(if n > 0 {
+            ThinkingConfig::Budget {
+                budget_tokens: n.max(AnthropicConfig::MIN_THINKING_BUDGET),
+            }
+        } else {
+            ThinkingConfig::Disabled
+        })
+    } else if is_truthy(&flag) {
+        Some(ThinkingConfig::Budget {
+            budget_tokens: AnthropicConfig::DEFAULT_THINKING_BUDGET,
+        })
+    } else {
+        Some(ThinkingConfig::Disabled)
+    }
+}
+
+/// Read and parse a named property from a single `token.properties`-style
 /// file at `path`. Returns `None` (without treating it as an error) if the
-/// file does not exist, cannot be read, or has no non-empty `KEY` property.
-fn read_key_from_path(path: &std::path::Path) -> Option<String> {
+/// file does not exist, cannot be read, or has no non-empty property.
+fn read_named_key_from_path(
+    path: &std::path::Path,
+    property: &str,
+    provider_label: &str,
+) -> Option<String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
-            let key = parse_key_property(&contents, TOKEN_PROPERTIES_KEY_NAME);
+            let key = parse_key_property(&contents, property);
             if key.is_some() {
                 tracing::debug!(
                     path = %path.display(),
-                    "loaded default Anthropic API key from token.properties"
+                    property,
+                    provider = provider_label,
+                    "loaded default API key from token.properties"
                 );
             } else {
                 tracing::debug!(
                     path = %path.display(),
-                    "token.properties found but has no non-empty `{TOKEN_PROPERTIES_KEY_NAME}` property"
+                    property,
+                    "token.properties found but has no non-empty property"
                 );
             }
             key
@@ -346,6 +470,27 @@ fn parse_key_property(contents: &str, property_name: &str) -> Option<String> {
         return (!value.is_empty()).then(|| value.to_string());
     }
     None
+}
+
+/// Map an [`Effort`] to the wire value accepted by the model's provider.
+///
+/// Anthropic accepts `low` / `medium` / `high`. DeepSeek's Anthropic-compatible
+/// API accepts `low` / `high` / `max`, so medium is promoted to high and high
+/// is mapped to max.
+fn effort_wire_value(model: &str, effort: Effort) -> &'static str {
+    if crate::models::is_deepseek_model(model) {
+        match effort {
+            Effort::Low => "low",
+            Effort::Medium => "high",
+            Effort::High => "max",
+        }
+    } else {
+        match effort {
+            Effort::Low => "low",
+            Effort::Medium => "medium",
+            Effort::High => "high",
+        }
+    }
 }
 
 /// Convert a compiled [`LlmRequest`] plus config into the Anthropic Messages
@@ -401,7 +546,10 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
         .effort
         .filter(|_| crate::models::supports_effort(&config.model))
     {
-        body.insert("output_config".into(), json!({ "effort": effort }));
+        body.insert(
+            "output_config".into(),
+            json!({ "effort": effort_wire_value(&config.model, effort) }),
+        );
     }
 
     // Configure extended thinking. The response then carries `thinking` blocks
@@ -416,15 +564,28 @@ pub fn build_body(req: &LlmRequest, config: &AnthropicConfig) -> Value {
             body.insert("thinking".into(), json!({ "type": "disabled" }));
         }
         ThinkingConfig::Adaptive { display_summarized } => {
-            let mut thinking = json!({ "type": "adaptive" });
-            if *display_summarized {
-                thinking["display"] = json!("summarized");
+            // DeepSeek's Anthropic-compatible endpoint only understands
+            // enabled/disabled; map adaptive down to a plain enable.
+            if crate::models::is_deepseek_model(&config.model) {
+                body.insert(
+                    "thinking".into(),
+                    json!({
+                        "type": "enabled",
+                        "budget_tokens": AnthropicConfig::DEFAULT_THINKING_BUDGET,
+                    }),
+                );
+            } else {
+                let mut thinking = json!({ "type": "adaptive" });
+                if *display_summarized {
+                    thinking["display"] = json!("summarized");
+                }
+                body.insert("thinking".into(), thinking);
             }
-            body.insert("thinking".into(), thinking);
         }
         ThinkingConfig::Budget { budget_tokens } => {
             // `budget_tokens` must be strictly less than `max_tokens`, which
-            // `effective_max_tokens` guarantees.
+            // `effective_max_tokens` guarantees. DeepSeek ignores the budget
+            // field but still accepts `type: "enabled"`.
             let budget = (*budget_tokens).max(AnthropicConfig::MIN_THINKING_BUDGET);
             body.insert(
                 "thinking".into(),
@@ -724,7 +885,7 @@ mod tests {
         std::fs::write(&path, "KEY=sk-ant-from-file\n").unwrap();
 
         assert_eq!(
-            read_key_from_path(&path),
+            read_named_key_from_path(&path, TOKEN_PROPERTIES_KEY_NAME, "Anthropic"),
             Some("sk-ant-from-file".to_string())
         );
 
@@ -778,7 +939,43 @@ mod tests {
     fn missing_token_properties_file_falls_back_cleanly() {
         let path = std::env::temp_dir().join("turn-anthropic-test-token-does-not-exist.properties");
         let _ = std::fs::remove_file(&path);
-        assert_eq!(read_key_from_path(&path), None);
+        assert_eq!(
+            read_named_key_from_path(&path, TOKEN_PROPERTIES_KEY_NAME, "Anthropic"),
+            None
+        );
+    }
+
+    #[test]
+    fn deepseek_config_targets_deepseek_endpoint() {
+        let cfg = AnthropicConfig::deepseek("sk-ds", "deepseek-v4-flash");
+        assert_eq!(cfg.base_url, AnthropicConfig::DEEPSEEK_BASE_URL);
+        assert!(!cfg.prompt_caching);
+        assert_eq!(cfg.model, "deepseek-v4-flash");
+    }
+
+    #[test]
+    fn deepseek_body_maps_effort_and_budget_thinking() {
+        let mut cfg = AnthropicConfig::deepseek("sk-ds", "deepseek-v4-flash");
+        cfg.effort = Some(Effort::High);
+        let req = DefaultCompiler
+            .compile(&SessionState::new("s1").turn_context())
+            .unwrap();
+        let body = build_body(&req, &cfg);
+        assert_eq!(body["model"], "deepseek-v4-flash");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["output_config"]["effort"], "max");
+        // DeepSeek ignores Anthropic cache_control breakpoints.
+        assert!(body.get("system").is_none() || body["system"].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn with_model_switches_provider_endpoint() {
+        let cfg = AnthropicConfig::new("sk-ant", "claude-sonnet-5")
+            .with_model("deepseek-v4-pro");
+        assert_eq!(cfg.base_url, AnthropicConfig::DEEPSEEK_BASE_URL);
+        assert!(!cfg.prompt_caching);
+        let cfg = cfg.with_model("claude-haiku-4-5");
+        assert_eq!(cfg.base_url, AnthropicConfig::DEFAULT_BASE_URL);
     }
 
     #[test]

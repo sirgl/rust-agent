@@ -199,6 +199,7 @@ mod tests {
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
                 assert_eq!(opts.len(), MODELS.len());
                 assert!(opts.iter().any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
+                assert!(opts.iter().any(|o| o.value.0.as_ref() == "deepseek-v4-flash"));
             } else {
                 panic!("expected ungrouped options");
             }
@@ -227,6 +228,8 @@ mod tests {
         };
         assert!(selection.apply_update("model", json!("claude-haiku-4-5")));
         assert_eq!(selection.model, "claude-haiku-4-5");
+        assert!(selection.apply_update("model", json!("deepseek-v4-flash")));
+        assert_eq!(selection.model, "deepseek-v4-flash");
     }
 
     #[test]

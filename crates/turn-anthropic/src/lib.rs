@@ -40,10 +40,14 @@ use futures::StreamExt;
 
 pub use mapper::StreamMapper;
 pub use models::{
-    default_max_output_tokens, default_thinking_dialect, model_spec, supports_effort, ModelSpec,
-    ThinkingDialect, MODELS,
+    default_max_output_tokens, default_thinking_dialect, is_deepseek_model, model_spec,
+    models_for_provider, provider_for, supports_effort, ModelSpec, Provider, ThinkingDialect,
+    DEFAULT_DEEPSEEK_MODEL, DEFAULT_MODEL, MODELS,
 };
-pub use request::{build_body, load_default_api_key, AnthropicConfig, Effort, ThinkingConfig};
+pub use request::{
+    build_body, load_default_api_key, load_default_deepseek_api_key, AnthropicConfig, Effort,
+    ThinkingConfig,
+};
 pub use sse::SseDecoder;
 
 /// Observer notified with the *real* request body just before it is sent to the

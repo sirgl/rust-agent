@@ -12,6 +12,7 @@
 //! returns [`StopReason::Cancelled`], and emits no further updates.
 
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use futures::StreamExt;
 use tracing::{debug, info_span, warn, Instrument};
@@ -398,6 +399,22 @@ impl TurnEngine {
                 return Ok(StopReason::Cancelled);
             }
 
+            let round_cancel = cancel.child_token();
+            let _steering_monitor = self.inbox.as_ref().map(|inbox| {
+                let inbox = inbox.clone();
+                let round_cancel = round_cancel.clone();
+                tokio::spawn(async move {
+                    while !round_cancel.is_cancelled() {
+                        if !inbox.lock().expect("inbox mutex poisoned").is_empty() {
+                            debug!("steering message observed in background; cancelling round");
+                            round_cancel.cancel();
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+            });
+
             // Fold in any steering messages injected since the previous round so
             // they become part of the context for this decision call.
             self.drain_inbox(session);
@@ -474,8 +491,14 @@ impl TurnEngine {
                 // Observe cancellation while awaiting the next decision event.
                 let event = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => {
-                        debug!("cancellation observed while streaming decision events");
+                    _ = round_cancel.cancelled() => {
+                        let stop_reason = if cancel.is_cancelled() {
+                            debug!("cancellation observed while streaming decision events");
+                            StopReason::Cancelled
+                        } else {
+                            debug!("steering observed while streaming decision events");
+                            StopReason::ToolUse // Round interrupted by steering
+                        };
                         self.notify_response(
                             &round_trace,
                             round_session_id.clone(),
@@ -483,11 +506,16 @@ impl TurnEngine {
                             thinking_chars,
                             &round_tool_calls,
                             round_usage,
-                            Some(StopReason::Cancelled),
+                            Some(stop_reason),
                             None,
                             round_start,
                         );
-                        return Ok(StopReason::Cancelled);
+                        if stop_reason == StopReason::Cancelled {
+                            return Ok(StopReason::Cancelled);
+                        } else {
+                            flush_assistant_text(session, &mut assistant_text);
+                            break;
+                        }
                     }
                     next = stream.next() => next,
                 };
@@ -582,7 +610,7 @@ impl TurnEngine {
                         self.dispatch_tool(
                             session,
                             sink,
-                            cancel,
+                            &round_cancel,
                             id,
                             name,
                             arguments,
@@ -593,6 +621,22 @@ impl TurnEngine {
                         .await?;
                         if cancel.is_cancelled() {
                             return Ok(StopReason::Cancelled);
+                        }
+                        if round_cancel.is_cancelled() {
+                            debug!("steering message observed; interrupting tool sequence");
+                            self.notify_response(
+                                &round_trace,
+                                round_session_id.clone(),
+                                &round_text,
+                                thinking_chars,
+                                &round_tool_calls,
+                                round_usage,
+                                Some(StopReason::ToolUse),
+                                None,
+                                round_start,
+                            );
+                            flush_assistant_text(session, &mut assistant_text);
+                            break;
                         }
                         if is_terminal {
                             debug!("terminal tool dispatched; ending turn");
@@ -838,8 +882,13 @@ impl TurnEngine {
             let event = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
-                    debug!("cancellation observed while running tool {name}");
-                    session.push_tool_result(id.clone(), false, "cancelled by user");
+                    let msg = if self.has_pending_inbox() {
+                        "interrupted by steering"
+                    } else {
+                        "cancelled by user"
+                    };
+                    debug!("{msg} observed while running tool {name}");
+                    session.push_tool_result(id.clone(), false, msg);
                     self.notify_tool_finished(
                         round_trace,
                         session,
