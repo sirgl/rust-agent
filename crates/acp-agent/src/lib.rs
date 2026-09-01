@@ -15,11 +15,15 @@
 #![warn(missing_docs)]
 
 pub mod agent;
+#[cfg(feature = "unstable_protocol_v2")]
+mod agent_v2;
 pub mod commands;
 pub mod config;
 pub mod local_client;
 pub mod selection;
 pub mod sink;
+#[cfg(feature = "unstable_protocol_v2")]
+mod sink_v2;
 pub mod turn_coordinator;
 pub mod usage;
 

@@ -42,6 +42,13 @@ Start the ACP WebSocket server:
 cargo run -p acp-agent
 ```
 
+The default build serves ACP v1. To enable ACP v2 while keeping v1 clients
+working through protocol negotiation, build with:
+
+```bash
+cargo run -p acp-agent --features unstable_protocol_v2
+```
+
 The server listens on the port configured in the environment or defaults.
 
 ## Configuration

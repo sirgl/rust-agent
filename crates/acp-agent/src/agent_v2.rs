@@ -1,17 +1,17 @@
 //! The ACP `Agent`-side wiring for the stdio server.
 //!
-//! [`build_agent`] assembles an [`agent_client_protocol`] connection builder
+//! [`build_agent_v2`] assembles an [`agent_client_protocol`] connection builder
 //! that implements the agent half of the protocol. The builder registers one
 //! handler per supported method:
 //!
 //! - `initialize` — negotiate the protocol version and advertise capabilities.
-//! - `authenticate` — a no-op/passthrough (this agent requires no auth).
 //! - `session/new` — allocate a [`SessionState`] and return its id.
+//! - `session/list`, `session/resume`, `session/close` — manage persisted sessions.
 //! - `session/prompt` — run a [`TurnEngine`] turn, streaming `session/update`
-//!   notifications and returning a `stopReason`.
+//!   notifications and reporting completion through an idle state update.
 //! - `session/cancel` — cancel the in-flight turn for a session.
 //!
-//! The decision layer is injected as a [`NextTurnFactory`] so the same wiring
+//! The decision layer is injected through [`AgentDeps`] so the same wiring
 //! serves the real Anthropic backend (added later) and the deterministic replay
 //! backend used by tests, without touching the turn engine.
 //!
@@ -29,15 +29,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_client_protocol::schema::v1::{
-    AgentCapabilities, AuthenticateRequest, AuthenticateResponse, AvailableCommand,
-    AvailableCommandsUpdate, CancelNotification, Content, ContentBlock, ContentChunk,
-    Implementation, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
-    McpServer, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionId,
-    SessionMode, SessionModeId, SessionModeState, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, SetSessionModeRequest,
-    SetSessionModeResponse, StopReason as AcpStopReason, TextContent, ToolCall, ToolCallContent,
-    ToolCallStatus as AcpToolCallStatus, ToolCallUpdate, ToolCallUpdateFields,
+use agent_client_protocol::schema::v2::{
+    AgentCapabilities, AgentMessage, AvailableCommand, AvailableCommandsUpdate,
+    CancelSessionNotification, CloseSessionRequest, CloseSessionResponse, ContentBlock,
+    IdleStateUpdate, Implementation, InitializeRequest, InitializeResponse, ListSessionsRequest,
+    ListSessionsResponse, McpCapabilities, McpServer, McpStdioCapabilities, NewSessionRequest,
+    NewSessionResponse, PromptRequest, PromptResponse, ReplayFrom, ResumeSessionRequest,
+    ResumeSessionResponse, RunningStateUpdate, SessionAdditionalDirectoriesCapabilities,
+    SessionCapabilities, SessionConfigId, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigSelect, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionInfo, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StateUpdate,
+    StopReason as AcpStopReason, TextContent, ToolCallStatus as AcpToolCallStatus, ToolCallUpdate,
+    UpdateSessionNotification, UserMessage,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{
@@ -45,8 +49,8 @@ use agent_client_protocol::{
     JsonRpcResponse,
 };
 use agent_core::{
-    EngineOutput, HistoryEntry, InMemorySessionStore, NextTurnService, SessionRecord, SessionState,
-    SessionStore, StopReason, ToolDescriptor, ToolRegistry, TurnEngine, TurnInbox, UpdateSink,
+    EngineOutput, HistoryEntry, SessionRecord, SessionState, SessionStore, StopReason,
+    ToolDescriptor, ToolRegistry, TurnEngine, TurnInbox, UpdateSink,
 };
 use mcp_client::stdio::StdioMcpConnection;
 use mcp_client::{register_mcp_tools, McpConnection};
@@ -54,105 +58,56 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, info, warn};
 
+use crate::agent::{AgentDeps, CHAT_MODE_ID, ORCHESTRATE_MODE_ID};
 use crate::commands::{parse_command, run_command};
-use crate::config::AgentConfig;
 use crate::local_client::LocalClientAccess;
 use crate::selection::ModelSelection;
-use crate::sink::{AcpUpdateSink, GenerationScopedSink};
+use crate::sink::GenerationScopedSink;
+use crate::sink_v2::AcpUpdateSink;
 use crate::turn_coordinator::TurnCoordinator;
 use crate::usage::USAGE_COMMAND;
 
-/// The mode id for the default plain-chat session mode.
-pub const CHAT_MODE_ID: &str = "chat";
-/// The mode id for the orchestrated-execution session mode.
-pub const ORCHESTRATE_MODE_ID: &str = "orchestrate";
-
-/// Build the ACP [`SessionModeState`] advertised on `session/new`, with the
-/// given `current` mode id and both `chat`/`orchestrate` modes available.
-fn session_mode_state(current: &str) -> SessionModeState {
-    SessionModeState::new(
-        SessionModeId::new(current.to_string()),
-        vec![
-            SessionMode::new(SessionModeId::new(CHAT_MODE_ID), "Chat")
-                .description("Plain streaming chat: a single turn engine answers the prompt."),
-            SessionMode::new(SessionModeId::new(ORCHESTRATE_MODE_ID), "Orchestrate").description(
-                "Orchestrated execution: an orchestrator drives sub-agents to accomplish the goal.",
-            ),
-        ],
+/// Build the ACP v2 mode selector. Session modes were removed in v2 and are
+/// represented as ordinary session config options with `category: "mode"`.
+fn mode_config_option(current: &str) -> SessionConfigOption {
+    SessionConfigOption::new(
+        SessionConfigId::new("mode"),
+        "Mode",
+        SessionConfigKind::Select(SessionConfigSelect::new(
+            SessionConfigValueId::new(current),
+            SessionConfigSelectOptions::Ungrouped(vec![
+                SessionConfigSelectOption::new(SessionConfigValueId::new(CHAT_MODE_ID), "Chat")
+                    .description(
+                        "Plain streaming chat: a single turn engine answers the prompt."
+                            .to_string(),
+                    ),
+                SessionConfigSelectOption::new(
+                    SessionConfigValueId::new(ORCHESTRATE_MODE_ID),
+                    "Orchestrate",
+                )
+                .description(
+                    "Orchestrated execution: an orchestrator drives sub-agents to accomplish the goal."
+                        .to_string(),
+                ),
+            ]),
+        )),
     )
+    .category(SessionConfigOptionCategory::Mode)
 }
 
-/// Whether `mode_id` is one of the advertised session modes.
+/// Return the complete ACP v2 configuration surface for a session.
+fn session_config_options(
+    selection: &ModelSelection,
+    current_mode: &str,
+) -> Vec<SessionConfigOption> {
+    let mut options = vec![mode_config_option(current_mode)];
+    options.extend(selection.config_options_v2());
+    options
+}
+
+/// Whether `mode_id` is one of the advertised mode config values.
 fn is_known_mode(mode_id: &str) -> bool {
     matches!(mode_id, CHAT_MODE_ID | ORCHESTRATE_MODE_ID)
-}
-
-/// Factory that produces a fresh [`NextTurnService`] for each prompt turn.
-///
-/// A fresh instance per turn keeps stateful backends (e.g. the deterministic
-/// replay backend, which consumes scripted rounds) well-behaved across multiple
-/// prompts in the same session.
-pub type NextTurnFactory = Arc<dyn Fn(&ModelSelection) -> Arc<dyn NextTurnService> + Send + Sync>;
-
-/// Dependencies required to build the agent connection.
-#[derive(Clone)]
-pub struct AgentDeps {
-    /// Produces the decision-layer service for each turn.
-    pub next_turn_factory: NextTurnFactory,
-    /// Tools exposed to the turn engine.
-    pub tools: ToolRegistry,
-    /// Static configuration (identity, system prompt).
-    pub config: AgentConfig,
-    /// Backing store used to persist session *core* state (history + usage)
-    /// after each turn, so sessions can survive process restarts.
-    ///
-    /// Defaults to [`default_store`] (an [`InMemorySessionStore`]) via
-    /// construction helpers; the binary swaps in a disk-backed store when a
-    /// persistence directory is configured.
-    pub store: Arc<dyn SessionStore>,
-    /// Optional provider-neutral observer attached to every turn engine so the
-    /// LLM inspector captures the typed request snapshot of every decision
-    /// round, for any backend. `None` disables typed capture.
-    pub turn_observer: Option<Arc<dyn agent_core::TurnObserver>>,
-    /// Optional base URL of the running LLM-inspector UI (e.g.
-    /// `http://127.0.0.1:7878`). When set, `session/new` greets each session
-    /// with a per-session inspector link as its first message. `None` disables
-    /// the greeting.
-    pub inspector_base_url: Option<String>,
-}
-
-impl AgentDeps {
-    /// Build dependencies with observability seams disabled (`turn_observer` and
-    /// `inspector_base_url` both `None`).
-    ///
-    /// A convenience for tests and callers that do not run the inspector, so
-    /// adding observability fields does not force every construction site to
-    /// mention them.
-    #[must_use]
-    pub fn new(
-        next_turn_factory: NextTurnFactory,
-        tools: ToolRegistry,
-        config: AgentConfig,
-        store: Arc<dyn SessionStore>,
-    ) -> Self {
-        Self {
-            next_turn_factory,
-            tools,
-            config,
-            store,
-            turn_observer: None,
-            inspector_base_url: None,
-        }
-    }
-}
-
-/// Build the default [`SessionStore`]: a non-durable [`InMemorySessionStore`].
-///
-/// Used as the ergonomic default for [`AgentDeps::store`] in tests and when no
-/// persistence directory is configured.
-#[must_use]
-pub fn default_store() -> Arc<dyn SessionStore> {
-    Arc::new(InMemorySessionStore::new())
 }
 
 /// Persist the given session's core state via `store`, logging (but not
@@ -225,9 +180,9 @@ struct SessionEntry {
     /// This session's tool registry: the base tools plus any tools
     /// discovered from the session's `mcp_servers` at `session/new` time.
     tools: ToolRegistry,
-    /// The current ACP session mode (`chat` or `orchestrate`), switchable via
-    /// `session/set_mode`.
-    mode: StdMutex<SessionModeId>,
+    /// The current execution mode. ACP v2 exposes this through the `mode`
+    /// session config option rather than the removed `session/set_mode` method.
+    mode: StdMutex<String>,
     /// Current model and effort selection for this session.
     selection: StdMutex<ModelSelection>,
     /// Steering inbox: user messages injected via [`STEERING_METHOD`] and drained
@@ -250,25 +205,10 @@ type Sessions = Arc<StdMutex<HashMap<String, Arc<SessionEntry>>>>;
 
 /// Build the ACP agent connection.
 ///
-/// Without the `unstable_protocol_v2` Cargo feature, the returned connection
-/// supports ACP v1 only. With the feature enabled, initialization is routed to
-/// the highest compatible v1 or v2 implementation requested by the client.
-#[cfg(not(feature = "unstable_protocol_v2"))]
-pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
-    build_agent_v1(deps)
-}
-
-/// Build the dual-protocol ACP agent connection.
-#[cfg(feature = "unstable_protocol_v2")]
-pub fn build_agent(deps: AgentDeps) -> impl ConnectTo<Client> {
-    Agent
-        .protocol_router()
-        .with_v1(build_agent_v1(deps.clone()))
-        .with_v2(crate::agent_v2::build_agent_v2(deps))
-}
-
-/// Build the ACP v1 implementation used directly or by the protocol router.
-fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
+/// The returned value implements [`ConnectTo<Client>`] and can be driven either
+/// over a real transport (e.g. `Stdio`) or, in tests, directly by a client
+/// builder via `connect_with`.
+pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
     let sessions: Sessions = Arc::new(StdMutex::new(HashMap::new()));
 
     let init_config = deps.config.clone();
@@ -282,22 +222,23 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
     let prompt_thought_interval = deps.config.thought_interval;
     let inject_thought_interval = deps.config.thought_interval;
     let cancel_sessions = sessions.clone();
-    let set_mode_sessions = sessions.clone();
     let config_sessions = sessions.clone();
     let inject_sessions = sessions.clone();
     let inject_factory = deps.next_turn_factory.clone();
     let prompt_observer = deps.turn_observer.clone();
     let inject_observer = deps.turn_observer.clone();
     let new_session_observer = deps.turn_observer.clone();
-    let load_session_observer = deps.turn_observer.clone();
+    let resume_session_observer = deps.turn_observer.clone();
     let new_session_inspector_url = deps.inspector_base_url.clone();
     let new_store = deps.store.clone();
     let prompt_store = deps.store.clone();
     let inject_store = deps.store.clone();
-    let load_sessions = sessions.clone();
-    let load_session_tools = deps.tools.clone();
-    let load_session_config = deps.config.clone();
-    let load_store = deps.store.clone();
+    let list_store = deps.store.clone();
+    let resume_sessions = sessions.clone();
+    let resume_session_tools = deps.tools.clone();
+    let resume_session_config = deps.config.clone();
+    let resume_store = deps.store.clone();
+    let close_sessions = sessions.clone();
 
     // The initial mode a new session starts in: `orchestrate` when the
     // orchestrated toggle is set (backward-compatible with `ACP_ORCHESTRATED`),
@@ -309,36 +250,35 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
     };
 
     Agent
-        .builder()
+        .v2()
         .name(deps.config.name.clone())
-        // initialize: negotiate protocol version, advertise capabilities.
+        // initialize: ACP v2 only, with the baseline session surface and the
+        // MCP/additional-directory extensions implemented below.
         .on_receive_request(
             async move |req: InitializeRequest, responder, _cx| {
-                let negotiated = ProtocolVersion::V1;
                 info!(
                     requested = %req.protocol_version,
-                    negotiated = %negotiated,
+                    negotiated = %ProtocolVersion::V2,
                     "initialize"
                 );
-                let response = InitializeResponse::new(negotiated)
-                    .agent_capabilities(AgentCapabilities::default().load_session(true))
-                    .agent_info(Implementation::new(
+                let capabilities = AgentCapabilities::new().session(
+                    SessionCapabilities::new()
+                        .mcp(McpCapabilities::new().stdio(McpStdioCapabilities::new()))
+                        .additional_directories(SessionAdditionalDirectoriesCapabilities::new()),
+                );
+                let response = InitializeResponse::new(
+                    ProtocolVersion::V2,
+                    Implementation::new(
                         init_config.name.clone(),
                         init_config.version.clone(),
-                    ))
+                    ),
+                )
+                    .capabilities(capabilities)
                     .meta(serde_json::Map::from_iter([(
                         "steering".to_string(),
                         serde_json::json!({ "supported": true }),
                     )]));
                 responder.respond(response)
-            },
-            on_receive_request!(),
-        )
-        // authenticate: no-op passthrough.
-        .on_receive_request(
-            async move |_req: AuthenticateRequest, responder, _cx| {
-                debug!("authenticate (no-op)");
-                responder.respond(AuthenticateResponse::new())
             },
             on_receive_request!(),
         )
@@ -350,7 +290,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let session_id = format!("session-{}", uuid_like());
 
                 if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
-                    warn!(session_id, cwd = %req.cwd.display(), %err, "session/new invalid cwd");
+                    warn!(session_id, cwd = %req.cwd.0.display(), %err, "session/new invalid cwd");
                     return responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params().data(err.to_string()),
                     );
@@ -361,16 +301,16 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 let mut state = SessionState::new(session_id.clone());
                 state.set_workspace(
-                    req.cwd.to_string_lossy().into_owned(),
+                    req.cwd.0.to_string_lossy().into_owned(),
                     req.additional_directories
                         .iter()
-                        .map(|path| path.to_string_lossy().into_owned()),
+                        .map(|path| path.0.to_string_lossy().into_owned()),
                 );
                 state.system_prompt = new_session_config.system_prompt.clone();
                 state.available_tools = tool_descriptors(&tools);
 
                 let selection = ModelSelection::for_config(&new_session_config);
-                let config_options = selection.config_options();
+                let config_options = session_config_options(&selection, initial_mode_id);
 
                 // Persist the freshly-created core state so the session exists
                 // in the store from the outset (best-effort).
@@ -391,7 +331,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                     state: Arc::new(AsyncMutex::new(state)),
                     turns: TurnCoordinator::new(session_id.clone()),
                     tools,
-                    mode: StdMutex::new(SessionModeId::new(initial_mode_id)),
+                    mode: StdMutex::new(initial_mode_id.to_string()),
                     selection: StdMutex::new(selection),
                     inbox: Arc::new(StdMutex::new(Vec::new())),
                     pending_welcome: StdMutex::new(pending_welcome),
@@ -404,7 +344,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 info!(
                     session_id,
-                    cwd = %req.cwd.display(),
+                    cwd = %req.cwd.0.display(),
                     initial_mode = initial_mode_id,
                     "session/new"
                 );
@@ -423,33 +363,76 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                 // turn is active.
                 responder.respond(
                     NewSessionResponse::new(SessionId::new(session_id))
-                        .modes(session_mode_state(initial_mode_id))
                         .config_options(config_options),
                 )
             },
             on_receive_request!(),
         )
-        // session/load: restore a persisted session from the store, reconnect
-        // its MCP servers, rehydrate state, replay history to the client, and
-        // re-advertise available commands.
+        // session/list: enumerate persisted sessions, optionally filtered by cwd.
         .on_receive_request(
-            async move |req: LoadSessionRequest, responder, cx| {
+            async move |req: ListSessionsRequest, responder, _cx| {
+                let ids = match list_store.list_ids().await {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        warn!(%err, "session/list failed to read store");
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::into_internal_error(err),
+                        );
+                    }
+                };
+
+                let mut listed = Vec::new();
+                for id in ids {
+                    let Some(record) = (match list_store.load(&id).await {
+                        Ok(record) => record,
+                        Err(err) => {
+                            warn!(session_id = id, %err, "session/list skipped unreadable session");
+                            continue;
+                        }
+                    }) else {
+                        continue;
+                    };
+                    let Some(cwd) = record.workspace_roots.first() else {
+                        continue;
+                    };
+                    if req
+                        .cwd
+                        .as_ref()
+                        .is_some_and(|filter| filter.0.as_path() != std::path::Path::new(cwd))
+                    {
+                        continue;
+                    }
+                    listed.push(
+                        SessionInfo::new(SessionId::new(record.session_id), cwd.clone())
+                            .additional_directories(record.workspace_roots.iter().skip(1).cloned()),
+                    );
+                }
+                listed.sort_by(|a, b| a.session_id.0.cmp(&b.session_id.0));
+                info!(sessions = listed.len(), "session/list");
+                responder.respond(ListSessionsResponse::new(listed))
+            },
+            on_receive_request!(),
+        )
+        // session/resume: restore persisted state, reconnect MCP servers, and
+        // optionally replay history when replayFrom requests it.
+        .on_receive_request(
+            async move |req: ResumeSessionRequest, responder, cx| {
                 let session_id = req.session_id.0.to_string();
 
                 // Read the persisted core state. A missing session is a client
                 // error; a store/deserialization failure is surfaced cleanly
                 // rather than panicking.
-                let record = match load_store.load(&session_id).await {
+                let record = match resume_store.load(&session_id).await {
                     Ok(Some(record)) => record,
                     Ok(None) => {
-                        warn!(session_id, "session/load for unknown session");
+                        warn!(session_id, "session/resume for unknown session");
                         return responder.respond_with_error(
                             agent_client_protocol::Error::invalid_params()
                                 .data(format!("unknown session: {session_id}")),
                         );
                     }
                     Err(err) => {
-                        warn!(session_id, %err, "session/load failed to read store");
+                        warn!(session_id, %err, "session/resume failed to read store");
                         return responder.respond_with_error(
                             agent_client_protocol::Error::invalid_params()
                                 .data(format!("failed to load session {session_id}: {err}")),
@@ -457,79 +440,105 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                     }
                 };
 
+                if matches!(req.replay_from, Some(ReplayFrom::Other(_))) {
+                    return responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data("unsupported replayFrom cursor"),
+                    );
+                }
+
+                if let Some(stored_cwd) = record.workspace_roots.first() {
+                    if req.cwd.0.as_path() != std::path::Path::new(stored_cwd) {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params().data(format!(
+                                "session {session_id} belongs to cwd {stored_cwd}"
+                            )),
+                        );
+                    }
+                }
+
                 // Reconnect any MCP servers the client asked for and re-derive
                 // the live tool set (tool schemas are not persisted).
-                let mut tools = load_session_tools.clone();
+                let mut tools = resume_session_tools.clone();
                 connect_session_mcp_servers(&session_id, &req.mcp_servers, &mut tools).await;
 
                 let available_tools = tool_descriptors(&tools);
                 let history = record.history.clone();
                 if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
-                    warn!(session_id, cwd = %req.cwd.display(), %err, "session/load invalid cwd");
+                    warn!(session_id, cwd = %req.cwd.0.display(), %err, "session/resume invalid cwd");
                     return responder.respond_with_error(
                         agent_client_protocol::Error::invalid_params().data(err.to_string()),
                     );
                 }
                 let mut state = SessionState::from_record(record, available_tools);
                 state.set_workspace(
-                    req.cwd.to_string_lossy().into_owned(),
+                    req.cwd.0.to_string_lossy().into_owned(),
                     req.additional_directories
                         .iter()
-                        .map(|path| path.to_string_lossy().into_owned()),
+                        .map(|path| path.0.to_string_lossy().into_owned()),
                 );
                 let restored_plan =
                     (!state.todo_list.items.is_empty()).then(|| state.todo_list.to_plan_update());
 
                 // The current ACP request is authoritative for execution
                 // context; persist it before exposing the loaded session.
-                persist_record(&load_store, &session_id, &state.to_record()).await;
+                persist_record(&resume_store, &session_id, &state.to_record()).await;
 
                 // Publish the rehydrated session state to the debug UI.
-                publish_session_state(&load_session_observer, &state, Some(CHAT_MODE_ID));
+                publish_session_state(&resume_session_observer, &state, Some(initial_mode_id));
 
-                let selection = ModelSelection::for_config(&load_session_config);
-                let config_options = selection.config_options();
+                let selection = ModelSelection::for_config(&resume_session_config);
+                let config_options = session_config_options(&selection, initial_mode_id);
 
                 let entry = Arc::new(SessionEntry {
                     state: Arc::new(AsyncMutex::new(state)),
                     turns: TurnCoordinator::new(session_id.clone()),
                     tools,
-                    mode: StdMutex::new(SessionModeId::new(CHAT_MODE_ID)),
+                    mode: StdMutex::new(initial_mode_id.to_string()),
                     selection: StdMutex::new(selection),
                     inbox: Arc::new(StdMutex::new(Vec::new())),
                     pending_welcome: StdMutex::new(None),
                     orchestration: AsyncMutex::new(None),
                 });
-                load_sessions
+                if let Some(previous) = resume_sessions
                     .lock()
                     .expect("sessions mutex poisoned")
-                    .insert(session_id.clone(), entry);
+                    .insert(session_id.clone(), entry)
+                {
+                    previous.turns.retire_active();
+                }
 
                 info!(
                     session_id,
-                    cwd = %req.cwd.display(),
+                    cwd = %req.cwd.0.display(),
                     entries = history.len(),
-                    "session/load"
+                    "session/resume"
                 );
 
                 // Replay the stored conversation to the client in order, as
                 // `session/update` notifications. Unknown/ingested entries are
                 // skipped (best-effort) rather than failing the load.
+                let should_replay = matches!(req.replay_from, Some(ReplayFrom::Start(_)));
                 let acp_session_id = SessionId::new(session_id.clone());
-                if let Some(plan) = restored_plan {
-                    let notification = SessionNotification::new(
-                        acp_session_id.clone(),
-                        SessionUpdate::Plan(crate::sink::map_plan(&plan)),
-                    );
-                    if let Err(err) = cx.send_notification(notification) {
-                        warn!(session_id, %err, "failed to restore todo plan");
-                    }
-                }
-                for entry in &history.entries {
-                    if let Some(update) = history_entry_to_update(entry) {
-                        let notification = SessionNotification::new(acp_session_id.clone(), update);
+                if should_replay {
+                    if let Some(plan) = restored_plan {
+                        let notification = UpdateSessionNotification::new(
+                            acp_session_id.clone(),
+                            SessionUpdate::PlanUpdate(crate::sink_v2::map_plan(&plan)),
+                        );
                         if let Err(err) = cx.send_notification(notification) {
-                            warn!(session_id, %err, "failed to replay history entry");
+                            warn!(session_id, %err, "failed to restore todo plan");
+                        }
+                    }
+                    for (index, entry) in history.entries.iter().enumerate() {
+                        if let Some(update) = history_entry_to_update(entry, index) {
+                            let notification = UpdateSessionNotification::new(
+                                acp_session_id.clone(),
+                                update,
+                            );
+                            if let Err(err) = cx.send_notification(notification) {
+                                warn!(session_id, %err, "failed to replay history entry");
+                            }
                         }
                     }
                 }
@@ -541,11 +550,33 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                     warn!(session_id, %err, "failed to advertise available commands");
                 }
 
-                responder.respond(LoadSessionResponse::new().config_options(config_options))
+                responder.respond(ResumeSessionResponse::new().config_options(config_options))
             },
             on_receive_request!(),
         )
-        // session/prompt: run a turn, streaming updates, return a stop reason.
+        // session/close: cancel work, remove live resources, retain persisted history.
+        .on_receive_request(
+            async move |req: CloseSessionRequest, responder, _cx| {
+                let session_id = req.session_id.0.to_string();
+                let removed = close_sessions
+                    .lock()
+                    .expect("sessions mutex poisoned")
+                    .remove(&session_id);
+                if let Some(entry) = removed {
+                    entry.turns.retire_active();
+                    info!(session_id, "session/close");
+                    responder.respond(CloseSessionResponse::new())
+                } else {
+                    responder.respond_with_error(
+                        agent_client_protocol::Error::invalid_params()
+                            .data(format!("unknown active session: {session_id}")),
+                    )
+                }
+            },
+            on_receive_request!(),
+        )
+        // session/prompt: acknowledge immediately, then report foreground
+        // lifecycle and output through session/update notifications.
         .on_receive_request(
             async move |req: PromptRequest, responder, cx| {
                 let session_id = req.session_id.0.to_string();
@@ -587,7 +618,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                             .data(format!("session {session_id} has no working directory")),
                     );
                 };
-                let client = match LocalClientAccess::with_elicitation_and_cwd(
+                let client = match LocalClientAccess::with_elicitation_and_cwd_v2(
                     cx.clone(),
                     req.session_id.clone(),
                     &working_directory,
@@ -601,43 +632,6 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                         );
                     }
                 };
-                let acp_sink = AcpUpdateSink::new(cx.clone(), req.session_id.clone())
-                    .with_yolo(selection.permission.is_yolo());
-                let mut sink = GenerationScopedSink::new(acp_sink, lease.clone());
-
-                // Flush any deferred one-shot greeting (e.g. the per-session
-                // LLM-inspector link) as the first agent message of this turn.
-                // Sent here, inside an active prompt turn, it is actually
-                // rendered by clients (unlike a `session/new`-time message).
-                let pending_welcome = {
-                    entry
-                        .pending_welcome
-                        .lock()
-                        .expect("welcome mutex poisoned")
-                        .take()
-                };
-                if let Some(welcome) = pending_welcome {
-                    if let Err(err) = sink.send(EngineOutput::MessageChunk(welcome)).await {
-                        warn!(session_id, %err, "failed to send inspector welcome message");
-                    }
-                }
-
-                // Intercept built-in slash commands (e.g. `/usage`): produce the
-                // command's display text as a plain agent message, without
-                // running a model turn.
-                if let Some(command) = parse_command(&user_text) {
-                    let model = selection.model.clone();
-                    let summary = {
-                        let guard = entry.state.lock().await;
-                        run_command(command, &guard, &model)
-                    };
-                    if let Err(err) = sink.send(EngineOutput::MessageChunk(summary)).await {
-                        warn!(session_id, %err, "failed to send /usage summary");
-                    }
-                    lease.finalize_if_current(|| async {}).await;
-                    return responder.respond(PromptResponse::new(AcpStopReason::EndTurn));
-                }
-
                 let factory = prompt_factory.clone();
                 let require_submit_result = prompt_require_submit_result;
                 let thought_interval = prompt_thought_interval;
@@ -647,16 +641,92 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                 // Snapshot the session's current mode so we can branch the turn.
                 let orchestrate = {
                     let mode = entry.mode.lock().expect("mode mutex poisoned");
-                    mode.0.as_ref() == ORCHESTRATE_MODE_ID
+                    mode.as_str() == ORCHESTRATE_MODE_ID
                 };
 
                 let inbox = entry.inbox.clone();
                 let store = prompt_store.clone();
 
+                let acp_session_id = req.session_id.clone();
+                let user_update = SessionUpdate::UserMessage(
+                    UserMessage::new(format!("user-{}", uuid_like())).content(req.prompt.clone()),
+                );
+
+                // ACP v2 acknowledges acceptance before foreground work runs.
+                responder.respond(PromptResponse::new())?;
+
                 // The turn must run off the event loop so the sink's blocking
                 // permission requests do not deadlock the connection.
                 cx.spawn({
+                    let cx = cx.clone();
                     async move {
+                        if let Err(err) = cx.send_notification(UpdateSessionNotification::new(
+                            acp_session_id.clone(),
+                            user_update,
+                        )) {
+                            warn!(session_id, %err, "failed to acknowledge user message");
+                        }
+                        if let Err(err) = cx.send_notification(UpdateSessionNotification::new(
+                            acp_session_id.clone(),
+                            SessionUpdate::StateUpdate(StateUpdate::Running(
+                                RunningStateUpdate::new(),
+                            )),
+                        )) {
+                            warn!(session_id, %err, "failed to publish running state");
+                        }
+
+                        // Flush any deferred one-shot greeting as the first
+                        // agent message of this foreground turn.
+                        let pending_welcome = entry
+                            .pending_welcome
+                            .lock()
+                            .expect("welcome mutex poisoned")
+                            .take();
+                        if let Some(welcome) = pending_welcome {
+                            let welcome_sink = AcpUpdateSink::new(cx.clone(), acp_session_id.clone())
+                                .with_yolo(selection.permission.is_yolo());
+                            let mut welcome_sink =
+                                GenerationScopedSink::new(welcome_sink, lease.clone());
+                            if let Err(err) = welcome_sink
+                                .send(EngineOutput::MessageChunk(welcome))
+                                .await
+                            {
+                                warn!(session_id, %err, "failed to send inspector welcome message");
+                            }
+                        }
+
+                        let acp_sink = AcpUpdateSink::new(cx.clone(), acp_session_id.clone())
+                            .with_yolo(selection.permission.is_yolo());
+                        let mut sink = GenerationScopedSink::new(acp_sink, lease.clone());
+
+                        // Built-in slash commands complete as ordinary ACP v2
+                        // foreground work without invoking the model.
+                        if let Some(command) = parse_command(&user_text) {
+                            let summary = {
+                                let guard = entry.state.lock().await;
+                                run_command(command, &guard, &selection.model)
+                            };
+                            if let Err(err) = sink.send(EngineOutput::MessageChunk(summary)).await {
+                                warn!(session_id, %err, "failed to send /usage summary");
+                            }
+                            lease
+                                .finalize_if_current(|| async {
+                                    if let Err(err) = cx.send_notification(
+                                        UpdateSessionNotification::new(
+                                            acp_session_id,
+                                            SessionUpdate::StateUpdate(StateUpdate::Idle(
+                                                IdleStateUpdate::new()
+                                                    .stop_reason(AcpStopReason::EndTurn),
+                                            )),
+                                        ),
+                                    ) {
+                                        warn!(session_id, %err, "failed to publish idle state");
+                                    }
+                                })
+                                .await;
+                            return Ok(());
+                        }
+
                         let (result, record, final_state, final_mode) = if orchestrate {
                             // Orchestrate mode: the prompt text is the goal; run
                             // the shared orchestration pipeline, streaming through
@@ -734,23 +804,36 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                             (result, record, final_state, CHAT_MODE_ID)
                         };
 
+                        let acp_stop = match &result {
+                            Ok(stop) => map_stop_reason(*stop),
+                            Err(_) => AcpStopReason::EndTurn,
+                        };
+
                         lease
                             .finalize_if_current(|| async {
                                 publish_session_state(&observer, &final_state, Some(final_mode));
                                 persist_record(&store, &session_id, &record).await;
+                                if let Err(err) = cx.send_notification(
+                                    UpdateSessionNotification::new(
+                                        acp_session_id,
+                                        SessionUpdate::StateUpdate(StateUpdate::Idle(
+                                            IdleStateUpdate::new().stop_reason(acp_stop),
+                                        )),
+                                    ),
+                                ) {
+                                    warn!(session_id, %err, "failed to publish idle state");
+                                }
                             })
                             .await;
 
                         match result {
                             Ok(stop) => {
                                 debug!(session_id, ?stop, "session/prompt finished");
-                                responder.respond(PromptResponse::new(map_stop_reason(stop)))
+                                Ok(())
                             }
                             Err(err) => {
                                 warn!(session_id, %err, "session/prompt failed");
-                                responder.respond_with_error(
-                                    agent_client_protocol::Error::into_internal_error(err),
-                                )
+                                Ok(())
                             }
                         }
                     }
@@ -778,16 +861,43 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                     );
                 };
 
-                let mut selection = entry.selection.lock().expect("selection mutex poisoned");
-                let json_value = if let Some(id) = req.value.as_value_id() {
+                let json_value = if let Some(id) = req.value.as_id() {
                     serde_json::Value::String(id.0.to_string())
                 } else if let Some(b) = req.value.as_bool() {
                     serde_json::Value::Bool(b)
                 } else {
                     serde_json::to_value(req.value).unwrap_or_default()
                 };
-                selection.apply_update(&req.config_id.0, json_value);
-                let config_options = selection.config_options();
+
+                if req.config_id.0.as_ref() == "mode" {
+                    let Some(mode_id) = json_value.as_str() else {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data("mode must be a select value"),
+                        );
+                    };
+                    if !is_known_mode(mode_id) {
+                        return responder.respond_with_error(
+                            agent_client_protocol::Error::invalid_params()
+                                .data(format!("unknown session mode: {mode_id}")),
+                        );
+                    }
+                    *entry.mode.lock().expect("mode mutex poisoned") = mode_id.to_string();
+                } else {
+                    entry
+                        .selection
+                        .lock()
+                        .expect("selection mutex poisoned")
+                        .apply_update(&req.config_id.0, json_value);
+                }
+
+                let selection = entry
+                    .selection
+                    .lock()
+                    .expect("selection mutex poisoned")
+                    .clone();
+                let mode = entry.mode.lock().expect("mode mutex poisoned").clone();
+                let config_options = session_config_options(&selection, &mode);
 
                 info!(session_id, config_id = %req.config_id.0, "session/set_config_option");
                 responder.respond(SetSessionConfigOptionResponse::new(config_options))
@@ -868,7 +978,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                             .data(format!("session {session_id} has no working directory")),
                     );
                 };
-                let client = match LocalClientAccess::with_elicitation_and_cwd(
+                let client = match LocalClientAccess::with_elicitation_and_cwd_v2(
                     cx.clone(),
                     req.session_id.clone(),
                     &working_directory,
@@ -890,18 +1000,35 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let tools = entry.tools.clone();
                 let inbox = entry.inbox.clone();
                 let acp_session_id = req.session_id.clone();
+                let user_update = SessionUpdate::UserMessage(
+                    UserMessage::new(format!("user-{}", uuid_like())).content(req.prompt.clone()),
+                );
                 let turn_entry = entry.clone();
                 let store = inject_store.clone();
                 let orchestrate = {
                     let mode = entry.mode.lock().expect("mode mutex poisoned");
-                    mode.0.as_ref() == ORCHESTRATE_MODE_ID
+                    mode.as_str() == ORCHESTRATE_MODE_ID
                 };
 
                 cx.spawn({
                     let cx = cx.clone();
                     async move {
+                        if let Err(err) = cx.send_notification(UpdateSessionNotification::new(
+                            acp_session_id.clone(),
+                            user_update,
+                        )) {
+                            warn!(session_id, %err, "failed to acknowledge steering message");
+                        }
+                        if let Err(err) = cx.send_notification(UpdateSessionNotification::new(
+                            acp_session_id.clone(),
+                            SessionUpdate::StateUpdate(StateUpdate::Running(
+                                RunningStateUpdate::new(),
+                            )),
+                        )) {
+                            warn!(session_id, %err, "failed to publish running state");
+                        }
                         let next_turn = factory(&selection);
-                        let acp_sink = AcpUpdateSink::new(cx, acp_session_id)
+                        let acp_sink = AcpUpdateSink::new(cx.clone(), acp_session_id.clone())
                             .with_yolo(selection.permission.is_yolo());
                         let mut sink = GenerationScopedSink::new(acp_sink, lease.clone());
 
@@ -971,10 +1098,25 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                             (result, record, final_state, CHAT_MODE_ID)
                         };
 
+                        let acp_stop = match &result {
+                            Ok(stop) => map_stop_reason(*stop),
+                            Err(_) => AcpStopReason::EndTurn,
+                        };
+
                         lease
                             .finalize_if_current(|| async {
                                 publish_session_state(&observer, &final_state, Some(final_mode));
                                 persist_record(&store, &session_id, &record).await;
+                                if let Err(err) = cx.send_notification(
+                                    UpdateSessionNotification::new(
+                                        acp_session_id,
+                                        SessionUpdate::StateUpdate(StateUpdate::Idle(
+                                            IdleStateUpdate::new().stop_reason(acp_stop),
+                                        )),
+                                    ),
+                                ) {
+                                    warn!(session_id, %err, "failed to publish idle state");
+                                }
                             })
                             .await;
 
@@ -995,7 +1137,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
         )
         // session/cancel: abort the in-flight turn for a session.
         .on_receive_notification(
-            async move |notif: CancelNotification, _cx| {
+            async move |notif: CancelSessionNotification, _cx| {
                 let session_id = notif.session_id.0.to_string();
                 if let Some(entry) = cancel_sessions
                     .lock()
@@ -1011,39 +1153,6 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
                 Ok(())
             },
             on_receive_notification!(),
-        )
-        // session/set_mode: switch the session's current mode.
-        .on_receive_request(
-            async move |req: SetSessionModeRequest, responder, _cx| {
-                let session_id = req.session_id.0.to_string();
-                let mode_id = req.mode_id.0.to_string();
-
-                let Some(entry) = set_mode_sessions
-                    .lock()
-                    .expect("sessions mutex poisoned")
-                    .get(&session_id)
-                    .cloned()
-                else {
-                    warn!(session_id, "session/set_mode for unknown session");
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params()
-                            .data(format!("unknown session: {session_id}")),
-                    );
-                };
-
-                if !is_known_mode(&mode_id) {
-                    warn!(session_id, mode = %mode_id, "session/set_mode: unknown mode");
-                    return responder.respond_with_error(
-                        agent_client_protocol::Error::invalid_params()
-                            .data(format!("unknown session mode: {mode_id}")),
-                    );
-                }
-
-                *entry.mode.lock().expect("mode mutex poisoned") = req.mode_id.clone();
-                info!(session_id, mode = %mode_id, "session/set_mode");
-                responder.respond(SetSessionModeResponse::new())
-            },
-            on_receive_request!(),
         )
 }
 
@@ -1064,10 +1173,10 @@ fn inspector_welcome_text(base_url: &str, session_id: &str) -> String {
 /// Build the `AvailableCommandsUpdate` notification advertising this agent's
 /// built-in slash commands (currently just `/usage`).
 ///
-/// Shared by `session/new` and `session/load` so a reloaded session exposes the
+/// Shared by `session/new` and `session/resume` so a resumed session exposes the
 /// same commands as a freshly created one.
-fn available_commands_notification(session_id: &str) -> SessionNotification {
-    SessionNotification::new(
+fn available_commands_notification(session_id: &str) -> UpdateSessionNotification {
+    UpdateSessionNotification::new(
         SessionId::new(session_id.to_string()),
         SessionUpdate::AvailableCommandsUpdate(AvailableCommandsUpdate::new(vec![
             AvailableCommand::new(
@@ -1090,25 +1199,29 @@ fn blocks_text(blocks: &[agent_core::ContentBlock]) -> String {
 }
 
 /// Map a persisted [`HistoryEntry`] to the ACP [`SessionUpdate`] used to replay
-/// it to a client during `session/load`.
+/// it to a client during `session/resume` replay.
 ///
 /// Returns `None` for entries that have no faithful `session/update` analog
 /// (e.g. previously-ingested provider fragments), which are skipped during
 /// replay on a best-effort basis.
-fn history_entry_to_update(entry: &HistoryEntry) -> Option<SessionUpdate> {
+fn history_entry_to_update(entry: &HistoryEntry, index: usize) -> Option<SessionUpdate> {
+    let message_id = format!("history-{index}");
     match entry {
-        HistoryEntry::User(message) => Some(SessionUpdate::UserMessageChunk(ContentChunk::new(
-            ContentBlock::Text(TextContent::new(blocks_text(&message.content))),
-        ))),
-        HistoryEntry::Assistant(message) => {
-            Some(SessionUpdate::AgentMessageChunk(ContentChunk::new(
-                ContentBlock::Text(TextContent::new(blocks_text(&message.content))),
-            )))
-        }
+        HistoryEntry::User(message) => Some(SessionUpdate::UserMessage(
+            UserMessage::new(message_id).content(vec![ContentBlock::Text(TextContent::new(
+                blocks_text(&message.content),
+            ))]),
+        )),
+        HistoryEntry::Assistant(message) => Some(SessionUpdate::AgentMessage(
+            AgentMessage::new(message_id).content(vec![ContentBlock::Text(TextContent::new(
+                blocks_text(&message.content),
+            ))]),
+        )),
         HistoryEntry::ToolCall(record) => {
-            let tool_call = ToolCall::new(record.id.0.clone(), record.tool.name().to_string())
-                .status(AcpToolCallStatus::Completed);
-            Some(SessionUpdate::ToolCall(tool_call))
+            let tool_call = ToolCallUpdate::new(record.id.0.clone())
+                .title(record.tool.name().to_string())
+                .status(AcpToolCallStatus::InProgress);
+            Some(SessionUpdate::ToolCallUpdate(tool_call))
         }
         HistoryEntry::ToolResult(record) => {
             let status = if record.success {
@@ -1116,25 +1229,20 @@ fn history_entry_to_update(entry: &HistoryEntry) -> Option<SessionUpdate> {
             } else {
                 AcpToolCallStatus::Failed
             };
-            let mut fields = ToolCallUpdateFields::new().status(status);
+            let mut update = ToolCallUpdate::new(record.id.0.clone()).status(status);
             let text = blocks_text(&record.content);
             if !text.is_empty() {
-                fields = fields.content(vec![ToolCallContent::Content(Content::new(
-                    ContentBlock::Text(TextContent::new(text)),
-                ))]);
+                update = update.content(vec![ContentBlock::Text(TextContent::new(text)).into()]);
             }
-            Some(SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(
-                record.id.0.clone(),
-                fields,
-            )))
+            Some(SessionUpdate::ToolCallUpdate(update))
         }
         HistoryEntry::Thinking(_) => {
             // Thinking blocks are preserved for faithful provider replay but have
-            // no user-visible `session/update` analog on load; skip them.
+            // no user-visible `session/update` analog on resume; skip them.
             None
         }
         HistoryEntry::Ingested(record) => {
-            debug!(source = %record.source, "session/load: skipping ingested history entry");
+            debug!(source = %record.source, "session/resume: skipping ingested history entry");
             None
         }
     }
@@ -1213,7 +1321,7 @@ async fn connect_session_mcp_servers(
                     .collect();
                 match StdioMcpConnection::connect(
                     stdio.name.clone(),
-                    &stdio.command,
+                    stdio.command.0.as_os_str(),
                     &stdio.args,
                     &env,
                 )
@@ -1244,10 +1352,10 @@ async fn connect_session_mcp_servers(
                     ),
                 }
             }
-            // The http/sse (and, behind the `unstable_mcp_over_acp` feature,
-            // acp) MCP transports are part of the ACP schema but do not yet
+            // The HTTP (and, behind the `unstable_mcp_over_acp` feature, ACP)
+            // MCP transports are part of the ACP schema but do not yet
             // have a concrete client implementation in this agent; the stdio
-            // transport above is the one genuinely usable transport in v1
+            // transport above is the one genuinely usable transport in v2
             // (see docs/design/mcp-and-subagents.md). `McpServer` is
             // `#[non_exhaustive]`, so the fallback arm also covers any future
             // transport variant.
@@ -1255,11 +1363,6 @@ async fn connect_session_mcp_servers(
                 session_id,
                 server = %http.name,
                 "session/new: mcp http transport is not yet supported; server skipped"
-            ),
-            McpServer::Sse(sse) => warn!(
-                session_id,
-                server = %sse.name,
-                "session/new: mcp sse transport is not yet supported; server skipped"
             ),
             other => warn!(
                 session_id,

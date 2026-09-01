@@ -123,6 +123,73 @@ impl ModelSelection {
         ]
     }
 
+    /// Convert the selection to ACP v2 session configuration options.
+    #[cfg(feature = "unstable_protocol_v2")]
+    pub(crate) fn config_options_v2(
+        &self,
+    ) -> Vec<agent_client_protocol::schema::v2::SessionConfigOption> {
+        use agent_client_protocol::schema::v2::{
+            SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+            SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions,
+            SessionConfigValueId,
+        };
+
+        vec![
+            SessionConfigOption::new(
+                SessionConfigId::new("model"),
+                "Model",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    SessionConfigValueId::new(self.model.clone()),
+                    SessionConfigSelectOptions::Ungrouped(
+                        MODELS
+                            .iter()
+                            .map(|model| {
+                                SessionConfigSelectOption::new(
+                                    SessionConfigValueId::new(model.id),
+                                    model.display_name,
+                                )
+                                .description(model.description.to_string())
+                            })
+                            .collect(),
+                    ),
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::new(
+                SessionConfigId::new("effort"),
+                "Effort",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    SessionConfigValueId::new(self.effort_to_string()),
+                    SessionConfigSelectOptions::Ungrouped(vec![
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("low"), "Low"),
+                        SessionConfigSelectOption::new(
+                            SessionConfigValueId::new("medium"),
+                            "Medium",
+                        ),
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("high"), "High"),
+                    ]),
+                )),
+            )
+            .category(SessionConfigOptionCategory::Model),
+            SessionConfigOption::new(
+                SessionConfigId::new("permissions"),
+                "Permissions",
+                SessionConfigKind::Select(SessionConfigSelect::new(
+                    SessionConfigValueId::new(self.permission.as_id()),
+                    SessionConfigSelectOptions::Ungrouped(vec![
+                        SessionConfigSelectOption::new(
+                            SessionConfigValueId::new("normal"),
+                            "Normal",
+                        )
+                        .description("Ask before destructive tool calls".to_string()),
+                        SessionConfigSelectOption::new(SessionConfigValueId::new("yolo"), "YOLO")
+                            .description("Auto-grant all tool calls without asking".to_string()),
+                    ]),
+                )),
+            ),
+        ]
+    }
+
     fn effort_to_string(&self) -> String {
         match self.effort {
             Effort::Low => "low".to_string(),
@@ -199,7 +266,9 @@ mod tests {
             if let SessionConfigSelectOptions::Ungrouped(opts) = &select.options {
                 assert_eq!(opts.len(), MODELS.len());
                 assert!(opts.iter().any(|o| o.value.0.as_ref() == "claude-sonnet-5"));
-                assert!(opts.iter().any(|o| o.value.0.as_ref() == "deepseek-v4-flash"));
+                assert!(opts
+                    .iter()
+                    .any(|o| o.value.0.as_ref() == "deepseek-v4-flash"));
             } else {
                 panic!("expected ungrouped options");
             }
