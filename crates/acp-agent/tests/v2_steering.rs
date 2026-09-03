@@ -1,3 +1,5 @@
+#![cfg(feature = "unstable_protocol_v2")]
+
 //! Integration tests for steering via the custom `_session/steering` method.
 //!
 //! The agent advertises `_meta.steering.supported = true` from `initialize` and
@@ -10,9 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use acp_agent::{build_agent, AgentConfig, AgentDeps, NextTurnFactory};
-use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionId,
-    SessionNotification, SessionUpdate,
+use agent_client_protocol::schema::v2::{
+    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionId, SessionUpdate,
+    UpdateSessionNotification,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, Client, JsonRpcRequest};
@@ -24,6 +26,8 @@ use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
+
+mod common;
 
 /// Client-side mirror of the agent's steering request, so tests can send the
 /// custom `_session/steering` method with the same wire shape.
@@ -110,11 +114,14 @@ async fn initialize_advertises_steering_capability() {
     let agent = build_agent(deps);
 
     let initialize_response = Client
-        .builder()
+        .v2()
         .name("test-client")
         .connect_with(agent, async move |cx| {
             let init = cx
-                .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                .send_request(InitializeRequest::new(
+                    ProtocolVersion::V2,
+                    agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+                ))
                 .block_task()
                 .await?;
             Ok(serde_json::to_value(init).expect("initialize response should serialize"))
@@ -126,7 +133,7 @@ async fn initialize_advertises_steering_capability() {
         initialize_response["_meta"]["steering"]["supported"],
         serde_json::json!(true),
     );
-    assert!(initialize_response["agentCapabilities"]["_meta"].is_null());
+    assert!(initialize_response["capabilities"]["session"].is_object());
 }
 
 #[tokio::test]
@@ -152,45 +159,45 @@ async fn steering_into_active_session_returns_injected() {
     );
     let first_chunk_seen = Arc::new(Notify::new());
     let notify_first = first_chunk_seen.clone();
+    let updates: common::Updates = Arc::new(Mutex::new(Vec::new()));
+    let collected = updates.clone();
+    let completion = updates.clone();
 
     let response = tokio::time::timeout(
         Duration::from_secs(5),
         Client
-            .builder()
+            .v2()
             .name("test-client")
             .on_receive_notification(
-                async move |notification: SessionNotification, _cx| {
+                async move |notification: UpdateSessionNotification, _cx| {
                     if matches!(
-                        notification.update,
+                        &notification.update,
                         SessionUpdate::AgentMessageChunk(chunk)
                             if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "started")
                     ) {
                         notify_first.notify_one();
                     }
+                    collected.lock().unwrap().push(notification.update);
                     Ok(())
                 },
                 on_receive_notification!(),
             )
             .connect_with(build_agent(deps), async move |cx| {
-                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V2, agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1")))
                     .block_task()
                     .await?;
                 let session = cx
                     .send_request(NewSessionRequest::new("/tmp"))
                     .block_task()
                     .await?;
-                let prompt = cx
-                    .send_request(PromptRequest::new(
-                        session.session_id.clone(),
-                        vec![ContentBlock::from("initial")],
-                    ))
-                    .block_task();
+                cx.send_request(PromptRequest::new(
+                    session.session_id.clone(),
+                    vec![ContentBlock::from("initial")],
+                ))
+                .block_task()
+                .await?;
 
-                tokio::pin!(prompt);
-                tokio::select! {
-                    _ = first_chunk_seen.notified() => {}
-                    result = &mut prompt => panic!("turn stopped before steering: {result:?}"),
-                }
+                first_chunk_seen.notified().await;
 
                 let response = cx
                     .send_request(TestSteeringRequest {
@@ -200,7 +207,7 @@ async fn steering_into_active_session_returns_injected() {
                     .block_task()
                     .await?;
                 release.notify_one();
-                prompt.await?;
+                common::wait_for_idle(&completion).await;
                 Ok(response)
             }),
     )
@@ -229,19 +236,22 @@ async fn steering_into_idle_session_starts_new_turn() {
     let completion = updates.clone();
 
     let response = Client
-        .builder()
+        .v2()
         .name("test-client")
         .on_receive_notification(
-            async move |notif: SessionNotification, _cx| {
+            async move |notif: UpdateSessionNotification, _cx| {
                 collected.lock().unwrap().push(notif.update);
                 Ok(())
             },
             on_receive_notification!(),
         )
         .connect_with(agent, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
@@ -254,36 +264,13 @@ async fn steering_into_idle_session_starts_new_turn() {
                 })
                 .block_task()
                 .await?;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if completion.lock().unwrap().iter().any(|update| {
-                        matches!(
-                            update,
-                            SessionUpdate::AgentMessageChunk(chunk)
-                                if matches!(&chunk.content, ContentBlock::Text(text) if text.text == "steered")
-                        )
-                    }) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("steering turn did not finish");
+            common::wait_for_idle(&completion).await;
             Ok(resp)
         })
         .await
         .expect("connection completed");
 
     assert_eq!(response, serde_json::json!({ "outcome": "startedNewTurn" }));
-
-    // Allow the spawned turn to stream its output.
-    for _ in 0..50 {
-        if !updates.lock().unwrap().is_empty() {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
 
     let chunks: Vec<String> = updates
         .lock()

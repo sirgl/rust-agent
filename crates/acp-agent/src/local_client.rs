@@ -19,6 +19,8 @@ use agent_client_protocol::schema::v1::{
     CreateElicitationRequest, ElicitationAction, ElicitationFormMode, ElicitationSchema,
     ElicitationSessionScope, SessionId,
 };
+#[cfg(feature = "unstable_protocol_v2")]
+use agent_client_protocol::schema::v2;
 use agent_client_protocol::{Client, ConnectionTo};
 use agent_core::{
     AgentError, ClientAccess, ElicitationOutcome, Result, TerminalChunk, TerminalOutcome,
@@ -33,6 +35,13 @@ use tracing::debug;
 /// Byte limit applied to captured terminal output before truncation.
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
+#[derive(Clone)]
+enum ElicitationConnection {
+    V1(ConnectionTo<Client>, SessionId),
+    #[cfg(feature = "unstable_protocol_v2")]
+    V2(ConnectionTo<Client>, v2::SessionId),
+}
+
 /// [`ClientAccess`] implementation that executes against the local filesystem
 /// and shell.
 ///
@@ -44,7 +53,7 @@ pub struct LocalClientAccess {
     /// Immutable working directory captured for this ACP session.
     cwd: PathBuf,
     /// Optional ACP connection used only to serve elicitation requests.
-    elicitation: Option<(ConnectionTo<Client>, SessionId)>,
+    elicitation: Option<ElicitationConnection>,
 }
 
 impl Default for LocalClientAccess {
@@ -79,7 +88,7 @@ impl LocalClientAccess {
         let cwd = std::env::current_dir().expect("process working directory must be available");
         Self {
             cwd,
-            elicitation: Some((cx, session_id)),
+            elicitation: Some(ElicitationConnection::V1(cx, session_id)),
         }
     }
 
@@ -91,7 +100,20 @@ impl LocalClientAccess {
     ) -> Result<Self> {
         Ok(Self {
             cwd: validate_cwd(cwd.into())?,
-            elicitation: Some((cx, session_id)),
+            elicitation: Some(ElicitationConnection::V1(cx, session_id)),
+        })
+    }
+
+    /// Create a v2 elicitation-capable client bound to a validated session cwd.
+    #[cfg(feature = "unstable_protocol_v2")]
+    pub(crate) fn with_elicitation_and_cwd_v2(
+        cx: ConnectionTo<Client>,
+        session_id: v2::SessionId,
+        cwd: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        Ok(Self {
+            cwd: validate_cwd(cwd.into())?,
+            elicitation: Some(ElicitationConnection::V2(cx, session_id)),
         })
     }
 
@@ -283,38 +305,88 @@ impl ClientAccess for LocalClientAccess {
         message: &str,
         requested_schema: serde_json::Value,
     ) -> Result<ElicitationOutcome> {
-        let Some((cx, session_id)) = &self.elicitation else {
+        let Some(elicitation) = &self.elicitation else {
             return Err(AgentError::Other(
                 "elicitation is not supported without a client connection".to_string(),
             ));
         };
         debug!(message, "elicitation/create");
-        let schema: ElicitationSchema = serde_json::from_value(requested_schema)
-            .map_err(|err| AgentError::Other(format!("invalid elicitation schema: {err}")))?;
-        let scope = ElicitationSessionScope::new(session_id.clone());
-        let mode = ElicitationFormMode::new(scope, schema);
-        let request = CreateElicitationRequest::new(mode, message);
-
-        let response = cx
-            .send_request(request)
-            .block_task()
-            .await
-            .map_err(|err| AgentError::Other(format!("elicitation/create failed: {err}")))?;
-
-        match response.action {
-            ElicitationAction::Accept(accept) => {
-                let content = accept.content.unwrap_or_default();
-                let value = serde_json::to_value(content).map_err(|err| {
-                    AgentError::Other(format!("invalid elicitation content: {err}"))
-                })?;
-                Ok(ElicitationOutcome::Accepted(value))
+        match elicitation {
+            ElicitationConnection::V1(cx, session_id) => {
+                request_elicitation_v1(cx, session_id, message, requested_schema).await
             }
-            ElicitationAction::Decline => Ok(ElicitationOutcome::Declined),
-            ElicitationAction::Cancel => Ok(ElicitationOutcome::Cancelled),
-            other => Err(AgentError::Other(format!(
-                "unsupported elicitation action: {other:?}"
-            ))),
+            #[cfg(feature = "unstable_protocol_v2")]
+            ElicitationConnection::V2(cx, session_id) => {
+                request_elicitation_v2(cx, session_id, message, requested_schema).await
+            }
         }
+    }
+}
+
+async fn request_elicitation_v1(
+    cx: &ConnectionTo<Client>,
+    session_id: &SessionId,
+    message: &str,
+    requested_schema: serde_json::Value,
+) -> Result<ElicitationOutcome> {
+    let schema: ElicitationSchema = serde_json::from_value(requested_schema)
+        .map_err(|err| AgentError::Other(format!("invalid elicitation schema: {err}")))?;
+    let scope = ElicitationSessionScope::new(session_id.clone());
+    let mode = ElicitationFormMode::new(scope, schema);
+    let request = CreateElicitationRequest::new(mode, message);
+
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|err| AgentError::Other(format!("elicitation/create failed: {err}")))?;
+
+    match response.action {
+        ElicitationAction::Accept(accept) => {
+            let content = accept.content.unwrap_or_default();
+            let value = serde_json::to_value(content)
+                .map_err(|err| AgentError::Other(format!("invalid elicitation content: {err}")))?;
+            Ok(ElicitationOutcome::Accepted(value))
+        }
+        ElicitationAction::Decline => Ok(ElicitationOutcome::Declined),
+        ElicitationAction::Cancel => Ok(ElicitationOutcome::Cancelled),
+        other => Err(AgentError::Other(format!(
+            "unsupported elicitation action: {other:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "unstable_protocol_v2")]
+async fn request_elicitation_v2(
+    cx: &ConnectionTo<Client>,
+    session_id: &v2::SessionId,
+    message: &str,
+    requested_schema: serde_json::Value,
+) -> Result<ElicitationOutcome> {
+    let schema: v2::ElicitationSchema = serde_json::from_value(requested_schema)
+        .map_err(|err| AgentError::Other(format!("invalid elicitation schema: {err}")))?;
+    let scope = v2::ElicitationSessionScope::new(session_id.clone());
+    let mode = v2::ElicitationFormMode::new(scope, schema);
+    let request = v2::CreateElicitationRequest::new(mode, message);
+
+    let response = cx
+        .send_request(request)
+        .block_task()
+        .await
+        .map_err(|err| AgentError::Other(format!("elicitation/create failed: {err}")))?;
+
+    match response.action {
+        v2::ElicitationAction::Accept(accept) => {
+            let content = accept.content.unwrap_or_default();
+            let value = serde_json::to_value(content)
+                .map_err(|err| AgentError::Other(format!("invalid elicitation content: {err}")))?;
+            Ok(ElicitationOutcome::Accepted(value))
+        }
+        v2::ElicitationAction::Decline => Ok(ElicitationOutcome::Declined),
+        v2::ElicitationAction::Cancel => Ok(ElicitationOutcome::Cancelled),
+        other => Err(AgentError::Other(format!(
+            "unsupported elicitation action: {other:?}"
+        ))),
     }
 }
 

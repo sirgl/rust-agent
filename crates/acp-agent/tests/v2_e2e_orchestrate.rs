@@ -1,3 +1,5 @@
+#![cfg(feature = "unstable_protocol_v2")]
+
 //! End-to-end test (Step 15): a prompt in `orchestrate` mode runs the
 //! orchestration pipeline, accumulating each sub-agent result as one assistant
 //! message and returning a stop reason. Driven through an in-process fake client with
@@ -11,9 +13,10 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock as AcpContentBlock, InitializeRequest, NewSessionRequest,
-    PromptRequest, SessionNotification, SessionUpdate, SetSessionModeRequest, StopReason,
+use agent_client_protocol::schema::v2::{
+    CancelSessionNotification, ContentBlock as AcpContentBlock, InitializeRequest,
+    NewSessionRequest, PromptRequest, SessionConfigId, SessionConfigValueId, SessionUpdate,
+    SetSessionConfigOptionRequest, StopReason, UpdateSessionNotification,
 };
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, Client, JsonRpcRequest};
@@ -28,11 +31,13 @@ use serde::{Deserialize, Serialize};
 
 use acp_agent::{build_agent, default_store, AgentConfig, AgentDeps, NextTurnFactory};
 
+mod common;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonRpcRequest)]
 #[request(method = "_session/steering", response = serde_json::Value)]
 struct TestSteeringRequest {
     #[serde(rename = "sessionId")]
-    session_id: agent_client_protocol::schema::v1::SessionId,
+    session_id: agent_client_protocol::schema::v2::SessionId,
     #[serde(default)]
     prompt: Vec<AcpContentBlock>,
 }
@@ -120,33 +125,36 @@ async fn orchestrate_mode_prompt_emits_one_subagent_result_message() {
 
     let updates: Arc<Mutex<Vec<SessionUpdate>>> = Arc::new(Mutex::new(Vec::new()));
     let collected = updates.clone();
+    let completion = updates.clone();
 
     let stop = Client
-        .builder()
+        .v2()
         .name("test-client")
         .on_receive_notification(
-            async move |notif: SessionNotification, _cx| {
+            async move |notif: UpdateSessionNotification, _cx| {
                 collected.lock().unwrap().push(notif.update);
                 Ok(())
             },
             on_receive_notification!(),
         )
         .connect_with(agent, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
             let new_session = cx
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
                 .await?;
-            let response = cx
-                .send_request(PromptRequest::new(
-                    new_session.session_id,
-                    vec![AcpContentBlock::from("Build a thing")],
-                ))
-                .block_task()
-                .await?;
-            Ok(response.stop_reason)
+            cx.send_request(PromptRequest::new(
+                new_session.session_id,
+                vec![AcpContentBlock::from("Build a thing")],
+            ))
+            .block_task()
+            .await?;
+            Ok(common::wait_for_idle(&completion).await)
         })
         .await
         .expect("connection completed");
@@ -175,10 +183,9 @@ async fn orchestrate_mode_prompt_emits_one_subagent_result_message() {
         })
         .collect::<Vec<_>>();
     assert_eq!(messages, vec!["did the work"]);
-    assert!(!updates.iter().any(|update| matches!(
-        update,
-        SessionUpdate::ToolCall(_) | SessionUpdate::ToolCallUpdate(_)
-    )));
+    assert!(!updates
+        .iter()
+        .any(|update| matches!(update, SessionUpdate::ToolCallUpdate(_))));
 }
 
 #[tokio::test]
@@ -189,19 +196,22 @@ async fn idle_steering_in_orchestrate_mode_runs_the_orchestration_pipeline() {
     let completion = updates.clone();
 
     let response = Client
-        .builder()
+        .v2()
         .name("test-client")
         .on_receive_notification(
-            async move |notif: SessionNotification, _cx| {
+            async move |notif: UpdateSessionNotification, _cx| {
                 collected.lock().unwrap().push(notif.update);
                 Ok(())
             },
             on_receive_notification!(),
         )
         .connect_with(agent, async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
             let session = cx
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
@@ -213,22 +223,7 @@ async fn idle_steering_in_orchestrate_mode_runs_the_orchestration_pipeline() {
                 })
                 .block_task()
                 .await?;
-            tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                loop {
-                    if completion.lock().unwrap().iter().any(|update| {
-                        matches!(
-                            update,
-                            SessionUpdate::AgentMessageChunk(chunk)
-                                if matches!(&chunk.content, AcpContentBlock::Text(text) if text.text == "did the work")
-                        )
-                    }) {
-                        break;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-            })
-            .await
-            .expect("steering turn did not finish");
+            common::wait_for_idle(&completion).await;
             Ok(response)
         })
         .await
@@ -314,34 +309,49 @@ async fn orchestrate_mode_inherits_cancelled_chat_prompt() {
         turn_observer: None,
         inspector_base_url: None,
     };
+    let updates: common::Updates = Arc::new(Mutex::new(Vec::new()));
+    let collected = updates.clone();
+    let completion = updates.clone();
 
     Client
-        .builder()
+        .v2()
         .name("test-client")
+        .on_receive_notification(
+            async move |notification: UpdateSessionNotification, _cx| {
+                collected.lock().unwrap().push(notification.update);
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
         .connect_with(build_agent(deps), async move |cx| {
-            cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
             let session = cx
                 .send_request(NewSessionRequest::new("/tmp"))
                 .block_task()
                 .await?;
-            let first_prompt = cx
-                .send_request(PromptRequest::new(
-                    session.session_id.clone(),
-                    vec![AcpContentBlock::from("Build a Kotlin RTS")],
-                ))
-                .block_task();
-            let cancel = async {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                cx.send_notification(CancelNotification::new(session.session_id.clone()))
-            };
-            let (first_response, cancel_result) = tokio::join!(first_prompt, cancel);
-            assert_eq!(first_response?.stop_reason, StopReason::Cancelled);
-            cancel_result?;
-            cx.send_request(SetSessionModeRequest::new(
+            cx.send_request(PromptRequest::new(
                 session.session_id.clone(),
-                "orchestrate",
+                vec![AcpContentBlock::from("Build a Kotlin RTS")],
+            ))
+            .block_task()
+            .await?;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            cx.send_notification(CancelSessionNotification::new(session.session_id.clone()))?;
+            assert_eq!(
+                common::wait_for_idle(&completion).await,
+                StopReason::Cancelled
+            );
+            completion.lock().unwrap().clear();
+
+            cx.send_request(SetSessionConfigOptionRequest::new(
+                session.session_id.clone(),
+                SessionConfigId::new("mode"),
+                SessionConfigValueId::new("orchestrate"),
             ))
             .block_task()
             .await?;
@@ -351,9 +361,13 @@ async fn orchestrate_mode_inherits_cancelled_chat_prompt() {
             ))
             .block_task()
             .await?;
-            cx.send_request(SetSessionModeRequest::new(
+            common::wait_for_idle(&completion).await;
+            completion.lock().unwrap().clear();
+
+            cx.send_request(SetSessionConfigOptionRequest::new(
                 session.session_id.clone(),
-                "chat",
+                SessionConfigId::new("mode"),
+                SessionConfigValueId::new("chat"),
             ))
             .block_task()
             .await?;
@@ -363,6 +377,7 @@ async fn orchestrate_mode_inherits_cancelled_chat_prompt() {
             ))
             .block_task()
             .await?;
+            common::wait_for_idle(&completion).await;
             Ok(())
         })
         .await

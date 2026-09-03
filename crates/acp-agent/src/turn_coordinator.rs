@@ -147,12 +147,28 @@ impl TurnCoordinator {
     pub fn cancel_active(&self) -> Option<u64> {
         let mut state = self.state.lock().expect("turn coordinator mutex poisoned");
         state.active.as_mut().map(|active| {
-            active.retired = true;
             active.cancel.cancel();
             info!(
                 session_id = self.session_id,
                 generation = active.generation,
                 "cancelled active turn"
+            );
+            active.generation
+        })
+    }
+
+    /// Cancel and retire the current generation so it can no longer emit output.
+    ///
+    /// ACP v2 `session/close` uses this when the live session is removed.
+    pub fn retire_active(&self) -> Option<u64> {
+        let mut state = self.state.lock().expect("turn coordinator mutex poisoned");
+        state.active.as_mut().map(|active| {
+            active.retired = true;
+            active.cancel.cancel();
+            info!(
+                session_id = self.session_id,
+                generation = active.generation,
+                "retired active turn"
             );
             active.generation
         })
@@ -166,7 +182,7 @@ impl TurnCoordinator {
             .expect("turn coordinator mutex poisoned")
             .active
             .as_ref()
-            .is_some_and(|active| !active.retired)
+            .is_some_and(|active| !active.retired && !active.cancel.is_cancelled())
     }
 
     /// Run a synchronous action while atomically confirming a current turn.
@@ -175,7 +191,11 @@ impl TurnCoordinator {
     /// check and insertion into its inbox.
     pub fn with_current_turn(&self, action: impl FnOnce()) -> bool {
         let state = self.state.lock().expect("turn coordinator mutex poisoned");
-        if state.active.as_ref().is_some_and(|active| !active.retired) {
+        if state
+            .active
+            .as_ref()
+            .is_some_and(|active| !active.retired && !active.cancel.is_cancelled())
+        {
             action();
             true
         } else {
@@ -244,6 +264,15 @@ impl TurnLease {
     #[must_use]
     pub fn is_current(&self) -> bool {
         self.coordinator.is_current(self.generation)
+    }
+
+    /// Whether this lease still owns ordinary streamed output.
+    ///
+    /// A cancelled ACP v2 turn remains current long enough to emit its final
+    /// idle state, but message, plan, tool, and permission output is stopped.
+    #[must_use]
+    pub fn accepts_output(&self) -> bool {
+        self.is_current() && !self.cancel.is_cancelled()
     }
 
     /// Signal task completion and clear the active turn only if still current.
@@ -336,7 +365,9 @@ mod tests {
         let lease = coordinator.begin_turn().await;
         assert_eq!(coordinator.cancel_active(), Some(lease.generation()));
         assert!(lease.cancellation_token().is_cancelled());
-        assert!(!lease.is_current());
+        assert!(lease.is_current());
+        assert!(!lease.accepts_output());
+        assert!(!coordinator.has_current_turn());
     }
 
     #[tokio::test]

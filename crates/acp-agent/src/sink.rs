@@ -85,7 +85,7 @@ impl<S> GenerationScopedSink<S> {
 #[async_trait]
 impl<S: UpdateSink> UpdateSink for GenerationScopedSink<S> {
     async fn send(&mut self, output: EngineOutput) -> Result<()> {
-        if !self.lease.is_current() {
+        if !self.lease.accepts_output() {
             debug!(
                 session_id = self.lease.session_id(),
                 generation = self.lease.generation(),
@@ -98,7 +98,7 @@ impl<S: UpdateSink> UpdateSink for GenerationScopedSink<S> {
     }
 
     async fn request_permission(&mut self, id: &ToolCallId, tool_name: &str) -> Result<bool> {
-        if !self.lease.is_current() {
+        if !self.lease.accepts_output() {
             debug!(
                 session_id = self.lease.session_id(),
                 generation = self.lease.generation(),
