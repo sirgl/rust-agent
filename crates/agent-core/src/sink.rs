@@ -59,6 +59,17 @@ pub struct ToolCallLocation {
     pub line: Option<u32>,
 }
 
+/// Text snapshots for one file changed by a tool call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileDiff {
+    /// The absolute path of the changed file.
+    pub path: String,
+    /// The file content before the change. `None` means that the tool created the file.
+    pub old_text: Option<String>,
+    /// The file content after the change.
+    pub new_text: String,
+}
+
 impl ToolCallLocation {
     /// Create a location for `path` with no line number.
     pub fn new(path: impl Into<String>) -> Self {
@@ -115,6 +126,8 @@ pub enum EngineOutput {
         output: Option<String>,
         /// Optional raw output returned by the tool (set on completion).
         raw_output: Option<serde_json::Value>,
+        /// File changes produced by this tool update.
+        file_diffs: Vec<FileDiff>,
     },
 }
 

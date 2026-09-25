@@ -14,13 +14,13 @@ use agent_client_protocol::schema::v2::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, Client};
 use agent_core::{
-    InMemorySessionStore, NextTurnService, SessionState, SessionStore,
+    InMemorySessionStore, JsonFileSessionStore, NextTurnService, SessionState, SessionStore,
     StopReason as CoreStopReason, ToolRegistry, TurnEvent,
 };
 
 mod common;
 
-fn deps(store: Arc<InMemorySessionStore>) -> AgentDeps {
+fn deps(store: Arc<dyn SessionStore>) -> AgentDeps {
     let factory: NextTurnFactory = Arc::new(move |_selection| {
         Arc::new(turn_replay::ReplayTurnService::new(vec![vec![
             TurnEvent::TextDelta("answer".to_string()),
@@ -40,6 +40,50 @@ fn deps(store: Arc<InMemorySessionStore>) -> AgentDeps {
         turn_observer: None,
         inspector_base_url: None,
     }
+}
+
+#[tokio::test]
+async fn resume_survives_agent_restart_with_disk_store() {
+    let root = std::env::temp_dir().join(format!("acp-v2-restart-{}", uuid::Uuid::new_v4()));
+    let workspace = root.join("workspace");
+    let store_dir = root.join("sessions");
+    std::fs::create_dir_all(&workspace).unwrap();
+
+    let first_workspace = workspace.clone();
+    let session_id = Client
+        .v2()
+        .name("first-process")
+        .connect_with(
+            build_agent(deps(Arc::new(JsonFileSessionStore::new(&store_dir)))),
+            async move |cx| {
+                cx.send_request(initialize()).block_task().await?;
+                Ok(cx
+                    .send_request(NewSessionRequest::new(first_workspace))
+                    .block_task()
+                    .await?
+                    .session_id)
+            },
+        )
+        .await
+        .expect("first agent process completed");
+
+    Client
+        .v2()
+        .name("second-process")
+        .connect_with(
+            build_agent(deps(Arc::new(JsonFileSessionStore::new(&store_dir)))),
+            async move |cx| {
+                cx.send_request(initialize()).block_task().await?;
+                cx.send_request(ResumeSessionRequest::new(session_id, workspace))
+                    .block_task()
+                    .await?;
+                Ok(())
+            },
+        )
+        .await
+        .expect("second agent process resumed the session");
+
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 fn initialize() -> InitializeRequest {

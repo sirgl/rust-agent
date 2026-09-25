@@ -210,6 +210,7 @@ mod tests {
                 status: ToolCallStatus::Completed,
                 output: Some("ok".to_string()),
                 raw_output: None,
+                file_diffs: Vec::new(),
             },
         ]);
         // The mid-line message must be closed before the status line.

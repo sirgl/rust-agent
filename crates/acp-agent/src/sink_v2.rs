@@ -14,18 +14,19 @@
 use std::collections::HashSet;
 
 use agent_client_protocol::schema::v2::{
-    ContentBlock, ContentChunk, MessageId, PermissionOption, PermissionOptionKind, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, PlanUpdate as AcpPlanUpdate, PlanUpdateContent,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionSubject,
-    RequiresActionStateUpdate, RunningStateUpdate, SessionId, SessionUpdate, StateUpdate, Terminal,
-    TerminalExitStatus, TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContentChunk,
+    ContentBlock, ContentChunk, Diff as AcpDiff, DiffChange, DiffFileType, MessageId,
+    PermissionOption, PermissionOptionKind, PlanEntry, PlanEntryPriority, PlanEntryStatus,
+    PlanUpdate as AcpPlanUpdate, PlanUpdateContent, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionSubject, RequiresActionStateUpdate,
+    RunningStateUpdate, SessionId, SessionUpdate, StateUpdate, Terminal, TerminalExitStatus,
+    TerminalOutputChunk, TerminalUpdate, TextContent, ToolCallContentChunk,
     ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus, ToolCallUpdate,
     ToolKind as AcpToolKind, UpdateSessionNotification,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use agent_core::{
-    AgentError, EngineOutput, PlanStepStatus, PlanUpdate, Result, ToolCallId, ToolCallLocation,
-    ToolCallStatus, ToolKind, UpdateSink,
+    AgentError, EngineOutput, FileDiff, PlanStepStatus, PlanUpdate, Result, ToolCallId,
+    ToolCallLocation, ToolCallStatus, ToolKind, UpdateSink,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -35,6 +36,16 @@ use tracing::debug;
 const ALLOW_OPTION_ID: &str = "allow-once";
 /// Permission option id used to signal the user denied the tool call.
 const REJECT_OPTION_ID: &str = "reject-once";
+
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, agent_client_protocol::JsonRpcNotification,
+)]
+#[notification(method = "session/update")]
+#[serde(rename_all = "camelCase")]
+struct SpecUpdateSessionNotification {
+    session_id: SessionId,
+    update: serde_json::Value,
+}
 
 /// An [`UpdateSink`] that emits ACP notifications over a live connection.
 pub struct AcpUpdateSink {
@@ -77,6 +88,19 @@ impl AcpUpdateSink {
                 self.session_id.clone(),
                 update,
             ))
+            .map_err(|err| AgentError::Other(format!("failed to send session/update: {err}")))
+    }
+
+    fn notify_spec_update(&self, update: SessionUpdate) -> Result<()> {
+        let mut update = serde_json::to_value(update).map_err(|err| {
+            AgentError::Other(format!("failed to serialize session/update: {err}"))
+        })?;
+        normalize_diff_patch(&mut update);
+        self.cx
+            .send_notification(SpecUpdateSessionNotification {
+                session_id: self.session_id.clone(),
+                update,
+            })
             .map_err(|err| AgentError::Other(format!("failed to send session/update: {err}")))
     }
 }
@@ -138,6 +162,7 @@ impl UpdateSink for AcpUpdateSink {
                 status,
                 output,
                 raw_output,
+                file_diffs,
             } => {
                 let tool_call_id = id.0;
                 let is_terminal = self.terminals.contains(&tool_call_id);
@@ -148,7 +173,16 @@ impl UpdateSink for AcpUpdateSink {
                 if let Some(out) = raw_output {
                     update = update.raw_output(out);
                 }
-                self.notify(SessionUpdate::ToolCallUpdate(update))?;
+                let has_file_diffs = !file_diffs.is_empty();
+                if let Some(diff) = map_file_diffs(&file_diffs) {
+                    update = update.content(vec![diff.into()]);
+                }
+                let update = SessionUpdate::ToolCallUpdate(update);
+                if has_file_diffs {
+                    self.notify_spec_update(update)?;
+                } else {
+                    self.notify(update)?;
+                }
                 if let Some(text) = output.filter(|text| !text.is_empty()) {
                     if is_terminal {
                         let data =
@@ -213,6 +247,68 @@ impl UpdateSink for AcpUpdateSink {
         debug!(tool = tool_name, granted, "permission decision received");
         Ok(granted)
     }
+}
+
+fn normalize_diff_patch(update: &mut serde_json::Value) {
+    let Some(content) = update
+        .get_mut("content")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return;
+    };
+    for item in content {
+        if item.get("type").and_then(serde_json::Value::as_str) != Some("diff") {
+            continue;
+        }
+        let Some(patch) = item
+            .get_mut("patch")
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if !patch.contains_key("diff") {
+            if let Some(text) = patch.remove("text") {
+                patch.insert("diff".to_string(), text);
+            }
+        }
+    }
+}
+
+fn map_file_diffs(diffs: &[FileDiff]) -> Option<AcpDiff> {
+    if diffs.is_empty() {
+        return None;
+    }
+    let mut changes = Vec::with_capacity(diffs.len());
+    let mut patch = String::new();
+    for diff in diffs {
+        let change = if diff.old_text.is_some() {
+            DiffChange::modify(diff.path.clone())
+        } else {
+            DiffChange::add(diff.path.clone())
+        }
+        .file_type(DiffFileType::Text);
+        changes.push(change);
+        patch.push_str(&git_patch(diff));
+    }
+    Some(AcpDiff::patch(patch, changes))
+}
+
+fn git_patch(diff: &FileDiff) -> String {
+    let old_text = diff.old_text.as_deref().unwrap_or_default();
+    let unified = diffy::create_patch(old_text, &diff.new_text).to_string();
+    let hunks = unified.lines().skip(2).collect::<Vec<_>>().join("\n");
+    let old_path = diff
+        .old_text
+        .as_ref()
+        .map_or("/dev/null", |_| diff.path.as_str());
+    let mut patch = format!(
+        "diff --git {path} {path}\n--- {old_path}\n+++ {path}\n{hunks}",
+        path = diff.path,
+    );
+    if unified.ends_with('\n') {
+        patch.push('\n');
+    }
+    patch
 }
 
 /// Wrap a plain string as a text [`ContentBlock`].
@@ -283,5 +379,35 @@ fn map_plan_status(status: PlanStepStatus) -> PlanEntryStatus {
         PlanStepStatus::Pending => PlanEntryStatus::Pending,
         PlanStepStatus::InProgress => PlanEntryStatus::InProgress,
         PlanStepStatus::Completed => PlanEntryStatus::Completed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diff_patch_uses_the_v2_wire_field() {
+        let diff = FileDiff {
+            path: "src/main.rs".to_string(),
+            old_text: Some("old\n".to_string()),
+            new_text: "new\n".to_string(),
+        };
+        let content = map_file_diffs(&[diff]).expect("file diff");
+        let mut update = serde_json::to_value(SessionUpdate::ToolCallUpdate(
+            ToolCallUpdate::new("write-file")
+                .status(AcpToolCallStatus::Completed)
+                .content(vec![content.into()]),
+        ))
+        .unwrap();
+
+        normalize_diff_patch(&mut update);
+
+        assert_eq!(update["content"][0]["patch"]["format"], "git_patch");
+        assert!(update["content"][0]["patch"]["diff"]
+            .as_str()
+            .expect("patch diff")
+            .contains("-old"));
+        assert!(update["content"][0]["patch"].get("text").is_none());
     }
 }

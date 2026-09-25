@@ -287,7 +287,7 @@ pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
         // registry.
         .on_receive_request(
             async move |req: NewSessionRequest, responder, cx| {
-                let session_id = format!("session-{}", uuid_like());
+                let session_id = new_session_id();
 
                 if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
                     warn!(session_id, cwd = %req.cwd.0.display(), %err, "session/new invalid cwd");
@@ -649,7 +649,7 @@ pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
 
                 let acp_session_id = req.session_id.clone();
                 let user_update = SessionUpdate::UserMessage(
-                    UserMessage::new(format!("user-{}", uuid_like())).content(req.prompt.clone()),
+                    UserMessage::new(format!("user-{}", uuid::Uuid::new_v4())).content(req.prompt.clone()),
                 );
 
                 // ACP v2 acknowledges acceptance before foreground work runs.
@@ -804,10 +804,7 @@ pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
                             (result, record, final_state, CHAT_MODE_ID)
                         };
 
-                        let acp_stop = match &result {
-                            Ok(stop) => map_stop_reason(*stop),
-                            Err(_) => AcpStopReason::EndTurn,
-                        };
+                        let acp_stop = map_turn_result_stop_reason(&result);
 
                         lease
                             .finalize_if_current(|| async {
@@ -1001,7 +998,7 @@ pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
                 let inbox = entry.inbox.clone();
                 let acp_session_id = req.session_id.clone();
                 let user_update = SessionUpdate::UserMessage(
-                    UserMessage::new(format!("user-{}", uuid_like())).content(req.prompt.clone()),
+                    UserMessage::new(format!("user-{}", uuid::Uuid::new_v4())).content(req.prompt.clone()),
                 );
                 let turn_entry = entry.clone();
                 let store = inject_store.clone();
@@ -1098,10 +1095,7 @@ pub(crate) fn build_agent_v2(deps: AgentDeps) -> impl ConnectTo<Client> {
                             (result, record, final_state, CHAT_MODE_ID)
                         };
 
-                        let acp_stop = match &result {
-                            Ok(stop) => map_stop_reason(*stop),
-                            Err(_) => AcpStopReason::EndTurn,
-                        };
+                        let acp_stop = map_turn_result_stop_reason(&result);
 
                         lease
                             .finalize_if_current(|| async {
@@ -1286,14 +1280,16 @@ fn map_stop_reason(reason: StopReason) -> AcpStopReason {
     }
 }
 
-/// Generate a process-unique, monotonically increasing id suffix.
-///
-/// A full UUID dependency is unnecessary for session ids that only need to be
-/// unique within a single running process.
-fn uuid_like() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+fn map_turn_result_stop_reason(result: &agent_core::Result<StopReason>) -> AcpStopReason {
+    match result {
+        Ok(stop) => map_stop_reason(*stop),
+        Err(_) => AcpStopReason::Refusal,
+    }
+}
+
+/// Generate a session id that stays unique across agent processes.
+fn new_session_id() -> String {
+    format!("session-{}", uuid::Uuid::new_v4())
 }
 
 /// Connect every MCP server the client requested for this session (via

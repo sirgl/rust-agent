@@ -18,6 +18,70 @@ use async_trait::async_trait;
 use crate::error::{AgentError, Result};
 use crate::session::SessionRecord;
 
+fn deserialize_session_record(contents: &str) -> serde_json::Result<SessionRecord> {
+    match serde_json::from_str(contents) {
+        Ok(record) => Ok(record),
+        Err(original_error) => {
+            let mut value: serde_json::Value = match serde_json::from_str(contents) {
+                Ok(value) => value,
+                Err(_) => return Err(original_error),
+            };
+            if !repair_legacy_thinking_entries(&mut value) {
+                return Err(original_error);
+            }
+            serde_json::from_value(value)
+        }
+    }
+}
+
+fn repair_legacy_thinking_entries(value: &mut serde_json::Value) -> bool {
+    let Some(entries) = value
+        .pointer_mut("/history/entries")
+        .and_then(serde_json::Value::as_array_mut)
+    else {
+        return false;
+    };
+
+    let mut repaired = false;
+    for entry in entries {
+        let Some(object) = entry.as_object_mut() else {
+            continue;
+        };
+        if object.contains_key("thinking_kind") {
+            continue;
+        }
+
+        let kind = object
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        match kind.as_deref() {
+            Some("thinking")
+                if object.get("text").is_some() && object.get("signature").is_some() =>
+            {
+                object.insert(
+                    "thinking_kind".to_string(),
+                    serde_json::Value::String("thinking".to_string()),
+                );
+                repaired = true;
+            }
+            Some("redacted") if object.get("data").is_some() => {
+                object.insert(
+                    "kind".to_string(),
+                    serde_json::Value::String("thinking".to_string()),
+                );
+                object.insert(
+                    "thinking_kind".to_string(),
+                    serde_json::Value::String("redacted".to_string()),
+                );
+                repaired = true;
+            }
+            _ => {}
+        }
+    }
+    repaired
+}
+
 /// A pluggable backing store for persisted session core state.
 ///
 /// Implementations must be safe to share across async tasks (`Send + Sync`)
@@ -123,7 +187,7 @@ impl SessionStore for JsonFileSessionStore {
         let path = self.path_for(session_id);
         match std::fs::read_to_string(&path) {
             Ok(contents) => {
-                let record: SessionRecord = serde_json::from_str(&contents)?;
+                let record = deserialize_session_record(&contents)?;
                 Ok(Some(record))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -161,6 +225,7 @@ impl SessionStore for JsonFileSessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::history::{HistoryEntry, ThinkingRecord};
     use crate::session::{SessionState, SESSION_RECORD_VERSION};
 
     fn sample_record(id: &str) -> SessionRecord {
@@ -257,6 +322,62 @@ mod tests {
         let store = JsonFileSessionStore::new(&dir);
         let err = store.load("broken").await;
         assert!(err.is_err(), "corrupt JSON should surface an error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn json_file_load_repairs_legacy_duplicate_thinking_kinds() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-core-store-legacy-thinking-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy-thinking.json"),
+            r#"{
+  "version": 1,
+  "session_id": "legacy-thinking",
+  "workspace_roots": [],
+  "history": {
+    "entries": [
+      {
+        "kind": "thinking",
+        "kind": "thinking",
+        "text": "consider the options",
+        "signature": "signature"
+      },
+      {
+        "kind": "thinking",
+        "kind": "redacted",
+        "data": "opaque"
+      }
+    ]
+  },
+  "system_prompt": null,
+  "usage": {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_input_tokens": 0,
+    "cache_creation_input_tokens": 0
+  }
+}"#,
+        )
+        .unwrap();
+
+        let store = JsonFileSessionStore::new(&dir);
+        let record = store.load("legacy-thinking").await.unwrap().unwrap();
+
+        assert!(matches!(
+            &record.history.entries[0],
+            HistoryEntry::Thinking(ThinkingRecord::Thinking { text, signature })
+                if text == "consider the options" && signature == "signature"
+        ));
+        assert!(matches!(
+            &record.history.entries[1],
+            HistoryEntry::Thinking(ThinkingRecord::Redacted { data }) if data == "opaque"
+        ));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -9,9 +9,9 @@ use std::sync::Arc;
 
 use agent_core::{
     AgentError, CancellationToken, ClientAccess, ElicitationOutcome, EngineOutput, HistoryEntry,
-    NextTurnService, Result, SessionState, StopReason, TerminalOutcome, Tool, ToolCallId,
-    ToolCallStatus, ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry, TurnContext,
-    TurnEngine, TurnEvent, TurnInbox, UpdateSink, MAX_TOOL_RESULT_CHARS,
+    NextTurnService, Result, SessionState, StopReason, TerminalOutcome, ThinkingRecord, Tool,
+    ToolCallId, ToolCallStatus, ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry,
+    TurnContext, TurnEngine, TurnEvent, TurnInbox, UpdateSink, MAX_TOOL_RESULT_CHARS,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -352,6 +352,60 @@ async fn tool_call_round_trip_streams_updates_and_appends_typed_history() {
     assert!(matches!(
         &session.history.entries[2],
         HistoryEntry::Assistant(_)
+    ));
+}
+
+#[tokio::test]
+async fn parallel_tool_calls_stay_in_one_assistant_turn_before_their_results() {
+    let svc = ReplayTurnService::new(vec![
+        vec![
+            TurnEvent::ThinkingBlock(ThinkingRecord::Thinking {
+                text: "inspect first".into(),
+                signature: "sig-123".into(),
+            }),
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-1"),
+                name: "echo".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::ToolCallRequested {
+                id: ToolCallId::new("call-2"),
+                name: "echo".into(),
+                arguments: serde_json::json!({}),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        }],
+    ]);
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(EchoTool));
+    let mut session = SessionState::new("s1");
+
+    TurnEngine::new(Arc::new(svc), registry)
+        .run_prompt(
+            &mut session,
+            &mut FakeSink::default(),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        &session.history.entries[..],
+        [
+            HistoryEntry::Thinking(_),
+            HistoryEntry::ToolCall(first),
+            HistoryEntry::ToolCall(second),
+            HistoryEntry::ToolResult(first_result),
+            HistoryEntry::ToolResult(second_result),
+        ] if first.id.as_str() == "call-1"
+            && second.id.as_str() == "call-2"
+            && first_result.id.as_str() == "call-1"
+            && second_result.id.as_str() == "call-2"
     ));
 }
 

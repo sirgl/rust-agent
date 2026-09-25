@@ -21,8 +21,8 @@ use agent_client_protocol::schema::v2::{
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::{on_receive_notification, on_receive_request, Client};
 use agent_core::{
-    NextTurnService, Result as CoreResult, StopReason as CoreStopReason, Tool, ToolContext,
-    ToolEvent, ToolRegistry, TurnContext, TurnEvent,
+    AgentError, NextTurnService, Result as CoreResult, StopReason as CoreStopReason, Tool,
+    ToolContext, ToolEvent, ToolRegistry, TurnContext, TurnError, TurnEvent,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream};
@@ -148,6 +148,80 @@ async fn terminal_shell_command_runs_in_session_workspace_and_reaches_next_round
     assert!(updates
         .iter()
         .any(|update| matches!(update, SessionUpdate::TerminalOutputChunk(_))));
+}
+
+#[tokio::test]
+async fn fs_write_completes_and_changes_the_file() {
+    let root = std::env::temp_dir().join(format!("rust-acp-diff-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let file = root.join("sample.txt");
+    std::fs::write(&file, "before\nkeep\n").unwrap();
+    let file_path = file.to_string_lossy().into_owned();
+    let script = vec![
+        vec![
+            TurnEvent::ToolCallRequested {
+                id: agent_core::ToolCallId::new("write-file"),
+                name: "fs_write".to_string(),
+                arguments: json!({
+                    "path": file_path,
+                    "content": "after\nkeep\n",
+                }),
+            },
+            TurnEvent::TurnFinished {
+                stop_reason: CoreStopReason::ToolUse,
+            },
+        ],
+        vec![TurnEvent::TurnFinished {
+            stop_reason: CoreStopReason::EndTurn,
+        }],
+    ];
+    let deps = deps_with_script(script, tools_builtin::builtin_registry());
+    let updates: common::Updates = Arc::new(Mutex::new(Vec::new()));
+    let collected = updates.clone();
+    let completion = updates.clone();
+    let request_root = root.clone();
+
+    Client
+        .v2()
+        .name("diff-client")
+        .on_receive_notification(
+            async move |notif: UpdateSessionNotification, _cx| {
+                collected.lock().unwrap().push(notif.update);
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(build_agent(deps), async move |cx| {
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
+            let session = cx
+                .send_request(NewSessionRequest::new(request_root))
+                .block_task()
+                .await?;
+            cx.send_request(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("change the file")],
+            ))
+            .block_task()
+            .await?;
+            common::wait_for_idle(&completion).await;
+            Ok(())
+        })
+        .await
+        .expect("connection completed");
+
+    let snapshot = updates.lock().unwrap().clone();
+    assert!(snapshot.iter().any(|update| matches!(
+        update,
+        SessionUpdate::ToolCallUpdate(update)
+            if update.status.value() == Some(&ToolCallStatus::Completed)
+    )));
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "after\nkeep\n");
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Build [`AgentDeps`] whose decision layer replays the given scripted rounds.
@@ -320,6 +394,73 @@ async fn plain_streaming_turn_streams_chunks_and_end_turn() {
         })
         .collect();
     assert_eq!(chunks, vec!["Hello, ".to_string(), "world!".to_string()]);
+}
+
+struct FailingBackend;
+
+#[async_trait]
+impl NextTurnService for FailingBackend {
+    async fn get_next_turn_streaming(
+        &self,
+        _ctx: &TurnContext,
+    ) -> CoreResult<BoxStream<'static, TurnEvent>> {
+        Err(AgentError::Turn(TurnError::new(
+            "provider rejected request",
+        )))
+    }
+}
+
+#[tokio::test]
+async fn failed_turn_publishes_refusal_instead_of_success() {
+    let factory: NextTurnFactory = Arc::new(|_selection| Arc::new(FailingBackend));
+    let deps = AgentDeps {
+        next_turn_factory: factory,
+        tools: ToolRegistry::new(),
+        config: AgentConfig {
+            require_submit_result: false,
+            ..AgentConfig::default()
+        },
+        store: acp_agent::default_store(),
+        turn_observer: None,
+        inspector_base_url: None,
+    };
+    let updates: common::Updates = Arc::new(Mutex::new(Vec::new()));
+    let collected = updates.clone();
+    let completion = updates.clone();
+
+    let stop = Client
+        .v2()
+        .name("test-client")
+        .on_receive_notification(
+            async move |notif: UpdateSessionNotification, _cx| {
+                collected.lock().unwrap().push(notif.update);
+                Ok(())
+            },
+            on_receive_notification!(),
+        )
+        .connect_with(build_agent(deps), async move |cx| {
+            cx.send_request(InitializeRequest::new(
+                ProtocolVersion::V2,
+                agent_client_protocol::schema::v2::Implementation::new("test-client", "0.1"),
+            ))
+            .block_task()
+            .await?;
+            let session = cx
+                .send_request(NewSessionRequest::new("/tmp"))
+                .block_task()
+                .await?;
+            cx.send_request(PromptRequest::new(
+                session.session_id,
+                vec![ContentBlock::from("hi")],
+            ))
+            .block_task()
+            .await?;
+            Ok(common::wait_for_idle(&completion).await)
+        })
+        .await
+        .expect("connection completed");
+
+    assert_eq!(stop, StopReason::Refusal);
 }
 
 #[tokio::test]

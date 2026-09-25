@@ -293,7 +293,7 @@ mod tests {
 /// We therefore capture them verbatim here so the compiler can replay them
 /// faithfully — an application of the crate-wide "preserve & reuse" rule.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "thinking_kind", rename_all = "snake_case")]
 pub enum ThinkingRecord {
     /// A regular thinking block with its opaque cryptographic signature.
     Thinking {

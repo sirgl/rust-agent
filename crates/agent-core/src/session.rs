@@ -211,7 +211,9 @@ pub struct TurnContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{PlanStepStatus, SessionStateSnapshot, TodoItem, TodoItemId, TodoList};
+    use crate::{
+        PlanStepStatus, SessionStateSnapshot, ThinkingRecord, TodoItem, TodoItemId, TodoList,
+    };
 
     fn todo_list() -> TodoList {
         TodoList::new(vec![TodoItem {
@@ -284,6 +286,25 @@ mod tests {
             .todo_list
             .items
             .is_empty());
+    }
+
+    #[test]
+    fn thinking_history_roundtrips_without_duplicate_kind_fields() {
+        let mut state = SessionState::new("session-thinking");
+        state.push_thinking(ThinkingRecord::Thinking {
+            text: "consider the options".to_string(),
+            signature: "signature".to_string(),
+        });
+
+        let record = state.to_record();
+        let json = serde_json::to_string_pretty(&record).unwrap();
+
+        assert_eq!(json.matches("\"kind\"").count(), 1);
+        assert_eq!(json.matches("\"thinking_kind\"").count(), 1);
+        assert_eq!(
+            serde_json::from_str::<SessionRecord>(&json).unwrap(),
+            record
+        );
     }
 
     #[test]
