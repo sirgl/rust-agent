@@ -13,7 +13,7 @@ use crate::error::{AgentError, Result};
 use crate::event::ToolCallId;
 use crate::observe::SharedTurnObserver;
 use crate::session::ToolDescriptor;
-use crate::sink::{ToolCallLocation, ToolKind};
+use crate::sink::{FileDiff, ToolCallLocation, ToolKind};
 use crate::todo::TodoList;
 use crate::trace::TraceContext;
 
@@ -28,6 +28,8 @@ pub enum ToolEvent {
     Completed(serde_json::Value),
     /// The tool failed with a descriptive message.
     Failed(String),
+    /// A text file changed during the tool call.
+    FileChanged(FileDiff),
     /// A validated replacement for the session's canonical todo state.
     TodoListUpdated(TodoList),
 }

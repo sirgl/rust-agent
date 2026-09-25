@@ -22,7 +22,7 @@ use crate::cancel::CancellationToken;
 use crate::client::ClientAccess;
 use crate::error::{AgentError, Result};
 use crate::event::{StopReason, TokenUsage, ToolCallId, TurnEvent};
-use crate::history::KnownTool;
+use crate::history::{HistoryEntry, KnownTool};
 use crate::observe::{
     SharedTurnObserver, ToolCallSummary, TurnObservation, TurnResponseObservation,
 };
@@ -432,6 +432,7 @@ impl TurnEngine {
             debug!(round_id = %round_trace.round_id.as_deref().unwrap_or_default(), "starting decision round");
             let mut ctx = session.turn_context();
             ctx.trace = Some(round_trace.clone());
+            let round_history_start = session.history.len();
 
             // Notify the provider-neutral observer with the typed request
             // snapshot before dispatching to the (possibly provider-specific)
@@ -468,6 +469,7 @@ impl TurnEngine {
             let mut thinking_chars = 0usize;
             let mut round_tool_calls: Vec<ToolCallSummary> = Vec::new();
             let mut round_usage = TokenUsage::default();
+            let mut add_terminal_nudge = false;
 
             let mut stream = match self.next_turn.get_next_turn_streaming(&ctx).await {
                 Ok(stream) => stream,
@@ -511,6 +513,7 @@ impl TurnEngine {
                             round_start,
                         );
                         if stop_reason == StopReason::Cancelled {
+                            finish_round_history(session, round_history_start);
                             return Ok(StopReason::Cancelled);
                         } else {
                             flush_assistant_text(session, &mut assistant_text);
@@ -536,6 +539,7 @@ impl TurnEngine {
                         round_start,
                     );
                     flush_assistant_text(session, &mut assistant_text);
+                    finish_round_history(session, round_history_start);
                     return Ok(StopReason::EndTurn);
                 };
 
@@ -543,11 +547,17 @@ impl TurnEngine {
                     TurnEvent::TextDelta(delta) => {
                         round_text.push_str(&delta);
                         assistant_text.push_str(&delta);
-                        sink.send(EngineOutput::MessageChunk(delta)).await?;
+                        if let Err(err) = sink.send(EngineOutput::MessageChunk(delta)).await {
+                            finish_round_history(session, round_history_start);
+                            return Err(err);
+                        }
                     }
                     TurnEvent::Thinking(delta) => {
                         thinking_chars += delta.chars().count();
-                        sink.send(EngineOutput::ThinkingChunk(delta)).await?;
+                        if let Err(err) = sink.send(EngineOutput::ThinkingChunk(delta)).await {
+                            finish_round_history(session, round_history_start);
+                            return Err(err);
+                        }
                     }
                     TurnEvent::ThinkingBlock(record) => {
                         // The live text was already streamed via `Thinking`;
@@ -562,7 +572,10 @@ impl TurnEngine {
                         session.push_thinking(record);
                     }
                     TurnEvent::Plan(plan) => {
-                        sink.send(EngineOutput::Plan(plan)).await?;
+                        if let Err(err) = sink.send(EngineOutput::Plan(plan)).await {
+                            finish_round_history(session, round_history_start);
+                            return Err(err);
+                        }
                     }
                     TurnEvent::Usage(usage) => {
                         round_usage.add(usage);
@@ -607,22 +620,32 @@ impl TurnEngine {
                             tool_call_id = %id.0,
                             tool_name = %name,
                         );
-                        self.dispatch_tool(
-                            session,
-                            sink,
-                            &round_cancel,
-                            id,
-                            name,
-                            arguments,
-                            presentation,
-                            &round_trace,
-                        )
-                        .instrument(tool_span)
-                        .await?;
+                        let dispatch_result = self
+                            .dispatch_tool(
+                                session,
+                                sink,
+                                &round_cancel,
+                                id,
+                                name,
+                                arguments,
+                                presentation,
+                                &round_trace,
+                            )
+                            .instrument(tool_span)
+                            .await;
+                        if let Err(err) = dispatch_result {
+                            finish_round_history(session, round_history_start);
+                            return Err(err);
+                        }
                         if cancel.is_cancelled() {
+                            finish_round_history(session, round_history_start);
                             return Ok(StopReason::Cancelled);
                         }
                         if round_cancel.is_cancelled() {
+                            if !self.has_pending_inbox() {
+                                finish_round_history(session, round_history_start);
+                                return Ok(StopReason::Cancelled);
+                            }
                             debug!("steering message observed; interrupting tool sequence");
                             self.notify_response(
                                 &round_trace,
@@ -651,6 +674,7 @@ impl TurnEngine {
                                 None,
                                 round_start,
                             );
+                            finish_round_history(session, round_history_start);
                             return Ok(StopReason::EndTurn);
                         }
                     }
@@ -682,10 +706,13 @@ impl TurnEngine {
                             // hands control back via a terminal tool.
                             _ if self.require_terminal_tool => {
                                 debug!("turn finished without terminal tool; nudging to continue");
-                                session.push_user_text(TERMINAL_TOOL_NUDGE.to_string());
+                                add_terminal_nudge = true;
                                 break;
                             }
-                            other => return Ok(other),
+                            other => {
+                                finish_round_history(session, round_history_start);
+                                return Ok(other);
+                            }
                         }
                     }
                     TurnEvent::Error(err) => {
@@ -701,9 +728,15 @@ impl TurnEngine {
                             round_start,
                         );
                         flush_assistant_text(session, &mut assistant_text);
+                        finish_round_history(session, round_history_start);
                         return Err(AgentError::Turn(err));
                     }
                 }
+            }
+
+            finish_round_history(session, round_history_start);
+            if add_terminal_nudge {
+                session.push_user_text(TERMINAL_TOOL_NUDGE.to_string());
             }
 
             iteration += 1;
@@ -780,6 +813,7 @@ impl TurnEngine {
                 status: ToolCallStatus::Failed,
                 output: Some(msg.clone()),
                 raw_output: None,
+                file_diffs: Vec::new(),
             })
             .await?;
             session.push_tool_result(id.clone(), false, msg);
@@ -805,6 +839,7 @@ impl TurnEngine {
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
                     raw_output: None,
+                    file_diffs: Vec::new(),
                 })
                 .await?;
                 session.push_tool_result(id.clone(), false, msg);
@@ -826,6 +861,7 @@ impl TurnEngine {
                 status: ToolCallStatus::InProgress,
                 output: None,
                 raw_output: None,
+                file_diffs: Vec::new(),
             })
             .await?;
         }
@@ -854,6 +890,7 @@ impl TurnEngine {
                     status: ToolCallStatus::Failed,
                     output: Some(msg.clone()),
                     raw_output: None,
+                    file_diffs: Vec::new(),
                 })
                 .await?;
                 session.push_tool_result(id.clone(), false, msg);
@@ -874,6 +911,7 @@ impl TurnEngine {
         let mut success = true;
         let mut final_message: Option<String> = None;
         let mut final_value: Option<serde_json::Value> = None;
+        let mut file_diffs = Vec::new();
         // Whether we already streamed this tool's output as message chunks (only
         // relevant when `render_as_message` is set), so we don't repeat it.
         let mut streamed_as_message = false;
@@ -918,6 +956,7 @@ impl TurnEngine {
                             status: ToolCallStatus::InProgress,
                             output: Some(delta),
                             raw_output: None,
+                            file_diffs: Vec::new(),
                         })
                         .await?;
                     }
@@ -936,6 +975,7 @@ impl TurnEngine {
                     success = false;
                     final_message = Some(message);
                 }
+                ToolEvent::FileChanged(diff) => file_diffs.push(diff),
                 ToolEvent::TodoListUpdated(todo_list) => {
                     if let Err(err) = todo_list.validate() {
                         success = false;
@@ -987,6 +1027,7 @@ impl TurnEngine {
                 status,
                 output: final_message.clone(),
                 raw_output: final_value,
+                file_diffs,
             })
             .await?;
         }
@@ -1138,6 +1179,26 @@ fn flush_assistant_text(session: &mut SessionState, buffer: &mut String) {
     if !buffer.is_empty() {
         session.push_assistant_text(std::mem::take(buffer));
     }
+}
+
+/// Keep all assistant blocks from one provider round before its tool results.
+/// Anthropic requires thinking and parallel tool calls in one assistant message.
+fn finish_round_history(session: &mut SessionState, start: usize) {
+    if start >= session.history.entries.len() {
+        return;
+    }
+
+    let mut results = Vec::new();
+    let mut assistant = Vec::new();
+    for entry in session.history.entries.drain(start..) {
+        if matches!(entry, HistoryEntry::ToolResult(_)) {
+            results.push(entry);
+        } else {
+            assistant.push(entry);
+        }
+    }
+    session.history.entries.extend(assistant);
+    session.history.entries.extend(results);
 }
 
 /// Render a JSON tool result into a compact human-readable string. Strings are

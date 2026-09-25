@@ -61,7 +61,7 @@ pub use service::NextTurnService;
 pub use session::{
     SessionRecord, SessionState, ToolDescriptor, TurnContext, SESSION_RECORD_VERSION,
 };
-pub use sink::{EngineOutput, ToolCallLocation, ToolCallStatus, ToolKind, UpdateSink};
+pub use sink::{EngineOutput, FileDiff, ToolCallLocation, ToolCallStatus, ToolKind, UpdateSink};
 pub use store::{InMemorySessionStore, JsonFileSessionStore, SessionStore};
 pub use todo::{TodoItem, TodoItemId, TodoList, TodoValidationError};
 pub use tool::{Tool, ToolContext, ToolEvent, ToolOutputPresentation, ToolRegistry, ToolResult};

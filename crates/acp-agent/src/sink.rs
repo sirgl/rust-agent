@@ -12,11 +12,11 @@
 //! on the JSON-RPC event loop, otherwise `block_task` would deadlock.
 
 use agent_client_protocol::schema::v1::{
-    Content, ContentBlock, ContentChunk, PermissionOption, PermissionOptionKind, Plan, PlanEntry,
-    PlanEntryPriority, PlanEntryStatus, RequestPermissionOutcome, RequestPermissionRequest,
-    SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall, ToolCallContent,
-    ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus, ToolCallUpdate,
-    ToolCallUpdateFields, ToolKind as AcpToolKind,
+    Content, ContentBlock, ContentChunk, Diff as AcpDiff, PermissionOption, PermissionOptionKind,
+    Plan, PlanEntry, PlanEntryPriority, PlanEntryStatus, RequestPermissionOutcome,
+    RequestPermissionRequest, SessionId, SessionNotification, SessionUpdate, TextContent, ToolCall,
+    ToolCallContent, ToolCallLocation as AcpToolCallLocation, ToolCallStatus as AcpToolCallStatus,
+    ToolCallUpdate, ToolCallUpdateFields, ToolKind as AcpToolKind,
 };
 use agent_client_protocol::{Client, ConnectionTo};
 use agent_core::{
@@ -162,14 +162,24 @@ impl UpdateSink for AcpUpdateSink {
                 status,
                 output,
                 raw_output,
+                file_diffs,
             } => {
                 let mut fields = ToolCallUpdateFields::new().status(map_status(status));
+                let mut content = file_diffs
+                    .into_iter()
+                    .map(|diff| {
+                        ToolCallContent::Diff(
+                            AcpDiff::new(diff.path, diff.new_text).old_text(diff.old_text),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 if let Some(text) = output {
                     if !text.is_empty() {
-                        fields = fields.content(vec![ToolCallContent::Content(Content::new(
-                            text_block(text),
-                        ))]);
+                        content.push(ToolCallContent::Content(Content::new(text_block(text))));
                     }
+                }
+                if !content.is_empty() {
+                    fields = fields.content(content);
                 }
                 if let Some(out) = raw_output {
                     fields = fields.raw_output(out);
@@ -338,6 +348,7 @@ mod tests {
                 status: ToolCallStatus::Completed,
                 output: Some("done".to_string()),
                 raw_output: Some(serde_json::json!({"ok": true})),
+                file_diffs: Vec::new(),
             },
         ]
     }

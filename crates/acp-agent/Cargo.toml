@@ -14,7 +14,11 @@ path = "src/main.rs"
 
 [features]
 default = []
-unstable_protocol_v2 = ["agent-client-protocol/unstable_protocol_v2", "dep:base64"]
+unstable_protocol_v2 = [
+    "agent-client-protocol/unstable_protocol_v2",
+    "dep:base64",
+    "dep:diffy",
+]
 
 [dependencies]
 agent-core.workspace = true
@@ -28,6 +32,7 @@ llm-inspector.workspace = true
 agent-client-protocol.workspace = true
 async-trait.workspace = true
 base64 = { workspace = true, optional = true }
+diffy = { workspace = true, optional = true }
 futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,3 +40,4 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+uuid.workspace = true

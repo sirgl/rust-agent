@@ -35,9 +35,9 @@
 use std::sync::Arc;
 
 use agent_core::{
-    AgentError, ClientAccess, ElicitationOutcome, MarkTodoCompletedToolCall, PlanStepStatus,
-    Result, TerminalChunk, Tool, ToolCallLocation, ToolContext, ToolEvent, ToolKind, ToolRegistry,
-    UpdateTodoListToolCall,
+    AgentError, ClientAccess, ElicitationOutcome, FileDiff, MarkTodoCompletedToolCall,
+    PlanStepStatus, Result, TerminalChunk, Tool, ToolCallLocation, ToolContext, ToolEvent,
+    ToolKind, ToolRegistry, UpdateTodoListToolCall,
 };
 use async_trait::async_trait;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -314,18 +314,26 @@ impl Tool for FsWriteTool {
     ) -> Result<BoxStream<'static, ToolEvent>> {
         let args: FsWriteArgs = parse_args(self.name(), args)?;
         let client: &Arc<dyn ClientAccess> = ctx.client()?;
+        let old_text = client.read_text_file(&args.path).await.ok();
         debug!(path = %args.path, bytes = args.content.len(), "fs_write");
         match client.write_text_file(&args.path, &args.content).await {
             Ok(()) => {
                 let msg = format!("wrote {} bytes to {}", args.content.len(), args.path);
-                Ok(events(vec![
-                    ToolEvent::Started,
-                    ToolEvent::Completed(serde_json::json!({
-                        "path": args.path,
-                        "bytes_written": args.content.len(),
-                        "message": msg,
-                    })),
-                ]))
+                let mut tool_events = vec![ToolEvent::Started];
+                if old_text.as_deref() != Some(args.content.as_str()) {
+                    let path = absolute_tool_path(&args.path, &ctx.workspace_roots);
+                    tool_events.push(ToolEvent::FileChanged(FileDiff {
+                        path,
+                        old_text,
+                        new_text: args.content.clone(),
+                    }));
+                }
+                tool_events.push(ToolEvent::Completed(serde_json::json!({
+                    "path": args.path,
+                    "bytes_written": args.content.len(),
+                    "message": msg,
+                })));
+                Ok(events(tool_events))
             }
             Err(err) => Ok(events(vec![
                 ToolEvent::Started,
@@ -333,6 +341,19 @@ impl Tool for FsWriteTool {
             ])),
         }
     }
+}
+
+fn absolute_tool_path(path: &str, workspace_roots: &[String]) -> String {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return path.to_string_lossy().into_owned();
+    }
+    workspace_roots
+        .first()
+        .map(|root| std::path::Path::new(root).join(path))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// The built-in `terminal_run` tool: run a command via the client.
@@ -727,6 +748,14 @@ mod tests {
             .unwrap();
         let evts = collect(stream).await;
         assert!(matches!(evts.last(), Some(ToolEvent::Completed(_))));
+        match &evts[1] {
+            ToolEvent::FileChanged(diff) => {
+                assert_eq!(diff.path, "/tmp/out.txt");
+                assert_eq!(diff.old_text.as_deref(), Some("contents of /tmp/out.txt"));
+                assert_eq!(diff.new_text, "hello");
+            }
+            other => panic!("expected file diff, got {other:?}"),
+        }
         let writes = client.writes.lock().unwrap();
         assert_eq!(writes.len(), 1);
         assert_eq!(writes[0].0, "/tmp/out.txt");

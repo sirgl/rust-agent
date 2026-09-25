@@ -108,12 +108,7 @@ impl StreamMapper {
             }
             // Emit the accumulated usage right before the terminal event so the
             // engine can fold it into the session totals.
-            Some("message_stop") => vec![
-                TurnEvent::Usage(self.usage),
-                TurnEvent::TurnFinished {
-                    stop_reason: self.stop_reason,
-                },
-            ],
+            Some("message_stop") => self.on_message_stop(),
             Some("error") => vec![TurnEvent::Error(TurnError::new(error_message(event)))],
             // ping and any unknown types carry nothing to emit.
             _ => Vec::new(),
@@ -125,7 +120,13 @@ impl StreamMapper {
             return Vec::new();
         };
         let block = event.get("content_block");
-        match block.and_then(|b| b.get("type")).and_then(Value::as_str) {
+        let block_type = block.and_then(|b| b.get("type")).and_then(Value::as_str);
+        let pending_thinking = if block_type == Some("tool_use") {
+            self.take_thinking_blocks_before(Some(index))
+        } else {
+            Vec::new()
+        };
+        match block_type {
             Some("text") => {
                 self.blocks.insert(index, BlockState::Text);
             }
@@ -176,7 +177,7 @@ impl StreamMapper {
             }
             _ => {}
         }
-        Vec::new()
+        pending_thinking
     }
 
     fn on_block_delta(&mut self, event: &Value) -> Vec<TurnEvent> {
@@ -196,20 +197,36 @@ impl StreamMapper {
                 if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
                     // Accumulate for the complete signed block, and forward the
                     // delta live for streaming display.
-                    if let Some(BlockState::Thinking { text: acc, .. }) =
-                        self.blocks.get_mut(&index)
-                    {
-                        acc.push_str(text);
+                    match self.blocks.get_mut(&index) {
+                        Some(BlockState::Thinking { text: acc, .. }) => acc.push_str(text),
+                        None => {
+                            self.blocks.insert(
+                                index,
+                                BlockState::Thinking {
+                                    text: text.to_string(),
+                                    signature: String::new(),
+                                },
+                            );
+                        }
+                        _ => {}
                     }
                     return vec![TurnEvent::Thinking(text.to_string())];
                 }
             }
             Some("signature_delta") => {
                 if let Some(sig) = delta.get("signature").and_then(Value::as_str) {
-                    if let Some(BlockState::Thinking { signature, .. }) =
-                        self.blocks.get_mut(&index)
-                    {
-                        signature.push_str(sig);
+                    match self.blocks.get_mut(&index) {
+                        Some(BlockState::Thinking { signature, .. }) => signature.push_str(sig),
+                        None => {
+                            self.blocks.insert(
+                                index,
+                                BlockState::Thinking {
+                                    text: String::new(),
+                                    signature: sig.to_string(),
+                                },
+                            );
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -269,6 +286,47 @@ impl StreamMapper {
                 self.usage.output_tokens = out;
             }
         }
+    }
+
+    fn on_message_stop(&mut self) -> Vec<TurnEvent> {
+        let mut events = self.take_thinking_blocks_before(None);
+        events.push(TurnEvent::Usage(self.usage));
+        events.push(TurnEvent::TurnFinished {
+            stop_reason: self.stop_reason,
+        });
+        events
+    }
+
+    fn take_thinking_blocks_before(&mut self, end: Option<u64>) -> Vec<TurnEvent> {
+        let indices: Vec<u64> = self
+            .blocks
+            .iter()
+            .filter_map(|(index, state)| {
+                let is_before_end = end.is_none_or(|end| *index < end);
+                (is_before_end
+                    && matches!(
+                        state,
+                        BlockState::Thinking { .. } | BlockState::RedactedThinking { .. }
+                    ))
+                .then_some(*index)
+            })
+            .collect();
+
+        indices
+            .into_iter()
+            .filter_map(|index| match self.blocks.remove(&index) {
+                Some(BlockState::Thinking { text, signature }) => {
+                    Some(TurnEvent::ThinkingBlock(ThinkingRecord::Thinking {
+                        text,
+                        signature,
+                    }))
+                }
+                Some(BlockState::RedactedThinking { data }) => {
+                    Some(TurnEvent::ThinkingBlock(ThinkingRecord::Redacted { data }))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Capture the prompt-side token counts reported at `message_start`.
@@ -402,6 +460,52 @@ mod tests {
             }
             other => panic!("expected signed ThinkingBlock, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn preserves_open_thinking_block_before_tool_use() {
+        let mut m = StreamMapper::new();
+        let out = push_all(
+            &mut m,
+            &[
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect first"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-123"}}),
+                json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"fs_read","input":{}}}),
+                json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/a\"}"}}),
+                json!({"type":"content_block_stop","index":1}),
+            ],
+        );
+
+        assert!(matches!(&out[0], TurnEvent::Thinking(text) if text == "inspect first"));
+        assert!(matches!(
+            &out[1],
+            TurnEvent::ThinkingBlock(ThinkingRecord::Thinking { text, signature })
+                if text == "inspect first" && signature == "sig-123"
+        ));
+        assert!(
+            matches!(&out[2], TurnEvent::ToolCallRequested { id, .. } if id.as_str() == "toolu_1")
+        );
+    }
+
+    #[test]
+    fn preserves_thinking_when_block_start_is_missing() {
+        let mut m = StreamMapper::new();
+        let out = push_all(
+            &mut m,
+            &[
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"inspect first"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig-123"}}),
+                json!({"type":"content_block_stop","index":0}),
+            ],
+        );
+
+        assert!(matches!(&out[0], TurnEvent::Thinking(text) if text == "inspect first"));
+        assert!(matches!(
+            &out[1],
+            TurnEvent::ThinkingBlock(ThinkingRecord::Thinking { text, signature })
+                if text == "inspect first" && signature == "sig-123"
+        ));
     }
 
     #[test]

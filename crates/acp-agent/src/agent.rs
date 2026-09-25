@@ -347,7 +347,7 @@ fn build_agent_v1(deps: AgentDeps) -> impl ConnectTo<Client> {
         // registry.
         .on_receive_request(
             async move |req: NewSessionRequest, responder, cx| {
-                let session_id = format!("session-{}", uuid_like());
+                let session_id = new_session_id();
 
                 if let Err(err) = LocalClientAccess::with_cwd(&req.cwd) {
                     warn!(session_id, cwd = %req.cwd.display(), %err, "session/new invalid cwd");
@@ -1178,14 +1178,9 @@ fn map_stop_reason(reason: StopReason) -> AcpStopReason {
     }
 }
 
-/// Generate a process-unique, monotonically increasing id suffix.
-///
-/// A full UUID dependency is unnecessary for session ids that only need to be
-/// unique within a single running process.
-fn uuid_like() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(1);
-    COUNTER.fetch_add(1, Ordering::Relaxed)
+/// Generate a session id that stays unique across agent processes.
+fn new_session_id() -> String {
+    format!("session-{}", uuid::Uuid::new_v4())
 }
 
 /// Connect every MCP server the client requested for this session (via

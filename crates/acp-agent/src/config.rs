@@ -115,11 +115,9 @@ pub struct AgentConfig {
     /// Directory under which session core state is persisted as JSON, one
     /// file per session.
     ///
-    /// When `Some`, the binary selects a disk-backed
-    /// [`JsonFileSessionStore`](agent_core::JsonFileSessionStore) so sessions
-    /// survive process restarts and can be reopened via `session/load`. When
-    /// `None` (the default), a non-durable
-    /// [`InMemorySessionStore`](agent_core::InMemorySessionStore) is used.
+    /// The default store uses `<temp>/rust-acp-agent/sessions`. It lets a
+    /// session survive a process restart. Set this field to `None` to use the
+    /// non-durable [`InMemorySessionStore`](agent_core::InMemorySessionStore).
     pub session_persistence_dir: Option<PathBuf>,
     /// Whether to start the LLM-inspector HTTP server at process startup.
     ///
@@ -151,6 +149,10 @@ pub fn default_inspector_log_dir() -> PathBuf {
     std::env::temp_dir().join("rust-acp-agent").join("llm-logs")
 }
 
+fn default_session_persistence_dir() -> PathBuf {
+    std::env::temp_dir().join("rust-acp-agent").join("sessions")
+}
+
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
@@ -165,7 +167,7 @@ impl Default for AgentConfig {
             default_model: "claude-haiku-4-5".to_string(),
             require_submit_result: true,
             thought_interval: 5,
-            session_persistence_dir: None,
+            session_persistence_dir: Some(default_session_persistence_dir()),
             inspector_enabled: true,
             inspector_addr: "127.0.0.1:7878".to_string(),
             inspector_log_dir: Some(default_inspector_log_dir()),
@@ -184,9 +186,8 @@ impl AgentConfig {
     ///   model (`ACP_MODEL` wins when several are set).
     /// - `ACP_REQUIRE_SUBMIT_RESULT` (`1`/`true`/`yes`/`on`) toggles whether a
     ///   turn only ends when the model calls the `submit_result` tool.
-    /// - `ACP_SESSION_DIR` selects a directory for disk-backed session
-    ///   persistence (enables the JSON file store); unset keeps sessions
-    ///   in memory only.
+    /// - `ACP_SESSION_DIR` selects the session directory. Use `off` to keep
+    ///   sessions in memory only.
     #[must_use]
     pub fn from_env() -> Self {
         let mut config = Self::default();
@@ -231,9 +232,13 @@ impl AgentConfig {
             }
         }
         if let Ok(dir) = std::env::var("ACP_SESSION_DIR") {
-            if !dir.trim().is_empty() {
-                config.session_persistence_dir = Some(PathBuf::from(dir));
-            }
+            let trimmed = dir.trim();
+            config.session_persistence_dir =
+                if trimmed.is_empty() || matches!(trimmed, "0" | "off" | "no" | "false") {
+                    None
+                } else {
+                    Some(PathBuf::from(trimmed))
+                };
         }
         if let Ok(v) = std::env::var("ACP_INSPECTOR") {
             config.inspector_enabled = !matches!(v.trim(), "0" | "false" | "no" | "off");
@@ -305,9 +310,12 @@ mod tests {
     }
 
     #[test]
-    fn default_has_no_session_persistence_dir() {
+    fn default_persists_sessions_under_system_temp() {
         let config = AgentConfig::default();
-        assert!(config.session_persistence_dir.is_none());
+        assert_eq!(
+            config.session_persistence_dir.as_deref(),
+            Some(default_session_persistence_dir().as_path())
+        );
     }
 
     #[test]
